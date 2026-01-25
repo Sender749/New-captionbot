@@ -280,3 +280,20 @@ async def set_emoji_remover_status(channel_id: int, status: bool):
         upsert=True
     )
 
+# ---------------- URL Buttons ----------------
+async def set_url_buttons(channel_id: int, buttons: list):
+    await chnl_ids.update_one(
+        {"chnl_id": channel_id},
+        {"$set": {"url_buttons": buttons}},
+        upsert=True
+    )
+
+async def get_url_buttons(channel_id: int) -> list:
+    doc = await chnl_ids.find_one({"chnl_id": channel_id})
+    return doc.get("url_buttons", []) if doc else []
+
+async def delete_url_buttons(channel_id: int):
+    await chnl_ids.update_one(
+        {"chnl_id": channel_id},
+        {"$unset": {"url_buttons": ""}}
+    )
