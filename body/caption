@@ -9,6 +9,8 @@ from Script import script
 from body.database import *  
 from body.file_forward import *
 from collections import deque, defaultdict
+from imdb import IMDb
+ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
 EDIT_DELAY = 2.5  # seconds (not exceed 1.5)
 WORKERS = 3       # make 2 if crash and edit delay 2.2
@@ -585,7 +587,8 @@ async def reCap(client, msg):
     prefix = cap_doc.get("prefix", "") or ""
     replace_raw = cap_doc.get("replace_words", None)
     # Extract info from caption
-    language = extract_language(default_caption)
+    audio_lang_list = extract_audio_languages(default_caption)
+    language = " ".join(audio_lang_list)
     year = extract_year(default_caption)
     # Build caption
     try:
@@ -593,10 +596,8 @@ async def reCap(client, msg):
         smart_file_name = ""
         if "{smart_file_name}" in cap_template:
             smart_file_name = build_smart_filename(
-                base_name=raw_file_name,
-                default_caption=default_caption,
-                year=year,
-                language=language
+                raw_file_name,
+                default_caption
             )
         new_caption = cap_template.format(
             file_name=raw_file_name,
@@ -622,8 +623,6 @@ async def reCap(client, msg):
         new_caption = f"{new_caption}\n{suffix}".strip()
     if emoji_remover_on:
         new_caption = remove_emojis(new_caption)
-    if language and contains_language(raw_file_name, language):
-        language = ""
     new_caption = new_caption.strip()
     if "<" in new_caption and ">" in new_caption:
         new_caption = sanitize_caption_html(new_caption)
@@ -633,6 +632,163 @@ async def reCap(client, msg):
         "caption": new_caption,
         "user_id": msg.from_user.id if msg.from_user else None
     })
+
+# ---------------- Smart File Name Helper ----------------
+LANG_LIST = [
+    "Hindi","English","Tamil","Telugu","Malayalam","Kannada",
+    "Marathi","Gujarati","Bengali","Punjabi","Urdu",
+    "Japanese","Korean","Chinese","Spanish","French","German",
+    "Italian","Russian"
+]
+QUALITY_LIST = ["480p","720p","1080p","2160p","4k"]
+SOURCE_LIST = ["WEB-DL","WEBRip","BluRay","HDRip","DVDRip"]
+VIDEO_CODEC_LIST = ["x265","x264","HEVC","AV1"]
+AUDIO_CODEC_LIST = ["AAC","DDP","AC3","DTS","Atmos"]
+EXT_LIST = ["mkv","mp4","avi","webm"]
+
+def _norm(text: str) -> str:
+    return re.sub(r'\s+', ' ', text.lower()).strip()
+
+def imdb_enrich_title(title: str, year: str):
+    if not title or not year or len(title) < 10:
+        return title, year
+    try:
+        results = ia.search_movie(title)
+        for r in results[:5]:
+            if str(r.get("year")) == year:
+                return r.get("title", title), year
+    except Exception:
+        pass
+    return title, year
+
+def extract_title_year(text: str):
+    text = re.sub(r'[._\-]', ' ', text)
+    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', text)
+    year = year_match.group(1) if year_match else ""
+    cut = year_match.start() if year_match else len(text)
+    title = text[:cut]
+    title = re.sub(
+        r'\b(480p|720p|1080p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|av1)\b',
+        '',
+        title,
+        flags=re.I
+    )
+    return title.strip().title(), year
+
+def detect_media_type(text: str):
+    if re.search(r'\bS\d{1,2}E\d{1,2}\b', text, re.I):
+        return "series"
+    if re.search(r'\banime\b', text, re.I):
+        return "anime"
+    return "movie"
+
+def extract_season_episode(text: str):
+    text = text.replace("–", "-").replace("to", "-")
+    season = ""
+    s_match = re.search(r'\bS(?:eason)?\s*(\d+)\b', text, re.I)
+    if s_match:
+        s_num = int(s_match.group(1))
+        season = f"S{s_num:02d}"
+    ep_range = ""
+    r_match = re.search(
+        r'\b(?:E|EP|Episode|Episodes)?\s*(\d+)\s*-\s*(\d+)\b',
+        text,
+        re.I
+    )
+    if r_match:
+        start = int(r_match.group(1))
+        end = int(r_match.group(2))
+        ep_range = f"E{start:02d}-{end:02d}"
+        return season, ep_range
+    e_match = re.search(r'\bE(?:P)?\s*(\d+)\b', text, re.I)
+    if e_match:
+        e_num = int(e_match.group(1))
+        return season, f"E{e_num:02d}"
+    return season, ""
+
+def extract_audio_languages(text: str):
+    found = []
+    block = re.search(r'(audio|dual audio|multi audio)[^a-z]*([a-z ,+/]+)', text, re.I)
+    src = block.group(2) if block else text
+    for lang in LANG_LIST:
+        if re.search(rf'\b{lang}\b', src, re.I):
+            found.append(lang)
+    return list(dict.fromkeys(found))
+
+def extract_subtitle_tag(text: str):
+    found = []
+    m = re.search(r'(subs?|subtitles?)[:\- ]+([a-z ,+/]+)', text, re.I)
+    if not m:
+        return ""
+    block = m.group(2)
+    for lang in LANG_LIST:
+        if re.search(rf'\b{lang}\b', block, re.I):
+            found.append(lang)
+    if not found:
+        return ""
+    if found == ["English"]:
+        return "ESub"
+    if found == ["Hindi"]:
+        return "HSub"
+    return "Sub"
+
+def extract_quality(text: str):
+    for q in QUALITY_LIST:
+        if re.search(rf'\b{q}\b', text, re.I):
+            return q
+    return ""
+
+def extract_source(text: str):
+    for s in SOURCE_LIST:
+        if re.search(rf'\b{s}\b', text, re.I):
+            return s
+    return ""
+    
+def extract_video_codec(text: str):
+    for c in VIDEO_CODEC_LIST:
+        if re.search(rf'\b{c}\b', text, re.I):
+            return c
+    return ""
+
+def extract_audio_codec(text: str):
+    for c in AUDIO_CODEC_LIST:
+        if re.search(rf'\b{c}\b', text, re.I):
+            return c
+    return ""
+
+def extract_extension(text: str):
+    for e in EXT_LIST:
+        if re.search(rf'\.{e}\b|\b{e}\b', text, re.I):
+            return e.upper()
+    return ""
+
+def build_smart_filename(filename: str, caption: str):
+    raw = f"{filename} {caption}"
+    title, year = extract_title_year(raw)
+    title, year = imdb_enrich_title(title, year)
+    media_type = detect_media_type(raw)
+    season, episode = extract_season_episode(raw)
+    audio_langs = extract_audio_languages(raw)
+    subs = extract_subtitle_tag(raw)
+    quality = extract_quality(raw)
+    source = extract_source(raw)
+    vcodec = extract_video_codec(raw)
+    acodec = extract_audio_codec(raw)
+    ext = extract_extension(raw)
+    parts = [title]
+    if season or episode:
+        parts.append(f"{season}{episode}".strip())
+    if year:
+        parts.append(year)
+    if audio_langs:
+        parts.append("+".join(audio_langs))
+    if subs:
+        parts.append(subs)
+    for p in [quality, source, vcodec, acodec, ext]:
+        if p:
+            parts.append(p)
+    return " ".join(parts).strip()
+
 
 # ---------------- Helper functions ----------------
 def _status_name(member_obj):
@@ -665,47 +821,7 @@ def get_size(size: int) -> str:
         size /= 1024.0
         i += 1
     return "%.2f %s" % (size, units[i])
-
-def contains_language(base_name: str, lang: str) -> bool:
-    if not base_name or not lang:
-        return False
-    base = normalize(base_name)
-    for l in lang.split():
-        if normalize(l) in base:
-            return True
-    return False
-
-def extract_language(default_caption: str) -> str:
-    if not default_caption:
-        return ""
-    languages = [
-        "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada",
-        "Marathi", "Gujarati", "Bengali", "Punjabi", "Urdu",
-        "French", "German", "Spanish", "Italian", "Russian",
-        "Japanese", "Korean", "Chinese"
-    ]
-    found = []
-    for lang in languages:
-        if re.search(rf'\b{lang}\b', default_caption, re.IGNORECASE):
-            found.append(lang)
-    return " ".join(dict.fromkeys(found))
-
-def normalize_for_matching(text: str) -> str:
-    if not text:
-        return ""
-    text = HTML_A_RE.sub(r'\1', text)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = text.replace("–", "-").replace("—", "-")
-    text = re.sub(r'\s+', ' ', text)
-    return text.lower().strip()
-
-def html_to_plain_text(text: str) -> str:
-    if not text:
-        return ""
-    text = HTML_A_RE.sub(r'\1', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    return text
-
+    
 def extract_year(default_caption: str) -> Optional[str]:
     match = re.search(r'\b(19\d{2}|20\d{2})\b', default_caption or "")
     return match.group(1) if match else None
@@ -754,65 +870,6 @@ async def format_dump_skip_list(client: Client) -> str:
         lines.append(f"• <b>{title}</b>\n  <code>{cid}</code>")
     return "\n".join(lines)
 
-def build_smart_filename(
-    base_name: str,
-    default_caption: str,
-    year: Optional[str],
-    language: Optional[str]
-) -> str:
-    base_norm = normalize(base_name)
-    def has(value: Optional[str]) -> bool:
-        return bool(value) and normalize(value) in base_norm
-    parts = [base_name]
-    se = extract_season_episode(default_caption)
-    if se and not has(se):
-        parts.append(se)
-    if year and not has(year):
-        parts.append(year)
-    quality = extract_quality(default_caption)
-    if quality and not has(quality):
-        parts.append(quality)
-    audio_langs = extract_audio_languages(default_caption)
-    if audio_langs and not contains_language(base_name, audio_langs):
-        parts.append(audio_langs)
-    sub_tag = extract_subtitle_tag(default_caption)
-    if sub_tag and not has(sub_tag):
-        parts.append(sub_tag)
-    audio = extract_audio_tags(default_caption)
-    if audio and not has(audio):
-        parts.append(audio)
-    codec = extract_codec(default_caption)
-    if codec and not has(codec):
-        parts.append(codec)
-    video_format = extract_format(default_caption)
-    if video_format and not has(video_format):
-        parts.append(video_format)
-    clean = []
-    seen = set()
-    for p in parts:
-        key = normalize(p)
-        if key not in seen:
-            seen.add(key)
-            clean.append(p)
-    return " ".join(clean)
-
-def extract_season_episode(text: str) -> Optional[str]:
-    patterns = [
-        r'\bS\d{1,2}E\d{1,2}\b',
-        r'\bS\d{1,2}E\d{1,2}\s*(?:-|–|to)\s*E?\d{1,2}\b',
-        r'\bS\d{1,2}\s*(?:Complete|Full)\b',
-        r'\bSeason\s*\d+\s*(?:Complete|Full)?\b',
-        r'\bE\d{1,2}\s*(?:-|–|to)\s*E\d{1,2}\b',
-        r'\bEpisodes?\s*\d+\s*(?:-|–|to)\s*\d+\b',
-        r'\bEP?\s*\d{1,3}\b',
-        r'\[\s*\d{1,3}\s*(?:-|–|to)\s*\d{1,3}\s*\]'
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            return m.group(0)
-    return None
-
 def normalize_series_name(name: str) -> str:
     if not name:
         return ""
@@ -820,87 +877,6 @@ def normalize_series_name(name: str) -> str:
     name = re.sub(r'[._\-]+', ' ', name)
     name = re.sub(r'\s+', ' ', name)
     return name.strip().title()
-
-def extract_audio_tags(text: str) -> Optional[str]:
-    tags = [
-        "Dual Audio", "Multi Audio", "5.1", "7.1", "AAC", "DDP", "Atmos"
-    ]
-    found = []
-    for t in tags:
-        if re.search(rf'\b{re.escape(t)}\b', text, re.IGNORECASE):
-            found.append(t)
-    return " ".join(dict.fromkeys(found)) if found else None
-
-def extract_codec(text: str) -> Optional[str]:
-    codecs = ["x265", "x264", "HEVC", "AV1"]
-    for c in codecs:
-        if re.search(rf'\b{c}\b', text, re.IGNORECASE):
-            return c
-    return None
-
-def extract_subtitle_tag(text: str) -> Optional[str]:
-    if not text:
-        return None
-    subs_langs = extract_subtitle_languages(text)
-    if not subs_langs:
-        return None
-    langs = subs_langs.lower()
-    if langs == "english":
-        return "ESub"
-    if langs == "hindi":
-        return "HSub"
-    return f"Subs {subs_langs}"
-
-def extract_audio_languages(text: str) -> str:
-    if not text:
-        return ""
-    languages = [
-        "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada",
-        "Marathi", "Gujarati", "Bengali", "Punjabi", "Urdu",
-        "French", "German", "Spanish", "Italian", "Russian",
-        "Japanese", "Korean", "Chinese"
-    ]
-    found = []
-    audio_block = re.search(r'(audio|dual audio|multi audio)[^a-z]*([a-z ,/]+)', text, re.IGNORECASE)
-    if audio_block:
-        block = audio_block.group(2)
-        for lang in languages:
-            if re.search(rf'\b{lang}\b', block, re.IGNORECASE):
-                found.append(lang)
-    return " ".join(dict.fromkeys(found))
-
-def extract_subtitle_languages(text: str) -> str:
-    if not text:
-        return ""
-    languages = [
-        "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada",
-        "Marathi", "Gujarati", "Bengali", "Punjabi", "Urdu",
-        "French", "German", "Spanish", "Italian", "Russian",
-        "Japanese", "Korean", "Chinese"
-    ]
-    found = set()
-    patterns = [
-        r'subtitles?\s*[:\-]\s*([a-z ,/]+)',
-        r'subs?\s*[:\-]\s*([a-z ,/]+)'
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            for lang in languages:
-                if re.search(rf'\b{lang}\b', m.group(1), re.IGNORECASE):
-                    found.add(lang)
-    return " ".join(sorted(found, key=str.lower))
-
-def normalize(text: str) -> str:
-    return re.sub(r'\s+', ' ', text.lower()).strip()
-
-def extract_quality(text: str) -> Optional[str]:
-    match = re.search(r'\b(480p|720p|1080p|2160p|4k)\b', text, re.IGNORECASE)
-    return match.group(1) if match else None
-
-def extract_format(text: str) -> Optional[str]:
-    match = re.search(r'\b(mkv|mp4|avi|web-dl|hdrip|bluray|webrip)\b', text, re.IGNORECASE)
-    return match.group(1) if match else None
 
 def strip_links_and_mentions_keep_text(text: str) -> str:
     if not text:
@@ -1096,18 +1072,13 @@ async def capture_user_input(client, message):
     # ================= FILE FORWARD SKIP HANDLER =================
     if user_id in FF_SESSIONS:
         session = FF_SESSIONS[user_id]
-
-        # session expired
         if session.get("expires") and session["expires"] < time.time():
             FF_SESSIONS.pop(user_id, None)
             await message.reply_text("⏰ Session expired.\nStart again using /file_forward")
             return
-
-        # waiting for skip message id / link
         if session.get("step") == "skip":
             raw = (message.text or "").strip()
             msg_id = extract_msg_id_from_text(raw)
-
             if msg_id is None:
                 await message.reply_text(
                     "❌ Invalid message.\n\n"
@@ -1116,18 +1087,12 @@ async def capture_user_input(client, message):
                     "• OR message ID number"
                 )
                 return
-
-            # store skip id
             session["skip"] = int(msg_id)
             session["step"] = "queue"
-
-            # -------- delete user's skip input --------
             try:
                 await message.delete()
             except:
                 pass
-
-            # -------- delete previous instruction message --------
             try:
                 await client.delete_messages(
                     session["chat_id"],
@@ -1135,16 +1100,10 @@ async def capture_user_input(client, message):
                 )
             except:
                 pass
-
-            # -------- send NEW progress message --------
             progress_msg = await client.send_message(
                 session["chat_id"],
                 "🚚 Preparing forwarding…"
             )
-
-            # store progress message id for live updates
             session["msg_id"] = progress_msg.id
-
-            # -------- enqueue jobs --------
             await enqueue_forward_jobs(client, user_id)
             return
