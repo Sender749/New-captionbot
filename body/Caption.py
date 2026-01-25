@@ -24,6 +24,13 @@ bot_data = {
     "url_set": {}
 }
 
+# ---- Channel Scheduler State ----
+CHANNEL_ACTIVE = defaultdict(int)        # channel_id -> active workers
+CHANNEL_COOLDOWN = {}                    # channel_id -> unblock timestamp
+
+DEFAULT_MAX_WORKERS = 2                  # per channel
+DEFAULT_EDIT_DELAY = 2.5                 # per channel
+
 def extract_msg_id_from_text(text: str) -> int | None:
     if not text:
         return None
@@ -518,11 +525,9 @@ async def caption_worker(client: Client):
     while True:
         job = await fetch_next_job()
         if not job:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
             continue
-        if not job.get("caption"):
-            await mark_done(job["_id"])
-            continue
+        ch = job["chat_id"]
         try:
             await client.edit_message_caption(chat_id=job["chat_id"], message_id=job["message_id"], caption=job["caption"], parse_mode=ParseMode.HTML, reply_markup=job.get("reply_markup"))
             skip_dump = await is_dump_skip(job["chat_id"])
@@ -543,17 +548,20 @@ async def caption_worker(client: Client):
                 except Exception as e:
                     print(f"[CP_DUMP_FAIL] {e}")
             await mark_done(job["_id"])
-            await asyncio.sleep(EDIT_DELAY)
+            await asyncio.sleep(DEFAULT_EDIT_DELAY)
         except FloodWait as e:
-            await reschedule(job["_id"], delay=e.value + 2)
-            await asyncio.sleep(e.value)
+            wait = e.value + 2
+            CHANNEL_COOLDOWN[ch] = time.time() + wait
+            await reschedule(job["_id"], delay=wait)
         except errors.MessageNotModified:
             await mark_done(job["_id"])
-        except Exception as e:
+        except Exception:
             if job.get("retries", 0) >= 5:
                 await mark_done(job["_id"])
             else:
                 await reschedule(job["_id"], delay=10)
+        finally:
+            CHANNEL_ACTIVE[ch] -= 1
 
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
