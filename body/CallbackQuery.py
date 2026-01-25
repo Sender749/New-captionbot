@@ -419,17 +419,17 @@ async def set_url_message(client, query):
     bot_data.setdefault("url_set", {}).pop(user_id, None)
     instr = await query.message.edit_text(
         text=(
-            "🔗 **Send URL buttons in this format:**\n\n"
+            "🔗 <b>Send URL buttons in this format:</b>\n\n"
             "<code>\"Button 1\" \"url1\" | \"Button 2\" \"url2\"</code>\n"
             "<code>\"Button 3\" \"url3\"</code>\n\n"
             "• Use <b>|</b> to put buttons in the same row\n"
-            "• Use Space to put buttons in the new row"
+            "• Use new line for next row"
         ),
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"url_cancel_{channel_id}")]
-        ]),
-        disable_web_page_preview=True
+        ])
     )
     bot_data["url_set"][user_id] = {
         "channel_id": channel_id,
