@@ -12,7 +12,7 @@ from collections import deque, defaultdict
 from imdb import IMDb
 ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-
+_CHANNEL_CACHE = {}
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
