@@ -9,7 +9,7 @@ from body.database import *
 FF_SESSIONS = {}
 CANCELLED_SESSIONS = set()
 FORWARD_WORKERS = 2
-BASE_DELAY = 1
+BASE_DELAY = 1.3
 USERNAME_RE = re.compile(r'@\w+', flags=re.IGNORECASE)
 URL_RE = re.compile(r'(https?://\S+|t\.me/\S+)', flags=re.IGNORECASE)
 HTML_TAG_RE = re.compile(r'<[^>]+>')
