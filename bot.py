@@ -8,6 +8,7 @@ from info import *
 from body.database import *
 from body.Caption import *
 from body.file_forward import *
+EXECUTORS = 20
 
 PLUGIN_ROOT = "body"
 
@@ -34,7 +35,7 @@ class Bot(Client):
         await ensure_queue_indexes()
         await ensure_forward_indexes()
         await recover_stuck_jobs()
-        for _ in range(WORKERS):
+        for _ in range(EXECUTORS):
             asyncio.create_task(caption_worker(self))
         me = await self.get_me()
         self.force_channel = FORCE_SUB
