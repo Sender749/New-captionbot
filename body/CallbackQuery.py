@@ -419,7 +419,6 @@ async def set_url_message(client, query):
         text=(
             "🔗 **Send URL buttons in this format:**\n\n"
             "<code>\"Button Name\" \"https://example.com\"</code>\n\n"
-            "You can send up to **3 buttons** (one per line).\n\n"
             "Example:\n"
             "<code>\"Join Channel\" \"https://t.me/example\"</code>"
         ),
