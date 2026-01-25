@@ -631,8 +631,8 @@ async def reCap(client, msg):
     reply_markup = None
     if url_buttons:
         reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton(b["text"], url=b["url"])]
-            for b in url_buttons
+            [InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row]
+            for row in url_buttons
         ])
     await enqueue_caption({
         "chat_id": msg.chat.id,
@@ -1083,20 +1083,25 @@ async def capture_user_input(client, message):
         session = bot_data["url_set"].pop(user_id)
         channel_id = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
+        rows = []
         lines = text.strip().splitlines()
-        buttons = []
         for line in lines:
-            match = re.findall(r'"([^"]+)"', line)
-            if len(match) == 2:
-                buttons.append({
-                    "text": match[0],
-                    "url": match[1]
-                })
-        if not buttons:
+            row = []
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+            for part in parts:
+                match = re.findall(r'"([^"]+)"', part)
+                if len(match) == 2:
+                    row.append({
+                        "text": match[0],
+                        "url": match[1]
+                    })
+            if row:
+                rows.append(row)
+        if not rows:
             return await message.reply_text("❌ Invalid format. Try again.")
-        await set_url_buttons(channel_id, buttons)
+        await set_url_buttons(channel_id, rows)
         if channel_id in CHANNEL_CACHE:
-            CHANNEL_CACHE[channel_id]["url_buttons"] = buttons
+            CHANNEL_CACHE[channel_id]["url_buttons"] = rows
         await client.delete_messages(user_id, message.id)
         await client.edit_message_text(
             chat_id=user_id,
