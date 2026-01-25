@@ -388,9 +388,11 @@ async def url_button_menu(client, query):
     chat_title = getattr(chat, "title", str(channel_id))
     buttons = await get_url_buttons(channel_id)
     if buttons:
-        preview = "\n".join(
-            f"• [{b['text']}]({b['url']})" for b in buttons
-        )
+        lines = []
+        for row in buttons:
+            row_txt = " | ".join(f"[{b['text']}]({b['url']})" for b in row)
+            lines.append(f"• {row_txt}")
+        preview = "\n".join(lines)
     else:
         preview = "❌ No URL buttons set."
     text = (
@@ -418,11 +420,12 @@ async def set_url_message(client, query):
     instr = await query.message.edit_text(
         text=(
             "🔗 **Send URL buttons in this format:**\n\n"
-            " "Button 1" "url1" | "Button 2" "url2"\n"
-            " "Button 3" "url3"\n\n"
-            "• Use | to put buttons in the same row\n"
+            "<code>\"Button 1\" \"url1\" | \"Button 2\" \"url2\"</code>\n"
+            "<code>\"Button 3\" \"url3\"</code>\n\n"
+            "• Use <b>|</b> to put buttons in the same row\n"
             "• Use Space to put buttons in the new row"
-        )
+        ),
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"url_cancel_{channel_id}")]
         ]),
