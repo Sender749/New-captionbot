@@ -273,10 +273,7 @@ async def ff_start(client, message):
         
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("admin"))
 async def admin_help(client, message):
-    text = script.ADMIN_HELP_TEXT.format(
-        workers=WORKERS,
-        delay=EDIT_DELAY
-    )
+    text = "⚙️ Scheduler: Per-channel & per-session isolated\nFloodWait-safe"
     await message.reply_text(
         text,
         parse_mode=ParseMode.HTML,
@@ -293,9 +290,6 @@ async def bot_stats(client, message):
         f"• Users: <code>{users_count}</code>\n"
         f"• Pending Jobs: <code>{pending}</code>\n"
         f"• Processing Jobs: <code>{processing}</code>\n"
-        f"• Workers: <code>{WORKERS}</code>\n"
-        f"• Edit Delay: <code>{EDIT_DELAY}s</code>\n"
-        f"• Mode: Persistent Queue\n"
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -438,14 +432,13 @@ async def queue_status(client, message):
             name = chat.title
         except:
             name = "Unknown"
-        eta = int(count * EDIT_DELAY / WORKERS)
+        eta = int((count / DEFAULT_MAX_WORKERS) * DEFAULT_EDIT_DELAY)
         cap_lines.append(
             f"• <b>{name}</b>\n"
             f"  ├ ID: <code>{ch_id}</code>\n"
             f"  ├ Jobs: <code>{count}</code>\n"
-            f"  └ ETA: ~{eta//60}m {eta%60}s"
+            f"  └ ETA (channel): ~{eta//60}m {eta%60}s"
         )
-    cap_eta_total = int(cap_pending * EDIT_DELAY / WORKERS)
     f_pending = await forward_queue.count_documents({"status": "pending"})
     f_processing = await forward_queue.count_documents({"status": "processing"})
     f_pipeline = [
@@ -475,21 +468,16 @@ async def queue_status(client, message):
             d_name = d_chat.title
         except:
             d_name = "Unknown"
-        eta = int(count * BASE_DELAY / FORWARD_WORKERS)
         forward_lines.append(
             f"• <b>{s_name}</b> ➜ <b>{d_name}</b>\n"
             f"  ├ Jobs: <code>{count}</code>\n"
-            f"  └ ETA: ~{eta//60}m {eta%60}s"
+            f"  └ ETA (pair): ~{eta//60}m {eta%60}s"
         )
-    f_eta_total = int(f_pending * BASE_DELAY / FORWARD_WORKERS)
     text = (
         "📊 <b>QUEUE STATUS</b>\n\n"
         "📝 <b>Caption Queue</b>\n"
         f"• Pending: <code>{cap_pending}</code>\n"
         f"• Processing: <code>{cap_processing}</code>\n"
-        f"• Workers: <code>{WORKERS}</code>\n"
-        f"• Edit Delay: <code>{EDIT_DELAY}s</code>\n"
-        f"• Global ETA: ~{cap_eta_total//60}m {cap_eta_total%60}s\n\n"
     )
     if cap_lines:
         text += "🔥 <b>Top Busy Caption Channels</b>\n" + "\n".join(cap_lines) + "\n\n"
@@ -499,9 +487,6 @@ async def queue_status(client, message):
         "📦 <b>File Forward Queue</b>\n"
         f"• Pending: <code>{f_pending}</code>\n"
         f"• Processing: <code>{f_processing}</code>\n"
-        f"• Workers: <code>{FORWARD_WORKERS}</code>\n"
-        f"• Base Delay: <code>{BASE_DELAY}s</code>\n"
-        f"• Global ETA: ~{f_eta_total//60}m {f_eta_total%60}s\n\n"
     )
     if forward_lines:
         text += "🚚 <b>Top Forward Sessions</b>\n" + "\n".join(forward_lines)
