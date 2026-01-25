@@ -12,8 +12,6 @@ from collections import deque, defaultdict
 from imdb import IMDb
 ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-EDIT_DELAY = 2.5  # seconds (not exceed 1.5)
-WORKERS = 3       # make 2 if crash and edit delay 2.2
 CHANNEL_CACHE = {}
 bot_data = {
     "caption_set": {},
@@ -523,30 +521,38 @@ def sanitize_caption_html(text: str) -> str:
 
 async def caption_worker(client: Client):
     while True:
-        job = await fetch_next_job()
+        job = await fetch_channel_job()
         if not job:
             await asyncio.sleep(0.5)
             continue
         ch = job["chat_id"]
         try:
-            await client.edit_message_caption(chat_id=job["chat_id"], message_id=job["message_id"], caption=job["caption"], parse_mode=ParseMode.HTML, reply_markup=job.get("reply_markup"))
-            skip_dump = await is_dump_skip(job["chat_id"])
-            if not skip_dump:
+            await client.edit_message_caption(
+                chat_id=ch,
+                message_id=job["message_id"],
+                caption=job["caption"],
+                parse_mode=ParseMode.HTML,
+                reply_markup=job.get("reply_markup")
+            )
+            if not await is_dump_skip(ch):
                 try:
-                    original = await client.get_messages(job["chat_id"], job["message_id"])
+                    original = await client.get_messages(ch, job["message_id"])
                     fname = None
                     for t in ("document", "video", "audio", "voice"):
                         obj = getattr(original, t, None)
                         if obj:
                             fname = getattr(obj, "file_name", None)
                             break
-                    if not fname:
-                        fname = "File"
-                    fname = clean_text(fname)
+                    fname = clean_text(fname or "File")
                     fname = remove_emojis(fname)
-                    await client.copy_message(chat_id=CP_CH, from_chat_id=job["chat_id"], message_id=job["message_id"], caption=fname)
-                except Exception as e:
-                    print(f"[CP_DUMP_FAIL] {e}")
+                    await client.copy_message(
+                        chat_id=CP_CH,
+                        from_chat_id=ch,
+                        message_id=job["message_id"],
+                        caption=fname
+                    )
+                except:
+                    pass
             await mark_done(job["_id"])
             await asyncio.sleep(DEFAULT_EDIT_DELAY)
         except FloodWait as e:
