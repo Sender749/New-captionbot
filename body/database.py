@@ -28,25 +28,6 @@ async def enqueue_forward(job: dict):
         "ts": time.time()
     })
 
-async def fetch_forward_fair_job():
-    now = time.time()
-    cursor = forward_queue.find(
-        {"status": "pending"}
-    ).sort("ts", 1)
-    async for job in cursor:
-        key = (job["src"], job["dst"])
-        if FORWARD_COOLDOWN.get(key, 0) > now:
-            continue
-        if FORWARD_ACTIVE[key] >= MAX_FORWARD_PER_PAIR:
-            continue
-        FORWARD_ACTIVE[key] += 1
-        await forward_queue.update_one(
-            {"_id": job["_id"], "status": "pending"},
-            {"$set": {"status": "processing", "started": now}}
-        )
-        return job
-    return None
-
 async def forward_done(job_id):
     await forward_queue.delete_one({"_id": job_id})
 
