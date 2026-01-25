@@ -48,6 +48,7 @@ async def channel_settings(client, query):
         [InlineKeyboardButton("🧹 Set Words Remover", callback_data=f"setwords_{channel_id}")],
         [InlineKeyboardButton("🔤 Set Prefix & Suffix", callback_data=f"set_suffixprefix_{channel_id}")],
         [InlineKeyboardButton("🔄 Set Replace Words", callback_data=f"setreplace_{channel_id}")],
+        [InlineKeyboardButton("🔘 Button URL", callback_data=f"seturl_{channel_id}")],
         [InlineKeyboardButton(f"🔗 {link_text}", callback_data=f"togglelink_{channel_id}")],
         [InlineKeyboardButton(f"😀 {emoji_text}", callback_data=f"toggleemoji_{channel_id}")],
         [InlineKeyboardButton("♻️ Reset Channel Settings", callback_data=f"reset_channel_{channel_id}")],
@@ -377,6 +378,80 @@ async def delete_replace_words(client, query):
         f"✅ **All replace words deleted successfully.**\n\n📛 **Channel:** {chat_title}",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
+
+# ======================== URL Button ==================================
+@Client.on_callback_query(filters.regex(r"^seturl_(-?\d+)$"))
+async def url_button_menu(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    chat = await client.get_chat(channel_id)
+    chat_title = getattr(chat, "title", str(channel_id))
+    buttons = await get_url_buttons(channel_id)
+    if buttons:
+        preview = "\n".join(
+            f"• [{b['text']}]({b['url']})" for b in buttons
+        )
+    else:
+        preview = "❌ No URL buttons set."
+    text = (
+        f"🔘 **Channel:** {chat_title}\n\n"
+        f"🔗 **Current URL Buttons:**\n{preview}\n\n"
+        "Choose an option 👇"
+    )
+    keyboard = [
+        [InlineKeyboardButton("➕ Set URL", callback_data=f"seturlmsg_{channel_id}"),
+         InlineKeyboardButton("🗑 Delete URL", callback_data=f"delurl_{channel_id}")],
+        [InlineKeyboardButton("↩ Back", callback_data=f"chinfo_{channel_id}")]
+    ]
+    await query.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True
+    )
+
+@Client.on_callback_query(filters.regex(r"^seturlmsg_(-?\d+)$"))
+async def set_url_message(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    user_id = query.from_user.id
+    bot_data.setdefault("url_set", {}).pop(user_id, None)
+    instr = await query.message.edit_text(
+        text=(
+            "🔗 **Send URL buttons in this format:**\n\n"
+            "<code>\"Button Name\" \"https://example.com\"</code>\n\n"
+            "You can send up to **3 buttons** (one per line).\n\n"
+            "Example:\n"
+            "<code>\"Join Channel\" \"https://t.me/example\"</code>"
+        ),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"url_cancel_{channel_id}")]
+        ]),
+        disable_web_page_preview=True
+    )
+    bot_data["url_set"][user_id] = {
+        "channel_id": channel_id,
+        "instr_msg_id": instr.id
+    }
+
+@Client.on_callback_query(filters.regex(r"^url_cancel_(-?\d+)$"))
+async def cancel_url_set(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    bot_data.get("url_set", {}).pop(query.from_user.id, None)
+    await url_button_menu(client, query)
+
+@Client.on_callback_query(filters.regex(r"^delurl_(-?\d+)$"))
+async def delete_url_buttons_cb(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    await delete_url_buttons(channel_id)
+    await query.message.edit_text(
+        "✅ **All URL buttons deleted successfully.**",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩ Back", callback_data=f"seturl_{channel_id}")]
+        ])
+    )
+
 
 # ======================== Link Remover ==================================
 @Client.on_callback_query(filters.regex(r'^togglelink_(-?\d+)$'))
