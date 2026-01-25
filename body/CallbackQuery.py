@@ -418,4 +418,3 @@ async def reset_channel_settings(client, query):
         await channel_settings(client, query)
     except:
         pass
-
