@@ -971,6 +971,7 @@ async def capture_user_input(client, message):
     active_users.update(bot_data.get("replace_words_set", {}).keys())
     active_users.update(bot_data.get("prefix_set", {}).keys())
     active_users.update(bot_data.get("suffix_set", {}).keys())
+    active_users.update(bot_data.get("url_set", {}).keys())
     active_users.update(FF_SESSIONS.keys())  
     if user_id not in active_users:
         return
