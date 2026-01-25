@@ -20,7 +20,8 @@ bot_data = {
     "block_words_set": {},
     "suffix_set": {},
     "prefix_set": {},
-    "replace_words_set": {}
+    "replace_words_set": {},
+    "url_set": {}
 }
 
 def extract_msg_id_from_text(text: str) -> int | None:
@@ -586,6 +587,7 @@ async def reCap(client, msg):
     suffix = cap_doc.get("suffix", "") or ""
     prefix = cap_doc.get("prefix", "") or ""
     replace_raw = cap_doc.get("replace_words", None)
+    url_buttons = cap_doc.get("url_buttons", [])
     # Extract info from caption
     audio_lang_list = extract_audio_languages(default_caption)
     language = " ".join(audio_lang_list)
@@ -626,6 +628,12 @@ async def reCap(client, msg):
     new_caption = new_caption.strip()
     if "<" in new_caption and ">" in new_caption:
         new_caption = sanitize_caption_html(new_caption)
+    reply_markup = None
+    if url_buttons:
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(b["text"], url=b["url"])]
+            for b in url_buttons
+        ])
     await enqueue_caption({
         "chat_id": msg.chat.id,
         "message_id": msg.id,
@@ -1068,6 +1076,34 @@ async def capture_user_input(client, message):
             )
         )
         return
+
+    # ---------- URL BUTTONS ----------
+    if user_id in bot_data.get("url_set", {}):
+        session = bot_data["url_set"].pop(user_id)
+        channel_id = session["channel_id"]
+        instr_msg_id = session["instr_msg_id"]
+        lines = text.strip().splitlines()
+        buttons = []
+        for line in lines[:3]:  # max 3 buttons
+            match = re.findall(r'"([^"]+)"', line)
+            if len(match) == 2:
+                buttons.append({
+                    "text": match[0],
+                    "url": match[1]
+                })
+        if not buttons:
+            return await message.reply_text("❌ Invalid format. Try again.")
+        await set_url_buttons(channel_id, buttons)
+        if channel_id in CHANNEL_CACHE:
+            CHANNEL_CACHE[channel_id]["url_buttons"] = buttons
+        await client.delete_messages(user_id, message.id)
+        await client.edit_message_text(
+            chat_id=user_id,
+            message_id=instr_msg_id,
+            text="✅ URL buttons updated successfully!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=f"seturl_{channel_id}")]]))
+        return
+
 
     # ================= FILE FORWARD SKIP HANDLER =================
     if user_id in FF_SESSIONS:
