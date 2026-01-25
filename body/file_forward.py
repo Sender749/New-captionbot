@@ -12,6 +12,7 @@ FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
 
 MAX_FORWARD_PER_PAIR = 1
 FORWARD_DELAY = 1.3
+FORWARD_EXECUTORS = 4
 
 FF_SESSIONS = {}
 CANCELLED_SESSIONS = set()
@@ -29,7 +30,7 @@ ANIM_FRAMES = [
 
 # ---------- START WORKERS ----------
 def on_bot_start(client: Client):
-    for _ in range(FORWARD_WORKERS):
+    for _ in range(FORWARD_EXECUTORS):
         asyncio.create_task(forward_worker(client))
 
 def clean_text(text: str) -> str:
@@ -147,47 +148,25 @@ async def enqueue_forward_jobs(client: Client, uid: int):
         ),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
 
-# ---------- WORKER ----------
 # ================= FORWARD SCHEDULER STATE =================
-from collections import defaultdict
-import time
-
-FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active workers
-FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock timestamp
-
-MAX_FORWARD_PER_PAIR = 1                 # per (src, dst)
-FORWARD_DELAY = BASE_DELAY               # keep existing delay
-
-
-# ================= FAIR FORWARD JOB FETCH =================
 async def fetch_forward_fair_job():
     now = time.time()
     cursor = forward_queue.find(
         {"status": "pending"}
     ).sort("ts", 1)
-
     async for job in cursor:
         key = (job["src"], job["dst"])
-
-        # skip if this pair is in FloodWait cooldown
         if FORWARD_COOLDOWN.get(key, 0) > now:
             continue
-
-        # respect per-pair concurrency
         if FORWARD_ACTIVE[key] >= MAX_FORWARD_PER_PAIR:
             continue
-
-        # lock slot
         FORWARD_ACTIVE[key] += 1
-
         await forward_queue.update_one(
             {"_id": job["_id"], "status": "pending"},
             {"$set": {"status": "processing", "started": now}}
         )
         return job
-
     return None
-
 
 # ================= IMPROVED FORWARD WORKER =================
 async def forward_worker(client: Client):
