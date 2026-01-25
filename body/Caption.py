@@ -507,6 +507,7 @@ async def caption_worker(client: Client):
             await asyncio.sleep(0.5)
             continue
         ch = job["chat_id"]
+        released = False
         try:
             await client.edit_message_caption(
                 chat_id=ch,
