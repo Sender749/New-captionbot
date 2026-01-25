@@ -90,6 +90,25 @@ async def fetch_next_job():
         return_document=True
     )
 
+async def fetch_channel_job():
+    now = time.time()
+    cursor = queue_col.find(
+        {"status": "pending"}
+    ).sort("ts", 1)
+    async for job in cursor:
+        ch = job["chat_id"]
+        if CHANNEL_COOLDOWN.get(ch, 0) > now:
+            continue
+        if CHANNEL_ACTIVE[ch] >= DEFAULT_MAX_WORKERS:
+            continue
+        CHANNEL_ACTIVE[ch] += 1
+        await queue_col.update_one(
+            {"_id": job["_id"], "status": "pending"},
+            {"$set": {"status": "processing", "started": now}}
+        )
+        return job
+    return None
+
 async def mark_done(job_id):
     await queue_col.delete_one({"_id": job_id})
     
