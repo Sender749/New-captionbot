@@ -10,10 +10,11 @@ from body.database import *
 from body.file_forward import *
 from collections import deque, defaultdict
 from imdb import IMDb
-from body.database import _CHANNEL_CACHE as CHANNEL_CACHE
+from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
 
 ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
+DEFAULT_EDIT_DELAY = 2.5                 # per channel
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
@@ -22,13 +23,6 @@ bot_data = {
     "replace_words_set": {},
     "url_set": {}
 }
-
-# ---- Channel Scheduler State ----
-CHANNEL_ACTIVE = defaultdict(int)        # channel_id -> active workers
-CHANNEL_COOLDOWN = {}                    # channel_id -> unblock timestamp
-
-DEFAULT_MAX_WORKERS = 2                  # per channel
-DEFAULT_EDIT_DELAY = 2.5                 # per channel
 
 def extract_msg_id_from_text(text: str) -> int | None:
     if not text:
@@ -556,9 +550,9 @@ async def caption_worker(client: Client):
             else:
                 await reschedule(job["_id"], delay=10)
         finally:
-            if not slot_released:
+            if not released:
                 CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
-                slot_released = True
+                released = True
 
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
