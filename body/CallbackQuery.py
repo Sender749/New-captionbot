@@ -422,7 +422,7 @@ async def set_url_message(client, query):
             " "Button 3" "url3"\n\n"
             "• Use | to put buttons in the same row\n"
             "• Use Space to put buttons in the new row"
-        ),
+        )
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"url_cancel_{channel_id}")]
         ]),
