@@ -10,9 +10,10 @@ from body.database import *
 from body.file_forward import *
 from collections import deque, defaultdict
 from imdb import IMDb
+from body.database import _CHANNEL_CACHE as CHANNEL_CACHE
+
 ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-_CHANNEL_CACHE = {}
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
@@ -518,7 +519,9 @@ async def caption_worker(client: Client):
                 message_id=job["message_id"],
                 caption=job["caption"],
                 parse_mode=ParseMode.HTML,
-                reply_markup=job.get("reply_markup")
+                reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row] for row in job.get("url_buttons", [])]) 
+                              if job.get("url_buttons") else None
+                             )
             )
             if not await is_dump_skip(ch):
                 try:
@@ -553,7 +556,9 @@ async def caption_worker(client: Client):
             else:
                 await reschedule(job["_id"], delay=10)
         finally:
-            CHANNEL_ACTIVE[ch] -= 1
+            if not slot_released:
+                CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
+                slot_released = True
 
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
@@ -638,7 +643,7 @@ async def reCap(client, msg):
         "chat_id": msg.chat.id,
         "message_id": msg.id,
         "caption": new_caption,
-        "reply_markup": reply_markup,
+        "url_buttons": url_buttons or [],
         "user_id": msg.from_user.id if msg.from_user else None
     })
 
