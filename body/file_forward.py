@@ -5,11 +5,16 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 from body.database import *
+from collections import defaultdict
+
+FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active
+FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
+
+MAX_FORWARD_PER_PAIR = 1
+FORWARD_DELAY = 1.3
 
 FF_SESSIONS = {}
 CANCELLED_SESSIONS = set()
-FORWARD_WORKERS = 2
-BASE_DELAY = 1.3
 USERNAME_RE = re.compile(r'@\w+', flags=re.IGNORECASE)
 URL_RE = re.compile(r'(https?://\S+|t\.me/\S+)', flags=re.IGNORECASE)
 HTML_TAG_RE = re.compile(r'<[^>]+>')
@@ -143,16 +148,56 @@ async def enqueue_forward_jobs(client: Client, uid: int):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
 
 # ---------- WORKER ----------
+# ================= FORWARD SCHEDULER STATE =================
+from collections import defaultdict
+import time
+
+FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active workers
+FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock timestamp
+
+MAX_FORWARD_PER_PAIR = 1                 # per (src, dst)
+FORWARD_DELAY = BASE_DELAY               # keep existing delay
+
+
+# ================= FAIR FORWARD JOB FETCH =================
+async def fetch_forward_fair_job():
+    now = time.time()
+    cursor = forward_queue.find(
+        {"status": "pending"}
+    ).sort("ts", 1)
+
+    async for job in cursor:
+        key = (job["src"], job["dst"])
+
+        # skip if this pair is in FloodWait cooldown
+        if FORWARD_COOLDOWN.get(key, 0) > now:
+            continue
+
+        # respect per-pair concurrency
+        if FORWARD_ACTIVE[key] >= MAX_FORWARD_PER_PAIR:
+            continue
+
+        # lock slot
+        FORWARD_ACTIVE[key] += 1
+
+        await forward_queue.update_one(
+            {"_id": job["_id"], "status": "pending"},
+            {"$set": {"status": "processing", "started": now}}
+        )
+        return job
+
+    return None
+
+
+# ================= IMPROVED FORWARD WORKER =================
 async def forward_worker(client: Client):
     while True:
-        job = await fetch_forward_job()
+        job = await fetch_forward_fair_job()
         if not job:
             await asyncio.sleep(1)
             continue
+        key = (job["src"], job["dst"])
         session_id = job.get("session_id")
-        if session_id in CANCELLED_SESSIONS:
-            await forward_done(job["_id"])
-            continue
         msg_id = job.get("msg_id")
         try:
             if session_id in CANCELLED_SESSIONS:
@@ -187,16 +232,17 @@ async def forward_worker(client: Client):
                     print(f"[FF_DUMP_FAIL] {e}")
             await forward_done(job["_id"])
             await update_forward_progress(client, job)
-            await asyncio.sleep(BASE_DELAY)
+            await asyncio.sleep(FORWARD_DELAY)
         except FloodWait as e:
-            delay = int(e.value) + 2
+            wait = int(e.value) + 2
             retries = job.get("retries", 0)
-            delay += min(60, retries * 2)
-            await forward_retry(job["_id"], delay)
-            await asyncio.sleep(1)
+            wait += min(60, retries * 2)
+            FORWARD_COOLDOWN[key] = time.time() + wait
+            await forward_retry(job["_id"], wait)
         except Exception:
             await forward_done(job["_id"])
-            await asyncio.sleep(0.5)
+        finally:
+            FORWARD_ACTIVE[key] -= 1
 
 # ---------- PROGRESS ----------
 async def update_forward_progress(client: Client, job):
