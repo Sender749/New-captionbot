@@ -524,7 +524,7 @@ async def caption_worker(client: Client):
             await mark_done(job["_id"])
             continue
         try:
-            await client.edit_message_caption(chat_id=job["chat_id"], message_id=job["message_id"], caption=job["caption"], parse_mode=ParseMode.HTML)
+            await client.edit_message_caption(chat_id=job["chat_id"], message_id=job["message_id"], caption=job["caption"], parse_mode=ParseMode.HTML, reply_markup=job.get("reply_markup"))
             skip_dump = await is_dump_skip(job["chat_id"])
             if not skip_dump:
                 try:
@@ -638,6 +638,7 @@ async def reCap(client, msg):
         "chat_id": msg.chat.id,
         "message_id": msg.id,
         "caption": new_caption,
+        "reply_markup": reply_markup,
         "user_id": msg.from_user.id if msg.from_user else None
     })
 
@@ -1084,7 +1085,7 @@ async def capture_user_input(client, message):
         instr_msg_id = session["instr_msg_id"]
         lines = text.strip().splitlines()
         buttons = []
-        for line in lines[:3]:  # max 3 buttons
+        for line in lines:
             match = re.findall(r'"([^"]+)"', line)
             if len(match) == 2:
                 buttons.append({
