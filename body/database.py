@@ -3,6 +3,12 @@ from info import *
 from typing import Optional
 import time
 from pymongo import ReturnDocument
+from collections import defaultdict
+
+# -------- Caption Scheduler State (GLOBAL) --------
+CHANNEL_ACTIVE = defaultdict(int)   # channel_id -> active workers
+CHANNEL_COOLDOWN = {}               # channel_id -> unblock timestamp
+DEFAULT_MAX_WORKERS = 2
 
 _CHANNEL_CACHE = {}
 CACHE_TTL = 30  # seconds
