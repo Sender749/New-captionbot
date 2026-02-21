@@ -1123,16 +1123,50 @@ async def capture_user_input(client, message):
             return
         if session.get("step") == "skip":
             raw = (message.text or "").strip()
-            msg_id = extract_msg_id_from_text(raw)
-            if msg_id is None:
+            parsed = parse_forward_input(raw)
+
+            if parsed.get("error"):
+                await message.reply_text(parsed["error"])
+                return
+
+            skip_id = parsed["skip_id"]
+            end_id = parsed["end_id"]
+            src_hint = parsed["src_hint"]
+            src_channel = session["source"]
+
+            # ---- Validate: if link contained a channel id, it must match source ----
+            if src_hint is not None and src_hint != src_channel:
                 await message.reply_text(
-                    "❌ Invalid message.\n\n"
-                    "Send:\n"
-                    "• Telegram message link\n"
-                    "• OR message ID number"
+                    "❌ <b>Wrong channel!</b>\n\n"
+                    "The message link you sent does not belong to the selected source channel.\n"
+                    "Please send a link or ID from the correct source channel."
                 )
                 return
-            session["skip"] = int(msg_id)
+
+            # ---- Validate: check that skip/start msg actually exists in source ----
+            if skip_id > 0:
+                valid = await validate_msg_in_channel(client, src_channel, skip_id)
+                if not valid:
+                    await message.reply_text(
+                        "❌ <b>Message not found!</b>\n\n"
+                        "The start message ID/link does not exist in the source channel.\n"
+                        "Please check and try again."
+                    )
+                    return
+
+            # ---- Validate end message if range was given ----
+            if end_id is not None:
+                valid_end = await validate_msg_in_channel(client, src_channel, end_id)
+                if not valid_end:
+                    await message.reply_text(
+                        "❌ <b>End message not found!</b>\n\n"
+                        "The end message ID/link does not exist in the source channel.\n"
+                        "Please check and try again."
+                    )
+                    return
+
+            session["skip"] = skip_id
+            session["end_id"] = end_id
             session["step"] = "queue"
             try:
                 await message.delete()
