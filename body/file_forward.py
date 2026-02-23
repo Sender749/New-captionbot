@@ -10,8 +10,8 @@ from collections import defaultdict
 FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active
 FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
 
-MAX_FORWARD_PER_PAIR = 1
-FORWARD_DELAY = 1.3
+MAX_FORWARD_PER_PAIR = 2
+FORWARD_DELAY = 0.5
 FORWARD_EXECUTORS = 4
 
 FF_SESSIONS = {}
