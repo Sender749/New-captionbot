@@ -14,7 +14,7 @@ from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANN
 
 ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-DEFAULT_EDIT_DELAY = 1                # per channel
+DEFAULT_EDIT_DELAY = 1.2                # per channel
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
