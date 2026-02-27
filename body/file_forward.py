@@ -10,9 +10,10 @@ from collections import defaultdict
 FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active
 FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
 
-MAX_FORWARD_PER_PAIR = 2
-FORWARD_DELAY = 1
-FORWARD_EXECUTORS = 4
+MAX_FORWARD_PER_PAIR = 3               # allow 3 concurrent per pair
+FORWARD_DELAY = 0.3                     # reduced delay for speed
+FORWARD_EXECUTORS = 6                   # more worker tasks
+PROGRESS_UPDATE_EVERY = 5              # update progress every N files
 
 FF_SESSIONS = {}
 CANCELLED_SESSIONS = set()
@@ -26,12 +27,6 @@ MSG_LINK_RE = re.compile(
     flags=re.IGNORECASE
 )
 
-ANIM_FRAMES = [
-    "🔄 Transferring files",
-    "🔄 Transferring files.",
-    "🔄 Transferring files..",
-    "🔄 Transferring files..."
-]
 
 # ---------- START WORKERS ----------
 def on_bot_start(client: Client):
@@ -178,6 +173,9 @@ async def enqueue_forward_jobs(client: Client, uid: int):
     end_id = s.get("end_id")             # None = no upper limit
 
     s["total"] = 0
+    s["forwarded"] = 0
+    s["errors"] = []
+    start_ts = time.time()
     msg_id = start_id
     consecutive_missing = 0
     MAX_CONSECUTIVE_MISSING = 500
@@ -208,7 +206,8 @@ async def enqueue_forward_jobs(client: Client, uid: int):
             "source_title": s["source_title"],
             "destination_title": s["destination_title"],
             "session_id": session_id,
-            "total": 0
+            "total": 0,
+            "start_time": start_ts,
         })
         s["total"] += 1
         msg_id += 1
@@ -220,10 +219,10 @@ async def enqueue_forward_jobs(client: Client, uid: int):
         s["chat_id"],
         s["msg_id"],
         (
-            f"📤 <b>{s['source_title']}</b>\n"
-            f"         ⬇️⬇️⬇️\n"
-            f"📥 <b>{s['destination_title']}</b>\n\n"
-            "🔄 Preparing files for transfer…"
+            f"📤 <b>Source:</b> {s['source_title']}\n"
+            f"📥 <b>Destination:</b> {s['destination_title']}\n"
+            f"📦 <b>Total files found:</b> <code>{s['total']}</code>\n\n"
+            "⏳ Starting transfer…"
         ),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
 
@@ -328,19 +327,33 @@ async def forward_worker(client: Client):
     while True:
         job = await fetch_forward_fair_job()
         if not job:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
             continue
         key = (job["src"], job["dst"])
         session_id = job.get("session_id")
         msg_id = job.get("msg_id")
+        success = False
         try:
             if session_id in CANCELLED_SESSIONS:
                 await forward_done(job["_id"])
                 continue
 
             msg = await client.get_messages(job["src"], msg_id)
-            await _forward_with_thumb(client, job["src"], job["dst"], msg)
 
+            # Fast path: copy_message (no re-upload, preserves file_id)
+            try:
+                await client.copy_message(
+                    chat_id=job["dst"],
+                    from_chat_id=job["src"],
+                    message_id=msg.id
+                )
+                success = True
+            except Exception:
+                # Fallback: _forward_with_thumb for special thumb handling
+                await _forward_with_thumb(client, job["src"], job["dst"], msg)
+                success = True
+
+            # Dump copy for non-admin users
             job_user = job.get("user_id")
             if job_user != ADMIN:
                 try:
@@ -361,32 +374,112 @@ async def forward_worker(client: Client):
                     )
                 except Exception as e:
                     print(f"[FF_DUMP_FAIL] {e}")
+
             await forward_done(job["_id"])
-            await update_forward_progress(client, job)
+            await update_forward_progress(client, job, success=True)
             await asyncio.sleep(FORWARD_DELAY)
+
         except FloodWait as e:
             wait = int(e.value) + 2
             retries = job.get("retries", 0)
-            wait += min(60, retries * 2)
+            wait = min(wait + retries * 3, 120)
             FORWARD_COOLDOWN[key] = time.time() + wait
+            print(f"[FF_FLOOD] Waiting {wait}s for {key}")
             await forward_retry(job["_id"], wait)
         except Exception as e:
             print(f"[FF_WORKER_ERR] {e}")
             await forward_done(job["_id"])
+            await update_forward_progress(client, job, success=False)
         finally:
-            FORWARD_ACTIVE[key] -= 1
+            FORWARD_ACTIVE[key] = max(0, FORWARD_ACTIVE[key] - 1)
 
 # ---------- PROGRESS ----------
-async def update_forward_progress(client: Client, job):
+SESSION_STATS = defaultdict(lambda: {"forwarded": 0, "errors": [], "start_time": None})
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s"
+
+async def update_forward_progress(client: Client, job, success: bool = True):
     session = job.get("session_id")
     if session in CANCELLED_SESSIONS:
         return
-    frame = ANIM_FRAMES[int(time.time()) % len(ANIM_FRAMES)]
+
+    stats = SESSION_STATS[session]
+    if stats["start_time"] is None:
+        stats["start_time"] = job.get("start_time", time.time())
+    if success:
+        stats["forwarded"] += 1
+    else:
+        stats["errors"].append(job.get("msg_id", "?"))
+
+    # Throttle: only update UI every N files or when done
+    remaining = await forward_queue.count_documents({"session_id": session, "status": {"$in": ["pending", "processing"]}})
+
+    elapsed = time.time() - (stats["start_time"] or time.time())
+    forwarded = stats["forwarded"]
+    total = job.get("total", 0)
+    errors = stats["errors"]
+    err_count = len(errors)
+
+    # Estimate speed
+    speed_str = ""
+    if elapsed > 0 and forwarded > 0:
+        rate = forwarded / elapsed
+        if remaining > 0:
+            eta = remaining / rate
+            speed_str = f"⚡ <b>Speed:</b> {rate:.1f} files/s  |  ETA: {_fmt_duration(eta)}\n"
+
+    if remaining == 0:
+        # ── COMPLETED ──
+        total_time = _fmt_duration(elapsed)
+        err_text = ""
+        if errors:
+            err_ids = ", ".join(str(e) for e in errors[:10])
+            if len(errors) > 10:
+                err_ids += f" … +{len(errors)-10} more"
+            err_text = f"\n⚠️ <b>Failed ({err_count}):</b> <code>{err_ids}</code>"
+        text = (
+            "✅ <b>Forwarding Completed!</b>\n\n"
+            f"📤 <b>Source:</b> {job['source_title']}\n"
+            f"📥 <b>Destination:</b> {job['destination_title']}\n"
+            f"📦 <b>Total Forwarded:</b> <code>{forwarded}</code> / <code>{total}</code>\n"
+            f"⏱ <b>Total Time:</b> {total_time}"
+            f"{err_text}"
+        )
+        try:
+            await client.edit_message_text(job["chat_id"], job["ui_msg"], text)
+        except:
+            pass
+        SESSION_STATS.pop(session, None)
+        return
+
+    # ── IN PROGRESS ── (throttle updates)
+    if forwarded % PROGRESS_UPDATE_EVERY != 0:
+        return
+
+    progress_bar = ""
+    if total > 0:
+        pct = forwarded / total
+        filled = int(pct * 10)
+        progress_bar = "▓" * filled + "░" * (10 - filled) + f" {int(pct*100)}%\n"
+
+    err_text = f"❌ <b>Errors so far:</b> <code>{err_count}</code>\n" if err_count else ""
     text = (
-        f"📤 <b>{job['source_title']}</b>\n"
-        f"         ⬇️⬇️⬇️\n"
-        f"📥 <b>{job['destination_title']}</b>\n\n"
-        f"{frame}"
+        "🔄 <b>Forwarding in Progress…</b>\n\n"
+        f"📤 <b>Source:</b> {job['source_title']}\n"
+        f"📥 <b>Destination:</b> {job['destination_title']}\n\n"
+        f"📦 {progress_bar}"
+        f"✅ <b>Forwarded:</b> <code>{forwarded}</code> / <code>{total}</code>\n"
+        f"⏱ <b>Elapsed:</b> {_fmt_duration(elapsed)}\n"
+        f"{speed_str}"
+        f"{err_text}"
     )
     try:
         await client.edit_message_text(
@@ -396,20 +489,6 @@ async def update_forward_progress(client: Client, job):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
     except:
         pass
-    remaining = await forward_queue.count_documents({"session_id": session})
-    if remaining == 0:
-        try:
-            await client.edit_message_text(
-                job["chat_id"],
-                job["ui_msg"],
-                (
-                    "✅ <b>Forwarding completed</b>\n\n"
-                    f"📤 <b>Source:</b> {job['source_title']}\n"
-                    f"📥 <b>Destination:</b> {job['destination_title']}\n\n"
-                )
-            )
-        except:
-            pass
 
 # ---------- CANCEL ----------
 @Client.on_callback_query(filters.regex("^ff_cancel$"))
@@ -422,18 +501,25 @@ async def ff_cancel(client, query):
     session_id = s.get("session_id")
     if session_id:
         CANCELLED_SESSIONS.add(session_id)
-        remaining = await forward_queue.count_documents(
-            {"session_id": session_id}
-        )
+        stats = SESSION_STATS.pop(session_id, {})
+        forwarded = stats.get("forwarded", 0)
+        errors = stats.get("errors", [])
+        start_time = stats.get("start_time")
+        elapsed = _fmt_duration(time.time() - start_time) if start_time else "N/A"
         total = s.get("total", 0)
-        sent = max(total - remaining, 0)
-        await forward_queue.delete_many(
-            {"session_id": session_id}
-        )
+        remaining = await forward_queue.count_documents({"session_id": session_id})
+
+        await forward_queue.delete_many({"session_id": session_id})
+
+        err_text = f"\n❌ <b>Errors:</b> <code>{len(errors)}</code>" if errors else ""
         await query.message.edit_text(
-            "🛑 <b>Forwarding cancelled</b>\n\n"
-            f"📦 <b>Files sent:</b> <code>{sent}</code>\n"
-            f"🗂 <b>Initially detected:</b> <code>{total}</code>"
+            "🛑 <b>Forwarding Cancelled</b>\n\n"
+            f"📤 <b>Source:</b> {s.get('source_title','?')}\n"
+            f"📥 <b>Destination:</b> {s.get('destination_title','?')}\n\n"
+            f"✅ <b>Forwarded:</b> <code>{forwarded}</code>\n"
+            f"📦 <b>Total found:</b> <code>{total}</code>\n"
+            f"⏱ <b>Time elapsed:</b> {elapsed}"
+            f"{err_text}"
         )
     else:
         await query.message.edit_text("🛑 Cancelled.")
