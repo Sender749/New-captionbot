@@ -597,17 +597,26 @@ async def reCap(client, msg):
         raw_file_name = normalize_series_name(file_name)
         smart_file_name = ""
         if "{smart_file_name}" in cap_template:
-            smart_file_name = build_smart_filename(
-                raw_file_name,
-                default_caption
-            )
+            smart_file_name = build_smart_filename(raw_file_name, default_caption)
+        # Extract extra placeholders
+        extra = extract_placeholders_from_combined(raw_file_name, default_caption)
         new_caption = cap_template.format(
             file_name=raw_file_name,
             smart_file_name=smart_file_name,
             file_size=file_size,
             default_caption=default_caption,
             language=language or "",
-            year=year or ""
+            year=year or "",
+            empty="",
+            resolution=extra.get("resolution", ""),
+            quality=extra.get("quality", ""),
+            source=extra.get("source", ""),
+            codec=extra.get("codec", ""),
+            audio_codec=extra.get("audio_codec", ""),
+            extension=extra.get("extension", ""),
+            season=extra.get("season", ""),
+            episode=extra.get("episode", ""),
+            subtitle=extra.get("subtitle", ""),
         )
     except Exception as e:
         new_caption = cap_template
@@ -647,13 +656,13 @@ LANG_LIST = [
     "Hindi","English","Tamil","Telugu","Malayalam","Kannada",
     "Marathi","Gujarati","Bengali","Punjabi","Urdu",
     "Japanese","Korean","Chinese","Spanish","French","German",
-    "Italian","Russian"
+    "Italian","Russian","Arabic","Turkish"
 ]
-QUALITY_LIST = ["480p","720p","1080p","2160p","4k"]
-SOURCE_LIST = ["WEB-DL","WEBRip","BluRay","HDRip","DVDRip"]
-VIDEO_CODEC_LIST = ["x265","x264","HEVC","AV1"]
-AUDIO_CODEC_LIST = ["AAC","DDP","AC3","DTS","Atmos"]
-EXT_LIST = ["mkv","mp4","avi","webm"]
+QUALITY_LIST = ["2160p","1080p","720p","480p","360p","4K","4k"]
+SOURCE_LIST = ["WEB-DL","WEBRip","BluRay","Blu-Ray","HDRip","DVDRip","HDTV","AMZN","NF","DSNP"]
+VIDEO_CODEC_LIST = ["x265","x264","HEVC","AV1","H.264","H.265"]
+AUDIO_CODEC_LIST = ["DD5.1","DDP5.1","AAC","DDP","AC3","DTS","Atmos","DD2.0"]
+EXT_LIST = ["mkv","mp4","avi","webm","mov"]
 
 def _norm(text: str) -> str:
     return re.sub(r'\s+', ' ', text.lower()).strip()
@@ -676,63 +685,98 @@ def extract_title_year(text: str):
     year = year_match.group(1) if year_match else ""
     cut = year_match.start() if year_match else len(text)
     title = text[:cut]
+    # Remove season/ep info and technical tags
     title = re.sub(
-        r'\b(480p|720p|1080p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|av1)\b',
-        '',
-        title,
-        flags=re.I
+        r'\b(s\d{1,2}|e\d{1,2}|ep\d{1,2}|480p|720p|1080p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|av1|dual|audio|esub|hsub|sub)\b',
+        '', title, flags=re.I
     )
+    title = re.sub(r'\s+', ' ', title)
     return title.strip().title(), year
 
 def detect_media_type(text: str):
-    if re.search(r'\bS\d{1,2}E\d{1,2}\b', text, re.I):
+    # Series with episode range like S01 (Ep.01-09)
+    if re.search(r'\bS\d{1,2}\s*\(Ep', text, re.I):
+        return "series"
+    if re.search(r'\bS\d{1,2}\s*E\d{1,2}\b', text, re.I):
         return "series"
     if re.search(r'\banime\b', text, re.I):
         return "anime"
     return "movie"
 
 def extract_season_episode(text: str):
-    text = text.replace("–", "-").replace("to", "-")
+    """Extract season and episode info supporting:
+    - S01 E02 → S01 E02
+    - S01 (Ep.01-09) → S01 (Ep.01-09)
+    - S01E07 → S01 E07
+    - WebRip Hin Eng S01 E02 → S01 E02
+    """
+    text = text.replace("–", "-")
     season = ""
-    s_match = re.search(r'\bS(?:eason)?\s*(\d+)\b', text, re.I)
+    episode = ""
+
+    # Season
+    s_match = re.search(r'\bS(?:eason)?\s*(\d{1,2})\b', text, re.I)
     if s_match:
         s_num = int(s_match.group(1))
         season = f"S{s_num:02d}"
-    ep_range = ""
-    r_match = re.search(
-        r'\b(?:E|EP|Episode|Episodes)?\s*(\d+)\s*-\s*(\d+)\b',
-        text,
-        re.I
-    )
-    if r_match:
-        start = int(r_match.group(1))
-        end = int(r_match.group(2))
-        ep_range = f"E{start:02d}-{end:02d}"
-        return season, ep_range
-    e_match = re.search(r'\bE(?:P)?\s*(\d+)\b', text, re.I)
+
+    # Episode range: (Ep.01-09) or Ep.01-09
+    ep_range_match = re.search(r'\(?Ep[.\s]*(\d{1,3})\s*[-–]\s*(\d{1,3})\)?', text, re.I)
+    if ep_range_match:
+        start = int(ep_range_match.group(1))
+        end = int(ep_range_match.group(2))
+        episode = f"(Ep.{start:02d}-{end:02d})"
+        return season, episode
+
+    # Single episode: E02 or EP02 or E 02
+    e_match = re.search(r'\bE(?:P)?\s*(\d{1,3})\b', text, re.I)
     if e_match:
         e_num = int(e_match.group(1))
-        return season, f"E{e_num:02d}"
-    return season, ""
+        episode = f"E{e_num:02d}"
+
+    return season, episode
 
 def extract_audio_languages(text: str):
+    """Extract audio languages, supporting formats like:
+    Dual Audio (Hindi + Tamil), Hindi + English, Hin Eng
+    """
     found = []
-    block = re.search(r'(audio|dual audio|multi audio)[^a-z]*([a-z ,+/]+)', text, re.I)
-    src = block.group(2) if block else text
+    # Short code mapping
+    SHORT_CODES = {
+        "hin": "Hindi", "eng": "English", "tam": "Tamil",
+        "tel": "Telugu", "mal": "Malayalam", "kan": "Kannada",
+        "ben": "Bengali", "pun": "Punjabi", "mar": "Marathi",
+    }
+    # Check short codes (3-letter, space separated like "Hin Eng")
+    for code, lang in SHORT_CODES.items():
+        if re.search(rf'\b{code}\b', text, re.I) and lang not in found:
+            found.append(lang)
+
+    # Full names — search in dual/multi audio block first, then full text
+    block_match = re.search(r'(?:dual|multi|triple)?\s*audio[^a-z]*([^\n]+)', text, re.I)
+    src = block_match.group(1) if block_match else text
     for lang in LANG_LIST:
-        if re.search(rf'\b{lang}\b', src, re.I):
+        if re.search(rf'\b{lang}\b', src, re.I) and lang not in found:
             found.append(lang)
     return list(dict.fromkeys(found))
 
 def extract_subtitle_tag(text: str):
+    """Returns ESub, HSub, Sub, or empty string.
+    Also detects 'ESub' / 'HSub' / 'Sub' directly in text.
+    """
+    # Direct tag
+    if re.search(r'\bESub(?:s)?\b', text, re.I):
+        return "ESub"
+    if re.search(r'\bHSub(?:s)?\b', text, re.I):
+        return "HSub"
+    # Computed from sub language block
     found = []
     m = re.search(r'(subs?|subtitles?)[:\- ]+([a-z ,+/]+)', text, re.I)
-    if not m:
-        return ""
-    block = m.group(2)
-    for lang in LANG_LIST:
-        if re.search(rf'\b{lang}\b', block, re.I):
-            found.append(lang)
+    if m:
+        block = m.group(2)
+        for lang in LANG_LIST:
+            if re.search(rf'\b{lang}\b', block, re.I):
+                found.append(lang)
     if not found:
         return ""
     if found == ["English"]:
@@ -743,60 +787,152 @@ def extract_subtitle_tag(text: str):
 
 def extract_quality(text: str):
     for q in QUALITY_LIST:
-        if re.search(rf'\b{q}\b', text, re.I):
+        if re.search(rf'\b{re.escape(q)}\b', text, re.I):
             return q
     return ""
 
 def extract_source(text: str):
     for s in SOURCE_LIST:
-        if re.search(rf'\b{s}\b', text, re.I):
+        if re.search(rf'\b{re.escape(s)}\b', text, re.I):
             return s
     return ""
-    
+
 def extract_video_codec(text: str):
     for c in VIDEO_CODEC_LIST:
-        if re.search(rf'\b{c}\b', text, re.I):
+        if re.search(rf'\b{re.escape(c)}\b', text, re.I):
             return c
     return ""
 
 def extract_audio_codec(text: str):
-    for c in AUDIO_CODEC_LIST:
-        if re.search(rf'\b{c}\b', text, re.I):
-            return c
+    # Try to get full bitrate notation like DD5.1-224Kbps
+    m = re.search(r'(DD5\.1|DDP5\.1|DD2\.0|DDP|AAC|AC3|DTS|Atmos)(?:[- ]\d+Kbps)?', text, re.I)
+    if m:
+        return m.group(0)
     return ""
 
 def extract_extension(text: str):
-    for e in EXT_LIST:
-        if re.search(rf'\.{e}\b|\b{e}\b', text, re.I):
-            return e.upper()
+    # Prefer from original filename (last part after dot)
+    ext_match = re.search(rf'\.({"|".join(EXT_LIST)})\b', text, re.I)
+    if ext_match:
+        return ext_match.group(1).lower()
     return ""
 
-def build_smart_filename(filename: str, caption: str):
+def extract_resolution(text: str) -> str:
+    """Returns resolution like 1920x1080 if found, else quality like 1080p."""
+    m = re.search(r'\b(\d{3,4}[xX×]\d{3,4})\b', text)
+    if m:
+        return m.group(1)
+    return extract_quality(text)
+
+def build_smart_filename(filename: str, caption: str) -> str:
+    """
+    Build a smart filename from both the raw filename and original caption.
+    Output format:
+      Movie: Title (Year) [Audio] Quality Source Codec ESub.ext
+      Series: Title S01 (Ep.01-09) (Year) [Audio] Quality Source Codec ESub.ext
+    Examples:
+      Sangamarmar S01 (Ep.01-09) (2026) Hindi Web Series HEVC 1080p ESub.mkv
+      Deepwater Horizon (2016) (Hindi DD5.1 + English DD5.1) BluRay 1080p ESub.mkv
+    """
+    # Combine filename (cleaned) + caption for analysis
+    raw_combined = f"{filename} {caption}"
+
+    # --- Extract all components ---
+    title, year = extract_title_year(raw_combined)
+    title, year = imdb_enrich_title(title, year)
+    season, episode = extract_season_episode(raw_combined)
+    audio_langs = extract_audio_languages(raw_combined)
+    subtitle = extract_subtitle_tag(raw_combined)
+    quality = extract_quality(raw_combined)
+    source = extract_source(raw_combined)
+    vcodec = extract_video_codec(raw_combined)
+    ext = extract_extension(raw_combined)
+
+    # Detect if it's a web series
+    is_series = bool(season) or detect_media_type(raw_combined) == "series"
+    is_web_series = is_series and re.search(r'\b(web|webrip|web-dl)\b', raw_combined, re.I)
+
+    # --- Build audio string ---
+    # Try to get audio with bitrate per language e.g. "Hindi DD5.1-224Kbps + English DD5.1-192Kbps"
+    audio_bitrate_matches = re.findall(
+        r'(Hindi|English|Tamil|Telugu|Malayalam|Kannada|Bengali|Punjabi|Urdu)'
+        r'\s+(DD5\.1|DDP5\.1|DD2\.0|DDP|AAC|AC3|DTS|Atmos)(?:[- ](\d+Kbps))?',
+        caption, re.I
+    )
+    if audio_bitrate_matches:
+        audio_parts = []
+        for lang, codec, kbps in audio_bitrate_matches:
+            if kbps:
+                audio_parts.append(f"{lang.title()} {codec}-{kbps}")
+            else:
+                audio_parts.append(f"{lang.title()} {codec}")
+        audio_str = " + ".join(audio_parts)
+        if len(audio_langs) > 1:
+            audio_str = f"({audio_str}) Dual Audio"
+    elif audio_langs:
+        if len(audio_langs) == 1:
+            audio_str = audio_langs[0]
+        elif len(audio_langs) == 2:
+            audio_str = f"({audio_langs[0]} + {audio_langs[1]}) Dual Audio"
+        else:
+            audio_str = "(" + " + ".join(audio_langs) + ") Multi Audio"
+    else:
+        audio_str = ""
+
+    # --- Assemble ---
+    parts = [title]
+    if season:
+        if episode:
+            parts.append(f"{season} {episode}")
+        else:
+            parts.append(season)
+    if year:
+        parts.append(f"({year})")
+    if audio_str:
+        parts.append(audio_str)
+    if is_web_series:
+        parts.append("Web Series")
+    if vcodec:
+        parts.append(vcodec)
+    if quality:
+        parts.append(quality)
+    if source and not is_web_series:
+        parts.append(source)
+    if subtitle:
+        parts.append(subtitle)
+    if ext:
+        result = " ".join(parts) + f".{ext}"
+    else:
+        result = " ".join(parts)
+    return result.strip()
+
+def extract_placeholders_from_combined(filename: str, caption: str) -> dict:
+    """
+    Return a dict of ALL extractable placeholders for use in caption templates.
+    """
     raw = f"{filename} {caption}"
     title, year = extract_title_year(raw)
-    title, year = imdb_enrich_title(title, year)
-    media_type = detect_media_type(raw)
     season, episode = extract_season_episode(raw)
     audio_langs = extract_audio_languages(raw)
-    subs = extract_subtitle_tag(raw)
+    subtitle = extract_subtitle_tag(raw)
     quality = extract_quality(raw)
     source = extract_source(raw)
     vcodec = extract_video_codec(raw)
     acodec = extract_audio_codec(raw)
     ext = extract_extension(raw)
-    parts = [title]
-    if season or episode:
-        parts.append(f"{season}{episode}".strip())
-    if year:
-        parts.append(year)
-    if audio_langs:
-        parts.append("+".join(audio_langs))
-    if subs:
-        parts.append(subs)
-    for p in [quality, source, vcodec, acodec, ext]:
-        if p:
-            parts.append(p)
-    return " ".join(parts).strip()
+    resolution = extract_resolution(raw)
+    lang_str = " + ".join(audio_langs) if audio_langs else ""
+    return {
+        "quality": quality,
+        "resolution": resolution,
+        "source": source,
+        "codec": vcodec,
+        "audio_codec": acodec,
+        "extension": ext,
+        "season": season,
+        "episode": episode,
+        "subtitle": subtitle,
+    }
 
 
 # ---------------- Helper functions ----------------
