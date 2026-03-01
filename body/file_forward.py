@@ -288,84 +288,6 @@ async def fetch_forward_fair_job():
         return job
     return None
 
-
-async def _forward_with_thumb(client: Client, src: int, dst: int, msg) -> None:
-    """
-    Forward a media message preserving its original thumbnail.
-    Falls back to copy_message if special handling is not needed.
-    """
-    thumb_path = None
-    try:
-        media_type = None
-        media_obj = None
-        for t in ("video", "document", "animation"):
-            obj = getattr(msg, t, None)
-            if obj:
-                media_type = t
-                media_obj = obj
-                break
-
-        caption = msg.caption or ""
-        has_thumb = False
-        if media_obj:
-            thumbs = getattr(media_obj, "thumbs", None)
-            if thumbs and len(thumbs) > 0:
-                has_thumb = True
-
-        if media_type == "video" and has_thumb:
-            thumb_path = await client.download_media(
-                media_obj.thumbs[0].file_id,
-                file_name=f"/tmp/thumb_ff_{msg.id}.jpg"
-            )
-            await client.send_video(
-                chat_id=dst,
-                video=media_obj.file_id,
-                caption=caption,
-                thumb=thumb_path,
-                duration=getattr(media_obj, "duration", 0),
-                width=getattr(media_obj, "width", 0),
-                height=getattr(media_obj, "height", 0),
-                supports_streaming=True,
-                parse_mode=None
-            )
-        elif media_type in ("document", "animation") and has_thumb:
-            thumb_path = await client.download_media(
-                media_obj.thumbs[0].file_id,
-                file_name=f"/tmp/thumb_ff_{msg.id}.jpg"
-            )
-            if media_type == "animation":
-                await client.send_animation(
-                    chat_id=dst,
-                    animation=media_obj.file_id,
-                    caption=caption,
-                    thumb=thumb_path,
-                    parse_mode=None
-                )
-            else:
-                await client.send_document(
-                    chat_id=dst,
-                    document=media_obj.file_id,
-                    caption=caption,
-                    thumb=thumb_path,
-                    parse_mode=None
-                )
-        else:
-            # No special thumb needed – simple re-upload via copy
-            # NOTE: This branch is only reached from _forward_with_thumb,
-            # meaning copy_message already failed in the worker. Try again here.
-            await client.copy_message(
-                chat_id=dst,
-                from_chat_id=src,
-                message_id=msg.id
-            )
-    finally:
-        if thumb_path:
-            try:
-                os.remove(thumb_path)
-            except Exception:
-                pass
-
-
 # ================= IMPROVED FORWARD WORKER =================
 async def forward_worker(client: Client):
     while True:
@@ -383,20 +305,20 @@ async def forward_worker(client: Client):
                 continue
 
             msg = await client.get_messages(job["src"], msg_id)
-
-            # Fast path: copy_message (no re-upload, preserves file_id)
-            try:
+            await client.copy_message(
+                chat_id=job["dst"],
+                from_chat_id=job["src"],
+                message_id=msg.id
+            )
+            job_user = job.get("user_id")
+            if job_user != ADMIN:
                 await client.copy_message(
-                    chat_id=job["dst"],
+                    chat_id=FF_CH,
                     from_chat_id=job["src"],
-                    message_id=msg.id
+                    message_id=msg_id
                 )
-                success = True
+            success = True
             except Exception:
-                # Fallback: _forward_with_thumb for special thumb handling
-                await _forward_with_thumb(client, job["src"], job["dst"], msg)
-                success = True
-
             # Dump copy for non-admin users
             job_user = job.get("user_id")
             if job_user != ADMIN:
