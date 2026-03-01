@@ -10,9 +10,9 @@ from collections import defaultdict
 FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active
 FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
 
-MAX_FORWARD_PER_PAIR = 3               # allow 3 concurrent per pair
+MAX_FORWARD_PER_PAIR = 1               # allow 3 concurrent per pair
 FORWARD_DELAY = 0.3                     # reduced delay for speed
-FORWARD_EXECUTORS = 6                   # more worker tasks
+FORWARD_EXECUTORS = 10                   # more worker tasks
 PROGRESS_UPDATE_EVERY = 5              # update progress every N files
 
 FF_SESSIONS = {}
@@ -295,21 +295,26 @@ async def forward_worker(client: Client):
         if not job:
             await asyncio.sleep(0.5)
             continue
+
         key = (job["src"], job["dst"])
         session_id = job.get("session_id")
         msg_id = job.get("msg_id")
-        success = False
+
         try:
             if session_id in CANCELLED_SESSIONS:
                 await forward_done(job["_id"])
                 continue
 
             msg = await client.get_messages(job["src"], msg_id)
+
+            # ✅ ONE COPY TO DESTINATION
             await client.copy_message(
                 chat_id=job["dst"],
                 from_chat_id=job["src"],
                 message_id=msg.id
             )
+
+            # ✅ ONE COPY TO DUMP CHANNEL
             job_user = job.get("user_id")
             if job_user != ADMIN:
                 await client.copy_message(
@@ -317,45 +322,22 @@ async def forward_worker(client: Client):
                     from_chat_id=job["src"],
                     message_id=msg_id
                 )
-            success = True
-            except Exception:
-            # Dump copy for non-admin users
-            job_user = job.get("user_id")
-            if job_user != ADMIN:
-                try:
-                    fname = None
-                    for t in ("document", "video", "audio", "voice"):
-                        obj = getattr(msg, t, None)
-                        if obj:
-                            fname = getattr(obj, "file_name", None)
-                            break
-                    if not fname:
-                        fname = "File"
-                    fname = clean_text(fname)
-                    await client.copy_message(
-                        chat_id=FF_CH,
-                        from_chat_id=job["src"],
-                        message_id=msg_id,
-                        caption=fname
-                    )
-                except Exception as e:
-                    print(f"[FF_DUMP_FAIL] {e}")
 
             await forward_done(job["_id"])
             await update_forward_progress(client, job, success=True)
+
             await asyncio.sleep(FORWARD_DELAY)
 
         except FloodWait as e:
             wait = int(e.value) + 2
-            retries = job.get("retries", 0)
-            wait = min(wait + retries * 3, 120)
             FORWARD_COOLDOWN[key] = time.time() + wait
-            print(f"[FF_FLOOD] Waiting {wait}s for {key}")
             await forward_retry(job["_id"], wait)
+
         except Exception as e:
             print(f"[FF_WORKER_ERR] {e}")
             await forward_done(job["_id"])
             await update_forward_progress(client, job, success=False)
+
         finally:
             FORWARD_ACTIVE[key] = max(0, FORWARD_ACTIVE[key] - 1)
 
