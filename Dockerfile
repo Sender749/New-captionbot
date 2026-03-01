@@ -26,8 +26,8 @@ RUN pip install imdbpy
 # Create logs directory
 RUN mkdir -p /app/logs
 
-# Expose Flask port
-EXPOSE 5000
+# Expose port
+EXPOSE 8000
 
 # Start supervisord
 CMD ["/usr/bin/supervisord", "-c", "/app/supervisord.conf"]
