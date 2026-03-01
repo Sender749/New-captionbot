@@ -255,12 +255,13 @@ async def remove_dump_cmd(client, message):
 async def ff_start(client, message):
     uid = message.from_user.id
     channels = await get_user_channels(uid)
+    print(f"[FF_START] uid={uid} channels={len(channels)}", flush=True)
     if not channels:
         return await message.reply_text("❌ No admin channels found.")
     FF_SESSIONS[uid] = {
         "step": "src",
         "channels": channels,
-        "expires": None  
+        "expires": None
     }
     kb = [[InlineKeyboardButton(ch["channel_title"], callback_data=f"ff_src_{ch['channel_id']}")] for ch in channels]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")])
@@ -1124,37 +1125,38 @@ async def capture_user_input(client, message):
     # a channel message (which has no .text) to indicate the skip point.
     if user_id in FF_SESSIONS:
         session = FF_SESSIONS[user_id]
+        print(f"[FF_INPUT] uid={user_id} step={session.get('step')} text={bool(message.text)} fwd={bool(getattr(message,'forward_from_chat',None))}", flush=True)
         if session.get("expires") and session["expires"] < time.time():
             FF_SESSIONS.pop(user_id, None)
             await message.reply_text("⏰ Session expired.\nStart again using /file_forward")
             return
         if session.get("step") == "skip":
-            # Support three input formats:
-            # 1. Plain text: a number or a t.me link typed/pasted by the user
-            # 2. Forwarded message: user forwards a message from the source channel
+            # Accepts: typed/pasted link or number, OR forwarded message from channel
             raw = ""
-            fwd_chat = getattr(message, "forward_from_chat", None)
+            fwd_chat   = getattr(message, "forward_from_chat", None)
             fwd_msg_id = getattr(message, "forward_from_message_id", None)
             if fwd_chat and fwd_msg_id:
-                # Build a synthetic link so parse_forward_input can handle it
                 cid = str(fwd_chat.id)
                 if cid.startswith("-100"):
-                    cid = cid[4:]  # strip -100 prefix for t.me/c/ style
+                    cid = cid[4:]
                 raw = f"https://t.me/c/{cid}/{fwd_msg_id}"
+                print(f"[FF_SKIP] uid={user_id} forwarded msg → raw={raw}", flush=True)
             else:
                 raw = (message.text or "").strip()
+                print(f"[FF_SKIP] uid={user_id} text input → raw={raw!r}", flush=True)
 
             if not raw:
                 await message.reply_text(
-                    "⏭ Enter forwarding range\n\nOptions:\n• 0 — forward ALL files\n• msg_link or id — start AFTER this message\n• start - end — forward BETWEEN two messages"
-                    "Examples:\n0\nhttps://t.me/c/1815162626/100\n100 - 500\nhttps://t.me/c/1234/100 - https://t.me/c/1234/500\n\n• Session expires in 15 minutes"
+                    "❌ Please send a message link, a message ID, or <code>0</code> to forward all.",
+                    parse_mode="html"
                 )
                 return
 
             parsed = parse_forward_input(raw)
+            print(f"[FF_SKIP] parsed={parsed}", flush=True)
 
             if parsed.get("error"):
-                await message.reply_text(parsed["error"])
+                await message.reply_text(f"❌ {parsed['error']}")
                 return
 
             skip_id = parsed["skip_id"]
