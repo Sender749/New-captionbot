@@ -7,10 +7,7 @@ from pyrogram.errors import FloodWait
 from body.database import *
 from collections import defaultdict
 
-FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active
-FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
-
-MAX_FORWARD_PER_PAIR = 1               # allow 3 concurrent per pair
+MAX_FORWARD_PER_PAIR = 1               # keep it 1
 FORWARD_DELAY = 0.3                     # reduced delay for speed
 FORWARD_EXECUTORS = 10                   # more worker tasks
 PROGRESS_UPDATE_EVERY = 5              # update progress every N files
@@ -22,15 +19,6 @@ PRIORITY_PAIRS = set()   # pairs waiting to resume first
 
 FF_SESSIONS = {}
 CANCELLED_SESSIONS = set()
-USERNAME_RE = re.compile(r'@\w+', flags=re.IGNORECASE)
-URL_RE = re.compile(r'(https?://\S+|t\.me/\S+)', flags=re.IGNORECASE)
-HTML_TAG_RE = re.compile(r'<[^>]+>')
-MD_LINK_RE = re.compile(r'\[([^\]]+)\]\([^)]+\)')
-# Matches t.me/c/CHANNEL_ID/MSG_ID or t.me/USERNAME/MSG_ID
-MSG_LINK_RE = re.compile(
-    r'(?:https?://)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]+))/(\d+)',
-    flags=re.IGNORECASE
-)
 
 
 # ---------- START WORKERS ----------
@@ -47,17 +35,6 @@ def on_bot_start(client: Client):
     for _ in range(FORWARD_EXECUTORS):
         asyncio.create_task(forward_worker(client))
     asyncio.create_task(_recover_loop())
-
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    text = MD_LINK_RE.sub(r'\1', text)
-    text = HTML_TAG_RE.sub('', text)
-    text = URL_RE.sub('', text)
-    text = USERNAME_RE.sub('', text)
-    text = re.sub(r'\s+', ' ', text)
-    return text.strip()
-
 
 def _parse_single(text: str):
     """
