@@ -15,6 +15,10 @@ FORWARD_DELAY = 0.3                     # reduced delay for speed
 FORWARD_EXECUTORS = 10                   # more worker tasks
 PROGRESS_UPDATE_EVERY = 5              # update progress every N files
 
+PAIR_COOLDOWN = {}              # (src,dst) -> unblock time
+PAIR_ACTIVE = defaultdict(int)  # active workers per pair
+PAIR_MAX_WORKERS = 1            # one worker per pair
+
 FF_SESSIONS = {}
 CANCELLED_SESSIONS = set()
 USERNAME_RE = re.compile(r'@\w+', flags=re.IGNORECASE)
@@ -276,11 +280,11 @@ async def fetch_forward_fair_job():
     ).sort("ts", 1)
     async for job in cursor:
         key = (job["src"], job["dst"])
-        if FORWARD_COOLDOWN.get(key, 0) > now:
+        if PAIR_COOLDOWN.get(key, 0) > now:
             continue
-        if FORWARD_ACTIVE[key] >= MAX_FORWARD_PER_PAIR:
+        if PAIR_ACTIVE[key] >= PAIR_MAX_WORKERS:
             continue
-        FORWARD_ACTIVE[key] += 1
+        PAIR_ACTIVE[key] += 1
         await forward_queue.update_one(
             {"_id": job["_id"], "status": "pending"},
             {"$set": {"status": "processing", "started": now}}
@@ -330,7 +334,7 @@ async def forward_worker(client: Client):
 
         except FloodWait as e:
             wait = int(e.value) + 2
-            FORWARD_COOLDOWN[key] = time.time() + wait
+            PAIR_COOLDOWN[key] = time.time() + wait
             await forward_retry(job["_id"], wait)
 
         except Exception as e:
@@ -339,7 +343,7 @@ async def forward_worker(client: Client):
             await update_forward_progress(client, job, success=False)
 
         finally:
-            FORWARD_ACTIVE[key] = max(0, FORWARD_ACTIVE[key] - 1)
+            PAIR_ACTIVE[key] = max(0, PAIR_ACTIVE[key] - 1)
 
 # ---------- PROGRESS ----------
 SESSION_STATS = defaultdict(lambda: {"forwarded": 0, "errors": [], "start_time": None, "total": 0})
