@@ -25,6 +25,7 @@ async def ensure_forward_indexes():
     await forward_queue.create_index([("status", 1), ("ts", 1)])
     await forward_queue.create_index([("src", 1)])
     await forward_queue.create_index([("dst", 1)])
+    await forward_queue.create_index([("session_id", 1)])
 
 async def enqueue_forward(job: dict):
     await forward_queue.insert_one({
@@ -43,6 +44,18 @@ async def forward_retry(job_id, delay):
         {"$set": {"status": "pending", "ts": time.time() + delay},
          "$inc": {"retries": 1}}
     )
+
+async def recover_stuck_forward_jobs(timeout=600):
+    """Reset forward jobs stuck in 'processing' state for too long."""
+    result = await forward_queue.update_many(
+        {
+            "status": "processing",
+            "started": {"$lt": time.time() - timeout}
+        },
+        {"$set": {"status": "pending"}}
+    )
+    if result.modified_count:
+        print(f"[FF_RECOVER] Reset {result.modified_count} stuck forward jobs", flush=True)
 
 # ---------------- Dump skip functions ----------------
 
