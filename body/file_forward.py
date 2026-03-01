@@ -18,6 +18,7 @@ PROGRESS_UPDATE_EVERY = 5              # update progress every N files
 PAIR_COOLDOWN = {}              # (src,dst) -> unblock time
 PAIR_ACTIVE = defaultdict(int)  # active workers per pair
 PAIR_MAX_WORKERS = 1            # one worker per pair
+PRIORITY_PAIRS = set()   # pairs waiting to resume first
 
 FF_SESSIONS = {}
 CANCELLED_SESSIONS = set()
@@ -275,21 +276,57 @@ async def enqueue_forward_jobs(client: Client, uid: int):
 # ================= FORWARD SCHEDULER STATE =================
 async def fetch_forward_fair_job():
     now = time.time()
+
     cursor = forward_queue.find(
         {"status": "pending"}
     ).sort("ts", 1)
+
+    # ===== FIRST PASS: PRIORITY PAIRS =====
     async for job in cursor:
         key = (job["src"], job["dst"])
+
+        if key not in PRIORITY_PAIRS:
+            continue
+
         if PAIR_COOLDOWN.get(key, 0) > now:
             continue
+
         if PAIR_ACTIVE[key] >= PAIR_MAX_WORKERS:
             continue
+
+        PRIORITY_PAIRS.discard(key)
         PAIR_ACTIVE[key] += 1
+
         await forward_queue.update_one(
             {"_id": job["_id"], "status": "pending"},
             {"$set": {"status": "processing", "started": now}}
         )
+
         return job
+
+    # ===== SECOND PASS: NORMAL JOBS =====
+    cursor = forward_queue.find(
+        {"status": "pending"}
+    ).sort("ts", 1)
+
+    async for job in cursor:
+        key = (job["src"], job["dst"])
+
+        if PAIR_COOLDOWN.get(key, 0) > now:
+            continue
+
+        if PAIR_ACTIVE[key] >= PAIR_MAX_WORKERS:
+            continue
+
+        PAIR_ACTIVE[key] += 1
+
+        await forward_queue.update_one(
+            {"_id": job["_id"], "status": "pending"},
+            {"$set": {"status": "processing", "started": now}}
+        )
+
+        return job
+
     return None
 
 # ================= IMPROVED FORWARD WORKER =================
@@ -335,6 +372,7 @@ async def forward_worker(client: Client):
         except FloodWait as e:
             wait = int(e.value) + 2
             PAIR_COOLDOWN[key] = time.time() + wait
+            PRIORITY_PAIRS.add(key)
             await forward_retry(job["_id"], wait)
 
         except Exception as e:
