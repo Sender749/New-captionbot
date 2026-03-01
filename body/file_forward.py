@@ -21,7 +21,7 @@ PROGRESS_UPDATE_EVERY = 5
 
 PAIR_COOLDOWN    = {}               # (src,dst) -> unblock time
 PAIR_ACTIVE      = defaultdict(int) # active workers per pair
-PAIR_MAX_WORKERS = 1
+PAIR_MAX_WORKERS = 2
 PRIORITY_PAIRS   = set()
 
 FF_SESSIONS        = {}
