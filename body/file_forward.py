@@ -29,9 +29,19 @@ MSG_LINK_RE = re.compile(
 
 
 # ---------- START WORKERS ----------
+async def _recover_loop():
+    """Periodically reset forward jobs stuck in processing state."""
+    while True:
+        try:
+            await recover_stuck_forward_jobs(timeout=600)
+        except Exception as e:
+            print(f"[FF_RECOVER_ERR] {e}")
+        await asyncio.sleep(300)
+
 def on_bot_start(client: Client):
     for _ in range(FORWARD_EXECUTORS):
         asyncio.create_task(forward_worker(client))
+    asyncio.create_task(_recover_loop())
 
 def clean_text(text: str) -> str:
     if not text:
@@ -176,7 +186,38 @@ async def enqueue_forward_jobs(client: Client, uid: int):
     s["forwarded"] = 0
     s["errors"] = []
     start_ts = time.time()
-    msg_id = start_id
+
+    # --- Smart scan: find the actual first available message to avoid
+    #     iterating over thousands of deleted message IDs when skip=0
+    #     or when skip_id is far below the first real message.
+    effective_start = start_id
+    if start_id <= 1 or end_id is None:
+        # Try to find the real first message quickly using a binary-search-like
+        # approach: fetch the channel's recent messages to get the latest id,
+        # then if start_id is far behind, jump forward in large strides.
+        try:
+            recent = await client.get_chat_history(src, limit=1)
+            latest_id = 0
+            async for m in recent:
+                latest_id = m.id
+            if latest_id > 0 and start_id < latest_id:
+                # Binary search for the first non-empty message >= start_id
+                lo, hi = start_id, latest_id
+                while hi - lo > 200:
+                    mid = (lo + hi) // 2
+                    try:
+                        probe = await client.get_messages(src, mid)
+                        if probe and not getattr(probe, 'empty', True):
+                            hi = mid
+                        else:
+                            lo = mid + 1
+                    except Exception:
+                        lo = mid + 1
+                effective_start = lo
+        except Exception:
+            effective_start = start_id  # fallback to original
+
+    msg_id = effective_start
     consecutive_missing = 0
     MAX_CONSECUTIVE_MISSING = 500
     while True:
@@ -206,13 +247,14 @@ async def enqueue_forward_jobs(client: Client, uid: int):
             "source_title": s["source_title"],
             "destination_title": s["destination_title"],
             "session_id": session_id,
-            "total": 0,
+            "total": 0,   # will be updated after scan
             "start_time": start_ts,
         })
         s["total"] += 1
         msg_id += 1
+    # Update all jobs for this session with the real total count
     await forward_queue.update_many(
-        {"src": src, "dst": dst, "total": 0},
+        {"session_id": session_id},
         {"$set": {"total": s["total"]}}
     )
     await client.edit_message_text(
@@ -308,7 +350,9 @@ async def _forward_with_thumb(client: Client, src: int, dst: int, msg) -> None:
                     parse_mode=None
                 )
         else:
-            # No thumb needed – fast copy_message path
+            # No special thumb needed – simple re-upload via copy
+            # NOTE: This branch is only reached from _forward_with_thumb,
+            # meaning copy_message already failed in the worker. Try again here.
             await client.copy_message(
                 chat_id=dst,
                 from_chat_id=src,
@@ -394,7 +438,7 @@ async def forward_worker(client: Client):
             FORWARD_ACTIVE[key] = max(0, FORWARD_ACTIVE[key] - 1)
 
 # ---------- PROGRESS ----------
-SESSION_STATS = defaultdict(lambda: {"forwarded": 0, "errors": [], "start_time": None})
+SESSION_STATS = defaultdict(lambda: {"forwarded": 0, "errors": [], "start_time": None, "total": 0})
 
 def _fmt_duration(seconds: float) -> str:
     seconds = int(seconds)
@@ -414,6 +458,10 @@ async def update_forward_progress(client: Client, job, success: bool = True):
     stats = SESSION_STATS[session]
     if stats["start_time"] is None:
         stats["start_time"] = job.get("start_time", time.time())
+    # Keep total in sync - use the job's total field (updated after scan)
+    job_total = job.get("total", 0)
+    if job_total > stats["total"]:
+        stats["total"] = job_total
     if success:
         stats["forwarded"] += 1
     else:
@@ -424,7 +472,7 @@ async def update_forward_progress(client: Client, job, success: bool = True):
 
     elapsed = time.time() - (stats["start_time"] or time.time())
     forwarded = stats["forwarded"]
-    total = job.get("total", 0)
+    total = stats["total"] or job.get("total", 0)
     errors = stats["errors"]
     err_count = len(errors)
 
