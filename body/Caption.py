@@ -1118,6 +1118,103 @@ async def capture_user_input(client, message):
         message.caption.html if message.caption else
         ""
     )
+
+    # ================= FILE FORWARD SKIP HANDLER =================
+    # Must be checked BEFORE the empty-text guard, because user may forward
+    # a channel message (which has no .text) to indicate the skip point.
+    if user_id in FF_SESSIONS:
+        session = FF_SESSIONS[user_id]
+        if session.get("expires") and session["expires"] < time.time():
+            FF_SESSIONS.pop(user_id, None)
+            await message.reply_text("⏰ Session expired.\nStart again using /file_forward")
+            return
+        if session.get("step") == "skip":
+            # Support three input formats:
+            # 1. Plain text: a number or a t.me link typed/pasted by the user
+            # 2. Forwarded message: user forwards a message from the source channel
+            raw = ""
+            fwd_chat = getattr(message, "forward_from_chat", None)
+            fwd_msg_id = getattr(message, "forward_from_message_id", None)
+            if fwd_chat and fwd_msg_id:
+                # Build a synthetic link so parse_forward_input can handle it
+                cid = str(fwd_chat.id)
+                if cid.startswith("-100"):
+                    cid = cid[4:]  # strip -100 prefix for t.me/c/ style
+                raw = f"https://t.me/c/{cid}/{fwd_msg_id}"
+            else:
+                raw = (message.text or "").strip()
+
+            if not raw:
+                await message.reply_text(
+                    "⏭ Enter forwarding range\n\nOptions:\n• 0 — forward ALL files\n• msg_link or id — start AFTER this message\n• start - end — forward BETWEEN two messages"
+                    "Examples:\n0\nhttps://t.me/c/1815162626/100\n100 - 500\nhttps://t.me/c/1234/100 - https://t.me/c/1234/500\n\n• Session expires in 15 minutes"
+                )
+                return
+
+            parsed = parse_forward_input(raw)
+
+            if parsed.get("error"):
+                await message.reply_text(parsed["error"])
+                return
+
+            skip_id = parsed["skip_id"]
+            end_id = parsed["end_id"]
+            src_hint = parsed["src_hint"]
+            src_channel = session["source"]
+
+            # ---- Validate: if link contained a channel id, it must match source ----
+            if src_hint is not None and src_hint != src_channel:
+                await message.reply_text(
+                    "❌ <b>Wrong channel!</b>\n\n"
+                    "The message link you sent does not belong to the selected source channel.\n"
+                    "Please send a link or ID from the correct source channel."
+                )
+                return
+
+            # ---- Validate: check that skip/start msg actually exists in source ----
+            if skip_id > 0:
+                valid = await validate_msg_in_channel(client, src_channel, skip_id)
+                if not valid:
+                    await message.reply_text(
+                        "❌ <b>Message not found!</b>\n\n"
+                        "The start message ID/link does not exist in the source channel.\n"
+                        "Please check and try again."
+                    )
+                    return
+
+            # ---- Validate end message if range was given ----
+            if end_id is not None:
+                valid_end = await validate_msg_in_channel(client, src_channel, end_id)
+                if not valid_end:
+                    await message.reply_text(
+                        "❌ <b>End message not found!</b>\n\n"
+                        "The end message ID/link does not exist in the source channel.\n"
+                        "Please check and try again."
+                    )
+                    return
+
+            session["skip"] = skip_id
+            session["end_id"] = end_id
+            session["step"] = "queue"
+            try:
+                await message.delete()
+            except:
+                pass
+            try:
+                await client.delete_messages(
+                    session["chat_id"],
+                    session["msg_id"]
+                )
+            except:
+                pass
+            progress_msg = await client.send_message(
+                session["chat_id"],
+                "🚚 Preparing forwarding…"
+            )
+            session["msg_id"] = progress_msg.id
+            await enqueue_forward_jobs(client, user_id)
+            return
+
     if not text.strip():
         return
 
@@ -1248,77 +1345,3 @@ async def capture_user_input(client, message):
             text="✅ URL buttons updated successfully!",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=f"seturl_{channel_id}")]]))
         return
-
-
-    # ================= FILE FORWARD SKIP HANDLER =================
-    if user_id in FF_SESSIONS:
-        session = FF_SESSIONS[user_id]
-        if session.get("expires") and session["expires"] < time.time():
-            FF_SESSIONS.pop(user_id, None)
-            await message.reply_text("⏰ Session expired.\nStart again using /file_forward")
-            return
-        if session.get("step") == "skip":
-            raw = (message.text or "").strip()
-            parsed = parse_forward_input(raw)
-
-            if parsed.get("error"):
-                await message.reply_text(parsed["error"])
-                return
-
-            skip_id = parsed["skip_id"]
-            end_id = parsed["end_id"]
-            src_hint = parsed["src_hint"]
-            src_channel = session["source"]
-
-            # ---- Validate: if link contained a channel id, it must match source ----
-            if src_hint is not None and src_hint != src_channel:
-                await message.reply_text(
-                    "❌ <b>Wrong channel!</b>\n\n"
-                    "The message link you sent does not belong to the selected source channel.\n"
-                    "Please send a link or ID from the correct source channel."
-                )
-                return
-
-            # ---- Validate: check that skip/start msg actually exists in source ----
-            if skip_id > 0:
-                valid = await validate_msg_in_channel(client, src_channel, skip_id)
-                if not valid:
-                    await message.reply_text(
-                        "❌ <b>Message not found!</b>\n\n"
-                        "The start message ID/link does not exist in the source channel.\n"
-                        "Please check and try again."
-                    )
-                    return
-
-            # ---- Validate end message if range was given ----
-            if end_id is not None:
-                valid_end = await validate_msg_in_channel(client, src_channel, end_id)
-                if not valid_end:
-                    await message.reply_text(
-                        "❌ <b>End message not found!</b>\n\n"
-                        "The end message ID/link does not exist in the source channel.\n"
-                        "Please check and try again."
-                    )
-                    return
-
-            session["skip"] = skip_id
-            session["end_id"] = end_id
-            session["step"] = "queue"
-            try:
-                await message.delete()
-            except:
-                pass
-            try:
-                await client.delete_messages(
-                    session["chat_id"],
-                    session["msg_id"]
-                )
-            except:
-                pass
-            progress_msg = await client.send_message(
-                session["chat_id"],
-                "🚚 Preparing forwarding…"
-            )
-            session["msg_id"] = progress_msg.id
-            await enqueue_forward_jobs(client, user_id)
-            return
