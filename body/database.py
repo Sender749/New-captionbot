@@ -6,14 +6,14 @@ from pymongo import ReturnDocument
 from collections import defaultdict
 
 # -------- Caption Scheduler State (GLOBAL) --------
-CHANNEL_ACTIVE = defaultdict(int)   # channel_id -> active workers
-CHANNEL_COOLDOWN = {}               # channel_id -> unblock timestamp
+CHANNEL_ACTIVE = defaultdict(int)
+CHANNEL_COOLDOWN = {}
 DEFAULT_MAX_WORKERS = 2
 
 _CHANNEL_CACHE = {}
-_CHAT_TITLE_CACHE = {}              # channel_id -> {title, ts}
-CACHE_TTL = 120                     # increased from 30s → 120s for fewer DB reads
-CHAT_TITLE_TTL = 300                # chat titles rarely change
+_CHAT_TITLE_CACHE = {}
+CACHE_TTL = 120
+CHAT_TITLE_TTL = 300
 
 client = motor.motor_asyncio.AsyncIOMotorClient(
     MONGO_DB,
@@ -55,6 +55,13 @@ async def enqueue_forward(job: dict):
         "retries": 0,
         "ts": time.time()
     })
+
+async def enqueue_forward_bulk(jobs: list):
+    """Bulk insert for faster enqueue of many jobs."""
+    if not jobs:
+        return
+    docs = [{"status": "pending", "retries": 0, "ts": time.time(), **j} for j in jobs]
+    await forward_queue.insert_many(docs, ordered=False)
 
 async def forward_done(job_id):
     await forward_queue.delete_one({"_id": job_id})
@@ -102,18 +109,13 @@ async def enqueue_caption(job: dict):
     })
 
 async def fetch_channel_job():
-    """
-    Atomic find-and-modify: grab one pending job whose channel is
-    not in cooldown and has room for another worker.
-    Much faster than cursor-iteration — single atomic DB round-trip.
-    """
     now = time.time()
-    blocked_channels = [ch for ch, ts in CHANNEL_COOLDOWN.items() if ts > now]
-    blocked_channels += [ch for ch, active in CHANNEL_ACTIVE.items() if active >= DEFAULT_MAX_WORKERS]
+    blocked = [ch for ch, ts in CHANNEL_COOLDOWN.items() if ts > now]
+    blocked += [ch for ch, active in CHANNEL_ACTIVE.items() if active >= DEFAULT_MAX_WORKERS]
 
     query = {"status": "pending"}
-    if blocked_channels:
-        query["chat_id"] = {"$nin": blocked_channels}
+    if blocked:
+        query["chat_id"] = {"$nin": blocked}
 
     job = await queue_col.find_one_and_update(
         query,
@@ -137,10 +139,7 @@ async def reschedule(job_id, delay=5):
 
 async def recover_stuck_jobs(timeout=300):
     await queue_col.update_many(
-        {
-            "status": "processing",
-            "started": {"$lt": time.time() - timeout}
-        },
+        {"status": "processing", "started": {"$lt": time.time() - timeout}},
         {"$set": {"status": "pending"}}
     )
 
@@ -161,11 +160,8 @@ async def delete_user(user_id):
     await users.delete_one({"_id": user_id})
 
 async def getid():
-    users_list = []
     cursor = users.find({}, {"_id": 1})
-    async for user in cursor:
-        users_list.append({"_id": user["_id"]})
-    return users_list
+    return [{"_id": u["_id"]} async for u in cursor]
 
 async def insert_user_check_new(user_id: int) -> bool:
     try:
@@ -176,21 +172,15 @@ async def insert_user_check_new(user_id: int) -> bool:
         )
         return result.upserted_id is not None
     except Exception as e:
-        print(f"[ERROR] in insert_user_check_new: {e}")
+        print(f"[ERROR] insert_user_check_new: {e}")
         return False
 
 # ---------------- Channel functions ----------------
 async def add_user_channel(user_id: int, channel_id: int, channel_title: str):
+    await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": channel_id}}})
     await users.update_one(
         {"_id": user_id},
-        {"$pull": {"channels": {"channel_id": channel_id}}}
-    )
-    await users.update_one(
-        {"_id": user_id},
-        {"$push": {"channels": {
-            "channel_id": channel_id,
-            "channel_title": channel_title
-        }}},
+        {"$push": {"channels": {"channel_id": channel_id, "channel_title": channel_title}}},
         upsert=True
     )
 
@@ -200,8 +190,7 @@ async def get_user_channels(user_id):
 
 # ---------------- Caption functions ----------------
 async def addCap(chnl_id: int, caption: str):
-    dets = {"chnl_id": chnl_id, "caption": caption}
-    await chnl_ids.insert_one(dets)
+    await chnl_ids.insert_one({"chnl_id": chnl_id, "caption": caption})
 
 async def updateCap(chnl_id: int, caption: str):
     await chnl_ids.update_one({"chnl_id": chnl_id}, {"$set": {"caption": caption}})
@@ -212,13 +201,9 @@ async def get_channel_caption(chnl_id: int):
 async def delete_channel_caption(chnl_id: int):
     await chnl_ids.delete_one({"chnl_id": chnl_id})
 
-# ---------------- Blocked Words functions ----------------
+# ---------------- Blocked Words ----------------
 async def set_block_words(chnl_id: int, raw_text: str):
-    await chnl_ids.update_one(
-        {"chnl_id": chnl_id},
-        {"$set": {"block_words": raw_text}},
-        upsert=True
-    )
+    await chnl_ids.update_one({"chnl_id": chnl_id}, {"$set": {"block_words": raw_text}}, upsert=True)
     _CHANNEL_CACHE.pop(chnl_id, None)
 
 async def get_block_words(chnl_id: int) -> str:
@@ -229,21 +214,13 @@ async def delete_block_words(chnl_id: int):
     await chnl_ids.update_one({"chnl_id": chnl_id}, {"$unset": {"block_words": ""}})
     _CHANNEL_CACHE.pop(chnl_id, None)
 
-# ---------------- Suffix & Prefix functions ----------------
+# ---------------- Suffix & Prefix ----------------
 async def set_suffix(channel_id: int, suffix: str):
-    await chnl_ids.update_one(
-        {"chnl_id": channel_id},
-        {"$set": {"suffix": suffix}},
-        upsert=True
-    )
+    await chnl_ids.update_one({"chnl_id": channel_id}, {"$set": {"suffix": suffix}}, upsert=True)
     _CHANNEL_CACHE.pop(channel_id, None)
 
 async def set_prefix(channel_id: int, prefix: str):
-    await chnl_ids.update_one(
-        {"chnl_id": channel_id},
-        {"$set": {"prefix": prefix}},
-        upsert=True
-    )
+    await chnl_ids.update_one({"chnl_id": channel_id}, {"$set": {"prefix": prefix}}, upsert=True)
     _CHANNEL_CACHE.pop(channel_id, None)
 
 async def get_suffix_prefix(channel_id: int):
@@ -307,20 +284,12 @@ async def get_emoji_remover_status(channel_id: int) -> bool:
     return bool(doc.get("emoji_remover", False))
 
 async def set_emoji_remover_status(channel_id: int, status: bool):
-    await chnl_ids.update_one(
-        {"chnl_id": channel_id},
-        {"$set": {"emoji_remover": bool(status)}},
-        upsert=True
-    )
+    await chnl_ids.update_one({"chnl_id": channel_id}, {"$set": {"emoji_remover": bool(status)}}, upsert=True)
     _CHANNEL_CACHE.pop(channel_id, None)
 
 # ---------------- URL Buttons ----------------
 async def set_url_buttons(channel_id: int, buttons: list):
-    await chnl_ids.update_one(
-        {"chnl_id": channel_id},
-        {"$set": {"url_buttons": buttons}},
-        upsert=True
-    )
+    await chnl_ids.update_one({"chnl_id": channel_id}, {"$set": {"url_buttons": buttons}}, upsert=True)
     _CHANNEL_CACHE.pop(channel_id, None)
 
 async def get_url_buttons(channel_id: int) -> list:
@@ -328,8 +297,5 @@ async def get_url_buttons(channel_id: int) -> list:
     return doc.get("url_buttons", [])
 
 async def delete_url_buttons(channel_id: int):
-    await chnl_ids.update_one(
-        {"chnl_id": channel_id},
-        {"$unset": {"url_buttons": ""}}
-    )
+    await chnl_ids.update_one({"chnl_id": channel_id}, {"$unset": {"url_buttons": ""}})
     _CHANNEL_CACHE.pop(channel_id, None)
