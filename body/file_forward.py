@@ -11,7 +11,7 @@ FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active
 FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
 
 MAX_FORWARD_PER_PAIR = 1
-FORWARD_DELAY = 1.3
+FORWARD_DELAY = 0.8
 FORWARD_EXECUTORS = 4
 
 FF_SESSIONS = {}
@@ -150,30 +150,41 @@ async def enqueue_forward_jobs(client: Client, uid: int):
 
 # ================= FORWARD SCHEDULER STATE =================
 async def fetch_forward_fair_job():
+    from pymongo import ReturnDocument
     now = time.time()
-    cursor = forward_queue.find(
-        {"status": "pending"}
-    ).sort("ts", 1)
-    async for job in cursor:
-        key = (job["src"], job["dst"])
-        if FORWARD_COOLDOWN.get(key, 0) > now:
-            continue
-        if FORWARD_ACTIVE[key] >= MAX_FORWARD_PER_PAIR:
-            continue
-        FORWARD_ACTIVE[key] += 1
+    blocked = [k for k, ts in FORWARD_COOLDOWN.items() if ts > now]
+    active_blocked = [k for k, v in FORWARD_ACTIVE.items() if v >= MAX_FORWARD_PER_PAIR]
+    blocked_keys = blocked + active_blocked
+
+    query = {"status": "pending"}
+    # If we have blocked src/dst pairs, try to exclude them
+    # We filter in-memory after atomic fetch since MongoDB doesn't support tuple keys
+    # But we do a fast atomic fetch first
+    job = await forward_queue.find_one_and_update(
+        query,
+        {"$set": {"status": "processing", "started": now}},
+        sort=[("ts", 1)],
+        return_document=ReturnDocument.AFTER
+    )
+    if not job:
+        return None
+    key = (job["src"], job["dst"])
+    if FORWARD_COOLDOWN.get(key, 0) > now or FORWARD_ACTIVE[key] >= MAX_FORWARD_PER_PAIR:
+        # Put it back and skip
         await forward_queue.update_one(
-            {"_id": job["_id"], "status": "pending"},
-            {"$set": {"status": "processing", "started": now}}
+            {"_id": job["_id"]},
+            {"$set": {"status": "pending", "ts": now + 0.5}}
         )
-        return job
-    return None
+        return None
+    FORWARD_ACTIVE[key] += 1
+    return job
 
 # ================= IMPROVED FORWARD WORKER =================
 async def forward_worker(client: Client):
     while True:
         job = await fetch_forward_fair_job()
         if not job:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.3)
             continue
         key = (job["src"], job["dst"])
         session_id = job.get("session_id")
