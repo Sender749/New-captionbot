@@ -6,8 +6,9 @@ from pyrogram import Client, errors
 from pyrogram.errors import FloodWait
 from info import *
 from body.database import *
+from body.Caption import caption_worker
 
-EXECUTORS   = 20
+EXECUTORS   = 30
 PLUGIN_ROOT = "body"
 
 class Bot(Client):
@@ -33,8 +34,6 @@ class Bot(Client):
         await ensure_queue_indexes()
         await ensure_forward_indexes()
         await recover_stuck_jobs()
-        # Import caption_worker from the plugin (already loaded by plugins loader)
-        from body.Caption import caption_worker
         for _ in range(EXECUTORS):
             asyncio.create_task(caption_worker(self))
         me = await self.get_me()
