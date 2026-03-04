@@ -418,8 +418,16 @@ async def start_cmd(client, message):
 
 @Client.on_message(filters.command("settings") & filters.private)
 async def settings_cmd(client, message):
-    loading = await message.reply_text("⚙️ Fetching your channels…")
-    await user_settings(client, user=message.from_user, send_func=loading.edit_text)
+    user_id = message.from_user.id
+    # Check if we have a valid cached channel list
+    cached_channels = get_cached_user_channels(user_id)
+    if cached_channels:
+        # Fast path: show channels immediately from cache, skip "Fetching…" message
+        await user_settings(client, user=message.from_user, send_func=message.reply_text)
+    else:
+        # Cold path: show loading indicator while fetching
+        loading = await message.reply_text("⚙️ Fetching your channels…")
+        await user_settings(client, user=message.from_user, send_func=loading.edit_text)
 
 
 @Client.on_message(filters.private & filters.command("file_forward"))
@@ -577,7 +585,12 @@ async def queue_status(client, message):
 
 async def user_settings(client: Client, *, user, send_func):
     user_id = user.id
-    channels = await get_user_channels(user_id)
+
+    # ── 1. Get channel list (use cache if fresh) ──────────────────────────────
+    channels = get_cached_user_channels(user_id)
+    if channels is None:
+        channels = await get_user_channels(user_id)
+
     if not channels:
         bot_me = await get_bot_me(client)
         return await send_func(
@@ -610,9 +623,11 @@ async def user_settings(client: Client, *, user, send_func):
                 return {"valid": True, "channel_id": ch_id, "channel_title": ch_title}
             else:
                 await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": ch_id}}})
+                invalidate_user_channels_cache(user_id)
                 return {"valid": False, "title": ch_title}
         except (ChatAdminRequired, RPCError):
             await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": ch_id}}})
+            invalidate_user_channels_cache(user_id)
             return {"valid": False, "title": ch_title}
         except Exception:
             return {"valid": True, "channel_id": ch_id, "channel_title": ch_title}
@@ -629,6 +644,13 @@ async def user_settings(client: Client, *, user, send_func):
 
     if not valid_channels:
         return await send_func("No active channels where I am admin.")
+
+    # ── 2. Update cache with verified channel list ────────────────────────────
+    set_cached_user_channels(user_id, valid_channels)
+
+    # ── 3. Background-prefetch all channel settings into cache (non-blocking) ─
+    channel_ids = [ch["channel_id"] for ch in valid_channels]
+    asyncio.create_task(prefetch_all_channels_for_user(channel_ids))
 
     buttons = [[InlineKeyboardButton(ch["channel_title"], callback_data=f"chinfo_{ch['channel_id']}")] for ch in valid_channels]
     buttons.append([InlineKeyboardButton("❌ Close", callback_data="close_msg")])
