@@ -6,10 +6,10 @@ from pyrogram import Client, errors
 from pyrogram.errors import FloodWait
 from info import *
 from body.database import *
-from body.Caption import caption_worker
 
 EXECUTORS   = 30
 PLUGIN_ROOT = "body"
+
 
 class Bot(Client):
     def __init__(self):
@@ -34,6 +34,7 @@ class Bot(Client):
         await ensure_queue_indexes()
         await ensure_forward_indexes()
         await recover_stuck_jobs()
+        from body.Caption import caption_worker
         for _ in range(EXECUTORS):
             asyncio.create_task(caption_worker(self))
         me = await self.get_me()
@@ -45,9 +46,9 @@ class Bot(Client):
                 print("⚠️ Bot must be admin in force-sub channel")
                 self.force_channel = None
         print(f"FF_CH = {FF_CH!r}  CP_CH = {CP_CH!r}")
-        print(f"{me.first_name} is started ✨")
+        print(f"{me.first_name} started ✨")
         try:
-            await self.send_message(ADMIN, f"**{me.first_name} started ✨**")
+            await self.send_message(ADMIN, f"<b>{me.first_name} started ✨</b>")
         except:
             pass
 
@@ -59,5 +60,6 @@ class Bot(Client):
             if callable(hook):
                 print(f"🔌 Running startup hook: {module_name}.on_bot_start()")
                 hook(self)
+
 
 Bot().run()
