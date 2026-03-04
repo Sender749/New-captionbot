@@ -12,10 +12,8 @@ DEFAULT_MAX_WORKERS = 2
 
 _CHANNEL_CACHE = {}
 _CHAT_TITLE_CACHE = {}
-_USER_CHANNELS_CACHE = {}   # user_id -> {"data": [...], "ts": float}
 CACHE_TTL = 120
 CHAT_TITLE_TTL = 300
-USER_CHANNELS_TTL = 60      # re-validate channel list every 60 s
 
 client = motor.motor_asyncio.AsyncIOMotorClient(
     MONGO_DB,
@@ -185,44 +183,10 @@ async def add_user_channel(user_id: int, channel_id: int, channel_title: str):
         {"$push": {"channels": {"channel_id": channel_id, "channel_title": channel_title}}},
         upsert=True
     )
-    invalidate_user_channels_cache(user_id)
 
 async def get_user_channels(user_id):
     data = await users.find_one({"_id": user_id}, {"channels": 1})
     return data.get("channels", []) if data else []
-
-# ---- Cached version for fast /settings ----
-def get_cached_user_channels(user_id: int):
-    """Return cached channel list for user, or None if stale/missing."""
-    now = time.time()
-    cached = _USER_CHANNELS_CACHE.get(user_id)
-    if cached and now - cached["ts"] < USER_CHANNELS_TTL:
-        return cached["data"]
-    return None
-
-def set_cached_user_channels(user_id: int, channels: list):
-    _USER_CHANNELS_CACHE[user_id] = {"data": channels, "ts": time.time()}
-
-def invalidate_user_channels_cache(user_id: int):
-    _USER_CHANNELS_CACHE.pop(user_id, None)
-
-async def prefetch_all_channels_for_user(channel_ids: list):
-    """Batch-load all channel settings for a user into _CHANNEL_CACHE in one DB query."""
-    if not channel_ids:
-        return
-    now = time.time()
-    # Only fetch channels not already in cache (or stale)
-    missing = [cid for cid in channel_ids
-               if cid not in _CHANNEL_CACHE or now - _CHANNEL_CACHE[cid]["ts"] >= CACHE_TTL]
-    if not missing:
-        return
-    cursor = chnl_ids.find({"chnl_id": {"$in": missing}})
-    found = {}
-    async for doc in cursor:
-        found[doc["chnl_id"]] = doc
-    for cid in missing:
-        doc = found.get(cid, {})
-        _CHANNEL_CACHE[cid] = {"data": doc, "ts": now}
 
 # ---------------- Caption functions ----------------
 async def addCap(chnl_id: int, caption: str):
@@ -335,3 +299,15 @@ async def get_url_buttons(channel_id: int) -> list:
 async def delete_url_buttons(channel_id: int):
     await chnl_ids.update_one({"chnl_id": channel_id}, {"$unset": {"url_buttons": ""}})
     _CHANNEL_CACHE.pop(channel_id, None)
+
+# ---------------- Delete Channel (full wipe) ----------------
+async def delete_all_channel_data(user_id: int, channel_id: int):
+    """Remove a channel from user's list and wipe all its settings from DB."""
+    # Remove from user's channel list
+    await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": channel_id}}})
+    # Wipe all channel settings doc
+    await chnl_ids.delete_one({"chnl_id": channel_id})
+    # Clear caches
+    _CHANNEL_CACHE.pop(channel_id, None)
+    _CHAT_TITLE_CACHE.pop(channel_id, None)
+    invalidate_user_channels_cache(user_id)
