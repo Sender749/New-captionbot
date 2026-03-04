@@ -79,6 +79,17 @@ def _build_progress_text(session: dict, done: int, errors: int, total: int, elap
     )
 
 
+# ---------- GET LAST MESSAGE ID OF A CHANNEL ----------
+async def _get_last_msg_id(client: Client, channel_id: int) -> int:
+    """Return the latest message ID in a channel."""
+    try:
+        async for msg in client.get_chat_history(channel_id, limit=1):
+            return msg.id
+    except Exception:
+        pass
+    return 1
+
+
 # ---------- SOURCE ----------
 @Client.on_callback_query(filters.regex(r"^ff_src_(-?\d+)$"))
 async def ff_src(client, query):
@@ -111,23 +122,70 @@ async def ff_dst(client, query):
     dst = int(query.matches[0].group(1))
     s["destination"] = dst
     s["destination_title"] = next((x["channel_title"] for x in s["channels"] if x["channel_id"] == dst), str(dst))
-    s["step"] = "skip"
+    s["step"] = "mode"
     s["chat_id"] = query.message.chat.id
     s["msg_id"] = query.message.id
     s["expires"] = time.time() + 900
     await query.message.edit_text(
-        "⏭ <b>Send MESSAGE LINK or MESSAGE ID to skip up to</b>\n\n"
-        "Example:\n"
-        "<code>https://t.me/c/1815162626/2458</code>\n\n"
-        "• Send <b>0</b> to forward all files\n"
-        "• Forwarding starts <b>AFTER</b> this message\n"
-        "• Session expires in <b>15 minutes</b>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]),
-        disable_web_page_preview=True
+        "📋 <b>Choose forwarding mode:</b>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭ Skip (forward after a message)",  callback_data=f"ff_mode_skip_{uid}")],
+            [InlineKeyboardButton("📌 Start–End range",                callback_data=f"ff_mode_range_{uid}")],
+            [InlineKeyboardButton("📦 Forward ALL files",              callback_data=f"ff_mode_all_{uid}")],
+            [InlineKeyboardButton("❌ Cancel",                         callback_data="ff_cancel")],
+        ])
     )
 
 
-# ---------- ENQUEUE + COUNT ----------
+# ---------- MODE SELECTION ----------
+@Client.on_callback_query(filters.regex(r"^ff_mode_(skip|range|all)_(\d+)$"))
+async def ff_mode_select(client, query):
+    uid = query.from_user.id
+    s = FF_SESSIONS.get(uid)
+    if not s:
+        return await query.answer("Session expired.", show_alert=True)
+    await query.answer()
+    mode = query.matches[0].group(1)
+    s["ff_mode"] = mode
+
+    if mode == "all":
+        s["skip"] = 0
+        s["range_start"] = None
+        s["range_end"] = None
+        s["step"] = "queue"
+        await query.message.edit_text(
+            "🔍 <b>Starting scan…</b>\n\nPreparing to forward all files.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
+        )
+        asyncio.create_task(enqueue_forward_jobs(client, uid))
+
+    elif mode == "skip":
+        s["step"] = "skip"
+        await query.message.edit_text(
+            "⏭ <b>Send MESSAGE LINK or MESSAGE ID to skip up to</b>\n\n"
+            "Example:\n"
+            "<code>https://t.me/c/1815162626/2458</code>  or  <code>2458</code>\n\n"
+            "• Forwarding starts <b>AFTER</b> this message ID\n"
+            "• Session expires in <b>15 minutes</b>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]),
+            disable_web_page_preview=True
+        )
+
+    elif mode == "range":
+        s["step"] = "range_input"
+        await query.message.edit_text(
+            "📌 <b>Send START and END message IDs or links</b>\n\n"
+            "Format — two IDs/links separated by a space or new line:\n"
+            "<code>100 500</code>\n"
+            "<code>https://t.me/c/.../100 https://t.me/c/.../500</code>\n\n"
+            "• Bot will forward all files <b>from START to END</b> (inclusive)\n"
+            "• Session expires in <b>15 minutes</b>",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]),
+            disable_web_page_preview=True
+        )
+
+
+# ---------- ENQUEUE + COUNT (batch scan, bottom-up for skip/all) ----------
 async def enqueue_forward_jobs(client: Client, uid: int):
     s = FF_SESSIONS[uid]
     if "session_id" not in s:
@@ -135,46 +193,102 @@ async def enqueue_forward_jobs(client: Client, uid: int):
     session_id = s["session_id"]
     src = s["source"]
     dst = s["destination"]
-    skip_id = int(s.get("skip", 0))
     start_time = time.time()
     s["start_time"] = start_time
 
-    # --- Phase 1: count & collect all media message IDs ---
+    ff_mode     = s.get("ff_mode", "skip")
+    range_start = s.get("range_start")
+    range_end   = s.get("range_end")
+    skip_id     = int(s.get("skip", 0))
+
+    # ── Determine scan window ─────────────────────────────────────────────
     await client.edit_message_text(
         s["chat_id"], s["msg_id"],
-        "🔍 <b>Scanning source channel…</b>\n\nCounting files to forward, please wait.",
+        "🔍 <b>Scanning source channel…</b>\n\n⏳ Finding latest message ID, please wait.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
     )
 
-    media_ids = []
-    msg_id = skip_id + 1
-    consecutive_missing = 0
-    MAX_CONSECUTIVE_MISSING = 500
-    batch = []
-    BATCH_SIZE = 200
+    if ff_mode == "range" and range_start is not None and range_end is not None:
+        scan_from = min(range_start, range_end)
+        scan_to   = max(range_start, range_end)
+    else:
+        # Skip/all: scan from skip_id+1 up to the last message
+        last_id = await _get_last_msg_id(client, src)
+        scan_from = skip_id + 1
+        scan_to   = last_id
 
-    while True:
+    total_range = max(scan_to - scan_from + 1, 1)
+
+    await client.edit_message_text(
+        s["chat_id"], s["msg_id"],
+        f"🔍 <b>Scanning source channel…</b>\n\n"
+        f"📨 Range: <code>{scan_from}</code> → <code>{scan_to}</code>\n"
+        f"⏳ Counting media files…",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
+    )
+
+    # ── Collect media IDs in batches ──────────────────────────────────────
+    media_ids = []
+    BATCH_SIZE = 200
+    scanned = 0
+    last_ui_update = time.time()
+    consecutive_missing = 0
+    MAX_CONSECUTIVE_MISSING = 300
+    msg_id = scan_from
+
+    while msg_id <= scan_to:
         if uid in CANCELLED_SESSIONS or s.get("session_id") in CANCELLED_SESSIONS:
             return
+
+        batch_end = min(msg_id + BATCH_SIZE - 1, scan_to)
+        ids_to_fetch = list(range(msg_id, batch_end + 1))
+
         try:
-            msg = await client.get_messages(src, msg_id)
+            messages = await client.get_messages(src, ids_to_fetch)
         except FloodWait as e:
             await asyncio.sleep(e.value + 1)
             continue
         except Exception:
-            msg = None
-
-        if not msg or not msg.id:
-            consecutive_missing += 1
-            if consecutive_missing >= MAX_CONSECUTIVE_MISSING:
-                break
-            msg_id += 1
+            scanned += len(ids_to_fetch)
+            msg_id = batch_end + 1
             continue
 
-        consecutive_missing = 0
-        if msg.media:
-            media_ids.append(msg.id)
-        msg_id += 1
+        if not isinstance(messages, list):
+            messages = [messages]
+
+        batch_missing = 0
+        for m in messages:
+            if not m or not m.id:
+                consecutive_missing += 1
+                batch_missing += 1
+            else:
+                consecutive_missing = 0
+                if m.media:
+                    media_ids.append(m.id)
+
+        scanned += len(ids_to_fetch)
+        msg_id = batch_end + 1
+
+        # UI update every 2s
+        now = time.time()
+        if now - last_ui_update >= 2.0:
+            last_ui_update = now
+            pct = int(100 * scanned / total_range)
+            bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            try:
+                await client.edit_message_text(
+                    s["chat_id"], s["msg_id"],
+                    f"🔍 <b>Scanning source channel…</b>\n\n"
+                    f"[{bar}] <code>{pct}%</code>\n"
+                    f"📨 Scanned: <code>{scanned}</code> / <code>{total_range}</code>\n"
+                    f"🎞 Media found: <code>{len(media_ids)}</code>",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
+                )
+            except (MessageNotModified, Exception):
+                pass
+
+        if consecutive_missing >= MAX_CONSECUTIVE_MISSING:
+            break
 
     total = len(media_ids)
     s["total"] = total
@@ -184,12 +298,12 @@ async def enqueue_forward_jobs(client: Client, uid: int):
     if total == 0:
         await client.edit_message_text(
             s["chat_id"], s["msg_id"],
-            "❌ <b>No media files found</b> in the source channel after the given skip point."
+            "❌ <b>No media files found</b> in the selected range."
         )
         FF_SESSIONS.pop(uid, None)
         return
 
-    # --- Phase 2: bulk enqueue ---
+    # ── Bulk enqueue ──────────────────────────────────────────────────────
     jobs = [
         {
             "user_id": uid,
@@ -209,11 +323,10 @@ async def enqueue_forward_jobs(client: Client, uid: int):
     await enqueue_forward_bulk(jobs)
 
     elapsed = time.time() - start_time
-    progress_text = _build_progress_text(s, 0, 0, total, elapsed)
     try:
         await client.edit_message_text(
             s["chat_id"], s["msg_id"],
-            progress_text,
+            _build_progress_text(s, 0, 0, total, elapsed),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
         )
     except MessageNotModified:
@@ -225,12 +338,8 @@ async def fetch_forward_fair_job():
     from pymongo import ReturnDocument
     now = time.time()
 
-    query = {"status": "pending"}
-    blocked_pairs = [(k, ts) for k, ts in FORWARD_COOLDOWN.items() if ts > now]
-    # We can't filter tuple-keyed cooldowns in MongoDB easily,
-    # so fetch atomically and reject post-fetch if blocked
     job = await forward_queue.find_one_and_update(
-        query,
+        {"status": "pending"},
         {"$set": {"status": "processing", "started": now}},
         sort=[("ts", 1)],
         return_document=ReturnDocument.AFTER
@@ -240,7 +349,6 @@ async def fetch_forward_fair_job():
 
     key = (job["src"], job["dst"])
     if FORWARD_COOLDOWN.get(key, 0) > now or FORWARD_ACTIVE[key] >= MAX_FORWARD_PER_PAIR:
-        # Put it back — cooldown or at capacity
         await forward_queue.update_one(
             {"_id": job["_id"]},
             {"$set": {"status": "pending", "ts": now + 1.0}}
@@ -268,14 +376,12 @@ async def forward_worker(client: Client):
                 FORWARD_ACTIVE[key] -= 1
                 continue
 
-            # Copy message as-is (caption/media unchanged)
             await client.copy_message(
                 chat_id=job["dst"],
                 from_chat_id=job["src"],
                 message_id=job["msg_id"]
             )
 
-            # Dump copy (admin log channel)
             job_user = job.get("user_id")
             if job_user != ADMIN:
                 try:
@@ -314,7 +420,8 @@ async def forward_worker(client: Client):
 
 
 # ---------- PROGRESS UPDATER ----------
-_LAST_PROGRESS_EDIT: dict = {}  # session_id -> last edit timestamp
+_LAST_PROGRESS_EDIT: dict = {}
+
 
 async def _update_session_progress(client: Client, job: dict, *, error: bool):
     session_id = job.get("session_id")
@@ -324,22 +431,22 @@ async def _update_session_progress(client: Client, job: dict, *, error: bool):
     uid = job.get("user_id")
     s = FF_SESSIONS.get(uid, {})
 
-    # Update in-memory counters
     if error:
         s["errors"] = s.get("errors", 0) + 1
     else:
         s["done"] = s.get("done", 0) + 1
 
-    done = s.get("done", 0)
-    errors = s.get("errors", 0)
-    total = job.get("total", 1)
+    done       = s.get("done", 0)
+    errors     = s.get("errors", 0)
+    total      = job.get("total", 1)
     start_time = job.get("start_time", time.time())
-    elapsed = time.time() - start_time
+    elapsed    = time.time() - start_time
 
-    # Rate-limit UI edits to once per 2 seconds to avoid flood
-    now = time.time()
+    now  = time.time()
     last = _LAST_PROGRESS_EDIT.get(session_id, 0)
-    remaining = await forward_queue.count_documents({"session_id": session_id, "status": {"$in": ["pending", "processing"]}})
+    remaining = await forward_queue.count_documents(
+        {"session_id": session_id, "status": {"$in": ["pending", "processing"]}}
+    )
     is_complete = remaining == 0
 
     if not is_complete and now - last < 2.0:
@@ -348,14 +455,13 @@ async def _update_session_progress(client: Client, job: dict, *, error: bool):
     _LAST_PROGRESS_EDIT[session_id] = now
 
     if is_complete:
-        text = _build_progress_text(s, done, errors, total, elapsed, done_flag=True)
+        text   = _build_progress_text(s, done, errors, total, elapsed, done_flag=True)
         markup = None
-        # Cleanup
         _LAST_PROGRESS_EDIT.pop(session_id, None)
         FF_SESSIONS.pop(uid, None)
         CANCELLED_SESSIONS.discard(session_id)
     else:
-        text = _build_progress_text(s, done, errors, total, elapsed)
+        text   = _build_progress_text(s, done, errors, total, elapsed)
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
 
     try:
@@ -384,12 +490,11 @@ async def ff_cancel(client, query):
     session_id = s.get("session_id")
     if session_id:
         CANCELLED_SESSIONS.add(session_id)
-        remaining = await forward_queue.count_documents({"session_id": session_id})
-        total = s.get("total", 0)
-        done = s.get("done", 0)
-        errors = s.get("errors", 0)
         await forward_queue.delete_many({"session_id": session_id})
         elapsed = time.time() - s.get("start_time", time.time())
+        done   = s.get("done", 0)
+        total  = s.get("total", 0)
+        errors = s.get("errors", 0)
         try:
             await query.message.edit_text(
                 f"🛑 <b>Forwarding Cancelled</b>\n\n"
