@@ -10,11 +10,18 @@ from body.database import *
 from body.file_forward import *
 from collections import deque, defaultdict
 from imdb import IMDb
-from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
+from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS, get_cached_chat_title, set_cached_chat_title
 
 ia = IMDb()
+_BOT_ME_CACHE = None  # cache get_me() result to avoid repeated API calls
+
+async def get_bot_me(client):
+    global _BOT_ME_CACHE
+    if _BOT_ME_CACHE is None:
+        _BOT_ME_CACHE = await client.get_me()
+    return _BOT_ME_CACHE
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-DEFAULT_EDIT_DELAY = 2.5                 # per channel
+DEFAULT_EDIT_DELAY = 1.5                 # per channel
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
@@ -35,19 +42,8 @@ def extract_msg_id_from_text(text: str) -> int | None:
     return None
 
 async def animate_loading(msg):
-    frames = [
-        "⚙️ Loading your channels",
-        "⚙️ Loading your channels.",
-        "⚙️ Loading your channels..",
-        "⚙️ Loading your channels...",
-    ]
-    while True:
-        for f in frames:
-            try:
-                await msg.edit_text(f)
-            except:
-                return
-            await asyncio.sleep(0.6)
+    """No-op: removed animation to improve perceived speed."""
+    pass
 
 @Client.on_chat_member_updated()
 async def when_added_as_admin(client, chat_member_update):
@@ -111,18 +107,18 @@ async def auto_delete_message(msg, delay: int):
 @Client.on_callback_query(filters.regex(r"^settings_cb$"))
 async def settings_button_handler(client: Client, query: CallbackQuery):
     await query.answer()
-    loading = await query.message.edit_text("⚙️ Loading your channels...")
+    # Edit immediately to show activity, then replace with real content
     await user_settings(
         client,
         user=query.from_user,
-        send_func=loading.edit_text
+        send_func=query.message.edit_text
     )
 
 @Client.on_callback_query(filters.regex("^help$"))
 async def help_callback(client, query: CallbackQuery):
     await query.answer()
-    bot_me = await client.get_me()
-    bot_username = bot_me.username
+    bot_me = await get_bot_me(client)
+    bot_username = bot_me.username or BOT_USERNAME
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕️ Add me to your channel ➕️", url=f"https://t.me/{bot_username}?startchannel=true")],
         [InlineKeyboardButton("⬅️ Back", callback_data="start")]
@@ -177,7 +173,7 @@ async def show_start_ui(
 @Client.on_callback_query(filters.regex("^about_cb$"))
 async def about_callback(client: Client, query: CallbackQuery):
     await query.answer()
-    bot = await client.get_me()
+    bot = await get_bot_me(client)
     text = script.ABOUT_TXT.format(
         bot_name=bot.first_name,
         bot_username=bot.username
@@ -298,7 +294,7 @@ async def broadcast(client, message):
         await silicon.edit("ʙʀᴏᴀᴅᴄᴀsᴛɪɴɢ...")
         for user in all_users:
             try:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.05)
                 await message.reply_to_message.copy(user["_id"])
                 success += 1
             except errors.InputUserDeactivated:
@@ -336,14 +332,16 @@ async def restart_bot(client, message):
 
 @Client.on_message(filters.command("settings") & filters.private)
 async def settings_cmd(client, message):
-    loading = await message.reply_text("⚙️ Loading your channels...")
+    # Send a placeholder immediately so the user gets instant feedback,
+    # then edit it with real content — avoids a noticeable "loading" delay.
+    loading = await message.reply_text("⚙️ Fetching your channels…")
     await user_settings(client, user=message.from_user, send_func=loading.edit_text)
 
 async def user_settings(client: Client,*,user,send_func,):
     user_id = user.id
     channels = await get_user_channels(user_id)
     if not channels:
-        bot = await client.get_me()
+        bot = await get_bot_me(client)
         bot_username = bot.username or BOT_USERNAME
         return await send_func(
             "You haven’t added me to any channels yet!\n\n"
@@ -357,14 +355,21 @@ async def user_settings(client: Client,*,user,send_func,):
     async def check_channel(ch):
         ch_id = ch.get("channel_id")
         ch_title = ch.get("channel_title", str(ch_id))
+        # Use cached title if available to avoid extra API call
+        cached_title = get_cached_chat_title(ch_id)
+        if cached_title:
+            ch_title = cached_title
         try:
             member = await client.get_chat_member(ch_id, "me")
             if _is_admin_member(member):
-                try:
-                    chat = await client.get_chat(ch_id)
-                    ch_title = getattr(chat, "title", ch_title)
-                except:
-                    pass
+                # Only fetch fresh title if not cached
+                if not cached_title:
+                    try:
+                        chat = await client.get_chat(ch_id)
+                        ch_title = getattr(chat, "title", ch_title)
+                        set_cached_chat_title(ch_id, ch_title)
+                    except:
+                        pass
                 return {"valid": True, "channel_id": ch_id, "channel_title": ch_title}
             else:
                 await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": ch_id}}})
@@ -504,7 +509,7 @@ async def caption_worker(client: Client):
     while True:
         job = await fetch_channel_job()
         if not job:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
             continue
         ch = job["chat_id"]
         released = False
