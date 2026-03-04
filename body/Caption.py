@@ -21,7 +21,7 @@ async def get_bot_me(client):
         _BOT_ME_CACHE = await client.get_me()
     return _BOT_ME_CACHE
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-DEFAULT_EDIT_DELAY = 1.5                 # per channel
+DEFAULT_EDIT_DELAY = 1                 # per channel
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
