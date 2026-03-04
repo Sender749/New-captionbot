@@ -6,9 +6,23 @@ from body.database import *
 from info import *
 from Script import script
 from body.Caption import * 
+from body.database import get_cached_chat_title, set_cached_chat_title
 from pyrogram.errors import RPCError, ChatAdminRequired, ChatWriteForbidden
 
 FONT_TXT = script.FONT_TXT
+
+async def _get_chat_title(client, channel_id: int) -> str:
+    """Get chat title using cache to avoid repeated API calls."""
+    cached = get_cached_chat_title(channel_id)
+    if cached:
+        return cached
+    try:
+        chat = await client.get_chat(channel_id)
+        title = getattr(chat, "title", str(channel_id))
+        set_cached_chat_title(channel_id, title)
+        return title
+    except Exception:
+        return str(channel_id)
 
 @Client.on_callback_query(filters.regex(r'^chinfo_(-?\d+)$'))
 async def channel_settings(client, query):
@@ -68,8 +82,7 @@ async def channel_settings(client, query):
 async def set_caption_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    chat_title = await _get_chat_title(client, channel_id)
 
     caption_data = await get_channel_caption(channel_id)
     current_caption = caption_data.get("caption") if caption_data else None
@@ -165,8 +178,7 @@ async def caption_font(client, query):
 async def set_words_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    chat_title = await _get_chat_title(client, channel_id)
 
     blocked_words = await get_block_words(channel_id)
     if blocked_words:
@@ -228,8 +240,7 @@ async def delete_blocked_words(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
     await delete_block_words(channel_id)
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    chat_title = await _get_chat_title(client, channel_id)
     buttons = [[InlineKeyboardButton("↩ Back", callback_data=f"setwords_{channel_id}")]]
     await query.message.edit_text(
         f"✅ **All blocked words deleted successfully.**\n\n📛 **Channel:** {chat_title}",
@@ -241,8 +252,7 @@ async def delete_blocked_words(client, query):
 async def suffix_prefix_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    chat_title = await _get_chat_title(client, channel_id)
     suffix, prefix = await get_suffix_prefix(channel_id)
 
     buttons = [
@@ -313,8 +323,7 @@ async def delete_prefix_cb(client, query):
 async def set_replace_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    chat_title = await _get_chat_title(client, channel_id)
     replace_raw = await get_replace_words(channel_id)
     if replace_raw:
         replace_text = "\n".join(
@@ -371,8 +380,7 @@ async def delete_replace_words(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
     await delete_replace_words_db(channel_id)
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    chat_title = await _get_chat_title(client, channel_id)
     buttons = [[InlineKeyboardButton("↩ Back", callback_data=f"setreplace_{channel_id}")]]
     await query.message.edit_text(
         f"✅ **All replace words deleted successfully.**\n\n📛 **Channel:** {chat_title}",
@@ -384,8 +392,7 @@ async def delete_replace_words(client, query):
 async def url_button_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    chat_title = await _get_chat_title(client, channel_id)
     buttons = await get_url_buttons(channel_id)
     if buttons:
         lines = []
