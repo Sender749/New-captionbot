@@ -12,24 +12,22 @@ FONT_TXT = script.FONT_TXT
 
 # ─── Placeholder reference shown in collapsed blockquote ───────────────────
 PLACEHOLDER_HELP = (
-    "<blockquote expandable>"
+    
     "📌 <b>Available Placeholders</b>\n\n"
-
-    "🔹 <b>File Info</b>\n"
+    "<blockquote expandable>"
     "  <code>{file_name}</code> — Raw file name\n"
     "  <code>{smart_file_name}</code> — Auto-built smart name\n"
-    "    (title · year · season/ep · lang · quality · codec · ESub)\n"
     "  <code>{file_size}</code> — File size (e.g. 1.23 GB)\n"
     "  <code>{default_caption}</code> — Original caption as-is\n"
     "  <code>{resolution}</code> — Video resolution (e.g. 1920x1080)\n"
     "  <code>{duration}</code> — Video duration (e.g. 02:15:30)\n"
-    "  <code>{empty}</code> — Empty string (use to clear a line)\n\n"
-
-    "🔹 <b>Metadata</b>\n"
+    "  <code>{empty}</code> — Empty caption\n"
     "  <code>{language}</code> — Detected audio languages\n"
     "  <code>{year}</code> — Release year (e.g. 2024)\n\n"
+    "</blockquote>"
 
     "🔹 <b>Text Styles</b>\n"
+    "<blockquote expandable>"
     "  <code>&lt;b&gt;Text&lt;/b&gt;</code> — Bold\n"
     "  <code>&lt;i&gt;Text&lt;/i&gt;</code> — Italic\n"
     "  <code>&lt;u&gt;Text&lt;/u&gt;</code> — Underline\n"
@@ -40,11 +38,11 @@ PLACEHOLDER_HELP = (
     "  <code>&lt;blockquote&gt;Text&lt;/blockquote&gt;</code> — Quote\n"
     "  <code>&lt;blockquote expandable&gt;…&lt;/blockquote&gt;</code> — Collapsible\n"
     "  <code>&lt;a href=\"url\"&gt;Text&lt;/a&gt;</code> — Hyperlink\n\n"
+    "</blockquote>"
 
     "✍️ <b>Example Caption</b>\n"
     "  <code>&lt;b&gt;{smart_file_name}&lt;/b&gt;</code>\n"
     "  <code>📦 {file_size} | 🗓 {year} | 🌐 {language}</code>"
-    "</blockquote>"
 )
 
 
@@ -101,6 +99,7 @@ async def channel_settings(client, query):
         [InlineKeyboardButton(f"🔗 {link_text}",          callback_data=f"togglelink_{channel_id}")],
         [InlineKeyboardButton(f"😀 {emoji_text}",         callback_data=f"toggleemoji_{channel_id}")],
         [InlineKeyboardButton("♻️ Reset Channel Settings", callback_data=f"reset_channel_{channel_id}")],
+        [InlineKeyboardButton("🗑️ Delete Channel",        callback_data=f"del_channel_confirm_{channel_id}")],
         [InlineKeyboardButton("↩ Back", callback_data="settings_cb"),
          InlineKeyboardButton("❌ Close", callback_data="close_msg")],
     ]
@@ -443,4 +442,44 @@ async def reset_channel_settings(client, query):
         await asyncio.sleep(1)
         await channel_settings(client, query)
     except:
+        pass
+
+
+# ═══════════════════════════════ DELETE CHANNEL ════════════════════════════
+@Client.on_callback_query(filters.regex(r"^del_channel_confirm_(-?\d+)$"))
+async def delete_channel_confirm(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    chat_title = await _get_chat_title(client, channel_id)
+    buttons = [
+        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"del_channel_do_{channel_id}"),
+         InlineKeyboardButton("❌ No, Go Back", callback_data=f"chinfo_{channel_id}")],
+    ]
+    await query.message.edit_text(
+        f"⚠️ <b>Are you sure you want to delete this channel?</b>\n\n"
+        f"📛 <b>Channel:</b> {chat_title}\n\n"
+        "This will remove the channel from your list and <b>delete all its settings</b> "
+        "(caption, prefix, suffix, blocked words, replace words, URL buttons, etc.).\n\n"
+        "<b>This action cannot be undone.</b>",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^del_channel_do_(-?\d+)$"))
+async def delete_channel_execute(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    user_id = query.from_user.id
+    await delete_all_channel_data(user_id, channel_id)
+    await query.message.edit_text(
+        "✅ <b>Channel deleted successfully.</b>\n\n"
+        "All settings for this channel have been removed.\n\n"
+        "Returning to your channel list…"
+    )
+    await asyncio.sleep(1.5)
+    # Refresh settings view
+    from body.Caption import user_settings
+    try:
+        await user_settings(client, user=query.from_user, send_func=query.message.edit_text)
+    except Exception:
         pass
