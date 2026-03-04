@@ -7,11 +7,11 @@ from pyrogram.enums import ParseMode
 from info import *
 from Script import script
 from body.database import *
-from body.file_forward import FF_SESSIONS
+from body.file_forward import FF_SESSIONS, enqueue_forward_jobs
 from collections import deque, defaultdict
 
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-DEFAULT_EDIT_DELAY = 1.5
+DEFAULT_EDIT_DELAY = 0.8
 
 bot_data = {
     "caption_set": {},
@@ -418,16 +418,8 @@ async def start_cmd(client, message):
 
 @Client.on_message(filters.command("settings") & filters.private)
 async def settings_cmd(client, message):
-    user_id = message.from_user.id
-    # Check if we have a valid cached channel list
-    cached_channels = get_cached_user_channels(user_id)
-    if cached_channels:
-        # Fast path: show channels immediately from cache, skip "Fetching…" message
-        await user_settings(client, user=message.from_user, send_func=message.reply_text)
-    else:
-        # Cold path: show loading indicator while fetching
-        loading = await message.reply_text("⚙️ Fetching your channels…")
-        await user_settings(client, user=message.from_user, send_func=loading.edit_text)
+    loading = await message.reply_text("⚙️ Fetching your channels…")
+    await user_settings(client, user=message.from_user, send_func=loading.edit_text)
 
 
 @Client.on_message(filters.private & filters.command("file_forward"))
@@ -585,12 +577,7 @@ async def queue_status(client, message):
 
 async def user_settings(client: Client, *, user, send_func):
     user_id = user.id
-
-    # ── 1. Get channel list (use cache if fresh) ──────────────────────────────
-    channels = get_cached_user_channels(user_id)
-    if channels is None:
-        channels = await get_user_channels(user_id)
-
+    channels = await get_user_channels(user_id)
     if not channels:
         bot_me = await get_bot_me(client)
         return await send_func(
@@ -623,11 +610,9 @@ async def user_settings(client: Client, *, user, send_func):
                 return {"valid": True, "channel_id": ch_id, "channel_title": ch_title}
             else:
                 await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": ch_id}}})
-                invalidate_user_channels_cache(user_id)
                 return {"valid": False, "title": ch_title}
         except (ChatAdminRequired, RPCError):
             await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": ch_id}}})
-            invalidate_user_channels_cache(user_id)
             return {"valid": False, "title": ch_title}
         except Exception:
             return {"valid": True, "channel_id": ch_id, "channel_title": ch_title}
@@ -644,13 +629,6 @@ async def user_settings(client: Client, *, user, send_func):
 
     if not valid_channels:
         return await send_func("No active channels where I am admin.")
-
-    # ── 2. Update cache with verified channel list ────────────────────────────
-    set_cached_user_channels(user_id, valid_channels)
-
-    # ── 3. Background-prefetch all channel settings into cache (non-blocking) ─
-    channel_ids = [ch["channel_id"] for ch in valid_channels]
-    asyncio.create_task(prefetch_all_channels_for_user(channel_ids))
 
     buttons = [[InlineKeyboardButton(ch["channel_title"], callback_data=f"chinfo_{ch['channel_id']}")] for ch in valid_channels]
     buttons.append([InlineKeyboardButton("❌ Close", callback_data="close_msg")])
@@ -1078,11 +1056,14 @@ async def capture_user_input(client, message):
         return
 
     # ---------- FILE FORWARD SKIP ----------
+    # ---------- FILE FORWARD SKIP / RANGE ----------
     if user_id in FF_SESSIONS:
         session = FF_SESSIONS[user_id]
         if session.get("expires") and session["expires"] < time.time():
             FF_SESSIONS.pop(user_id, None)
             return await message.reply_text("⏰ Session expired. Start again with /file_forward")
+
+        # ── SKIP mode ──
         if session.get("step") == "skip":
             raw = (message.text or "").strip()
             msg_id = extract_msg_id_from_text(raw)
@@ -1094,7 +1075,50 @@ async def capture_user_input(client, message):
                 await message.delete()
             except:
                 pass
-            progress_msg = await client.send_message(session["chat_id"], "🔍 Scanning source channel…")
-            session["msg_id"] = progress_msg.id
+            # Always edit the existing bot message — never send a new one
+            try:
+                await client.edit_message_text(
+                    session["chat_id"], session["msg_id"],
+                    "🔍 <b>Scanning source channel…</b>\n\nStarting from message <code>{}</code>, please wait.".format(msg_id),
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
+                )
+            except:
+                pass
+            asyncio.create_task(enqueue_forward_jobs(client, user_id))
+            return
+
+        # ── RANGE mode ──
+        if session.get("step") == "range_input":
+            raw = (message.text or "").strip()
+            # Accept: "100 500", "100\n500", or two links separated by space/newline
+            parts = re.split(r"[\s\n]+", raw.strip())
+            # Filter out empty strings
+            parts = [p for p in parts if p]
+            id1 = extract_msg_id_from_text(parts[0]) if len(parts) >= 1 else None
+            id2 = extract_msg_id_from_text(parts[1]) if len(parts) >= 2 else None
+            if id1 is None or id2 is None:
+                return await message.reply_text(
+                    "❌ Invalid format. Send two message IDs or links:\n"
+                    "<code>100 500</code>\nor\n"
+                    "<code>https://t.me/c/.../100 https://t.me/c/.../500</code>"
+                )
+            session["range_start"] = int(id1)
+            session["range_end"]   = int(id2)
+            session["step"] = "queue"
+            try:
+                await message.delete()
+            except:
+                pass
+            # Always edit the existing bot message
+            try:
+                await client.edit_message_text(
+                    session["chat_id"], session["msg_id"],
+                    f"🔍 <b>Scanning source channel…</b>\n\n"
+                    f"📌 Range: <code>{min(id1,id2)}</code> → <code>{max(id1,id2)}</code>\n"
+                    f"⏳ Please wait…",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
+                )
+            except:
+                pass
             asyncio.create_task(enqueue_forward_jobs(client, user_id))
             return
