@@ -18,12 +18,12 @@ FORWARD_EXECUTORS    = 6
 FF_SESSIONS        = {}
 CANCELLED_SESSIONS = set()
 
-USERNAME_RE = re.compile(r'@\w+',                    flags=re.IGNORECASE)
+USERNAME_RE = re.compile(r'@\w+',                     flags=re.IGNORECASE)
 URL_RE      = re.compile(r'(https?://\S+|t\.me/\S+)', flags=re.IGNORECASE)
 HTML_TAG_RE = re.compile(r'<[^>]+>')
 MD_LINK_RE  = re.compile(r'\[([^\]]+)\]\([^)]+\)')
 
-# Media types that count as "files" to forward
+# All media types we consider "files" worth forwarding
 MEDIA_TYPES = ("video", "document", "audio", "photo", "voice", "video_note", "animation", "sticker")
 
 
@@ -55,20 +55,19 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _has_media(msg) -> bool:
-    """Return True if message contains any forwardable media."""
+    """True if the message contains any forwardable media (photo, video, doc, etc.)."""
     if msg is None or not getattr(msg, "id", 0):
         return False
     for t in MEDIA_TYPES:
         if getattr(msg, t, None) is not None:
             return True
-    # Also accept msg.media flag as fallback
     return bool(getattr(msg, "media", None))
 
 
 def _build_progress_text(session: dict, done: int, errors: int,
                           total: int, elapsed: float, *, done_flag=False) -> str:
-    src = session.get("source_title", "Unknown")
-    dst = session.get("destination_title", "Unknown")
+    src     = session.get("source_title", "Unknown")
+    dst     = session.get("destination_title", "Unknown")
     bar_len = 10
     filled  = int(bar_len * done / total) if total > 0 else 0
     bar     = "█" * filled + "░" * (bar_len - filled)
@@ -95,35 +94,89 @@ def _build_progress_text(session: dict, done: int, errors: int,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Get the FIRST and LAST real message IDs of a channel
+# Reliably get the LAST real message ID of a channel.
+#
+# Strategy (tries three methods in order):
+#   1. get_chat_history(limit=1)  — works when bot has read access
+#   2. Probe known very-high IDs via get_messages() — works for admin-only bots
+#      because get_messages() uses a different MTProto method that admins can call
+#   3. Fall back to a safe high ceiling (999_999) so scan still runs
 # ─────────────────────────────────────────────────────────────────────────────
-async def _get_channel_bounds(client: Client, channel_id: int) -> tuple[int, int]:
-    """
-    Returns (first_id, last_id).
-    Uses get_chat_history with offset_id tricks to find real boundaries.
-    Falls back gracefully on permission errors.
-    """
-    first_id = 1
-    last_id  = 1
-
+async def _get_last_msg_id(client: Client, channel_id: int) -> int:
+    # Method 1: get_chat_history
     try:
-        # Last message: newest first
         async for msg in client.get_chat_history(channel_id, limit=1):
-            last_id = msg.id
-            print(f"[FF] _get_channel_bounds: last_id={last_id} for channel {channel_id}")
+            last = msg.id
+            print(f"[FF] last_id via get_chat_history: {last} (channel {channel_id})")
+            if last and last > 0:
+                return last
     except Exception as e:
-        print(f"[FF] _get_channel_bounds last_id error for {channel_id}: {e}")
+        print(f"[FF] get_chat_history failed for {channel_id}: {e}")
 
+    # Method 2: binary-search using get_messages()
+    # get_messages() works even for admin-only bots.
+    # We probe exponentially upward to find an ID that returns empty,
+    # then binary-search down to the last real message.
+    print(f"[FF] falling back to probe search for last_id in channel {channel_id}")
     try:
-        # First message: oldest first — offset from end of history
-        async for msg in client.get_chat_history(channel_id, limit=1, offset=-1):
-            first_id = msg.id
-            print(f"[FF] _get_channel_bounds: first_id={first_id} for channel {channel_id}")
-    except Exception as e:
-        print(f"[FF] _get_channel_bounds first_id error for {channel_id}: {e}")
-        first_id = 1
+        # Exponential probe: 1, 2, 4, 8, ... until we find an empty slot
+        probe = 1
+        last_known_real = 0
+        while probe <= 2_000_000:
+            msgs = await client.get_messages(channel_id, probe)
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+            real = [m for m in msgs if m and getattr(m, "id", 0)]
+            if real:
+                last_known_real = real[-1].id
+                probe *= 2
+            else:
+                # probe is beyond channel end — binary search between last_known_real and probe
+                break
+            await asyncio.sleep(0.05)
 
-    return first_id, last_id
+        if last_known_real == 0:
+            # Channel might be completely empty or unreachable
+            print(f"[FF] probe found no messages in channel {channel_id}")
+            return 1
+
+        # Binary search between last_known_real and probe
+        lo, hi = last_known_real, probe
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            msgs = await client.get_messages(channel_id, mid)
+            if not isinstance(msgs, list):
+                msgs = [msgs]
+            real = [m for m in msgs if m and getattr(m, "id", 0)]
+            if real:
+                lo = real[-1].id
+            else:
+                hi = mid
+            await asyncio.sleep(0.05)
+
+        print(f"[FF] last_id via probe/binary-search: {lo} (channel {channel_id})")
+        return lo
+
+    except Exception as e:
+        print(f"[FF] probe search failed for {channel_id}: {e}")
+
+    # Method 3: safe ceiling fallback — scan will just encounter empty IDs beyond real end
+    print(f"[FF] using fallback ceiling 999999 for channel {channel_id}")
+    return 999_999
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: edit the session's UI message, swallowing errors
+# ─────────────────────────────────────────────────────────────────────────────
+async def _edit(client: Client, s: dict, text: str, cancel_btn: bool = True):
+    markup = (
+        InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
+        if cancel_btn else None
+    )
+    try:
+        await client.edit_message_text(s["chat_id"], s["msg_id"], text, reply_markup=markup)
+    except (MessageNotModified, Exception) as e:
+        print(f"[FF] _edit failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -142,7 +195,6 @@ async def ff_src(client, query):
     s["source_title"] = next(
         (x["channel_title"] for x in s["all_channels"] if x["channel_id"] == src), str(src)
     )
-
     dst_channels = [x for x in s["all_channels"] if x["channel_id"] != src]
     if not dst_channels:
         return await query.message.edit_text(
@@ -150,11 +202,10 @@ async def ff_src(client, query):
         )
     s["dst_channels"] = dst_channels
     s["step"] = "dst"
-
-    print(f"[FF] uid={uid} selected source={src} ({s['source_title']})")
+    print(f"[FF] uid={uid} source={src} ({s['source_title']})")
 
     kb = [[InlineKeyboardButton(x["channel_title"], callback_data=f"ff_dst_{x['channel_id']}")] for x in dst_channels]
-    kb.append([InlineKeyboardButton("↩ Back", callback_data="ff_back_src")])
+    kb.append([InlineKeyboardButton("↩ Back (change source)", callback_data="ff_back_src")])
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")])
     await query.message.edit_text(
         f"📤 <b>Source:</b> {s['source_title']}\n\n📥 <b>Select DESTINATION channel</b>",
@@ -163,7 +214,7 @@ async def ff_src(client, query):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BACK to source
+# BACK to source list
 # ─────────────────────────────────────────────────────────────────────────────
 @Client.on_callback_query(filters.regex(r"^ff_back_src$"))
 async def ff_back_src(client, query):
@@ -172,19 +223,12 @@ async def ff_back_src(client, query):
     if not s:
         return await query.answer("Session expired. Use /file_forward again.", show_alert=True)
     await query.answer()
-
-    s.pop("source", None)
-    s.pop("source_title", None)
-    s.pop("destination", None)
-    s.pop("destination_title", None)
+    s.pop("source", None);  s.pop("source_title", None)
+    s.pop("destination", None); s.pop("destination_title", None)
     s["step"] = "src"
-
     kb = [[InlineKeyboardButton(ch["channel_title"], callback_data=f"ff_src_{ch['channel_id']}")] for ch in s["all_channels"]]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")])
-    await query.message.edit_text(
-        "📤 <b>Select SOURCE channel</b>",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+    await query.message.edit_text("📤 <b>Select SOURCE channel</b>", reply_markup=InlineKeyboardMarkup(kb))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,8 +251,7 @@ async def ff_dst(client, query):
     s["chat_id"] = query.message.chat.id
     s["msg_id"]  = query.message.id
     s["expires"] = time.time() + 900
-
-    print(f"[FF] uid={uid} selected dest={dst} ({s['destination_title']})")
+    print(f"[FF] uid={uid} dest={dst} ({s['destination_title']})")
 
     await query.message.edit_text(
         f"📤 <b>Source:</b> {s['source_title']}\n"
@@ -224,12 +267,19 @@ async def ff_dst(client, query):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SCAN + ENQUEUE  —  fixed batch scan
+# SCAN + ENQUEUE
+#
+# Core design:
+#   - scan_from = 1 (or skip_id+1) — ALWAYS start from beginning, never from
+#     a "first_id" guess.  Deleted IDs are just empty in the batch and get
+#     skipped instantly.  16–17 batch calls cover 3310 deleted messages — fast.
+#   - scan_to   = real last message, found reliably via _get_last_msg_id()
+#   - No consecutive_missing early exit — channels have gaps everywhere
 # ─────────────────────────────────────────────────────────────────────────────
 async def enqueue_forward_jobs(client: Client, uid: int):
     s = FF_SESSIONS.get(uid)
     if not s:
-        print(f"[FF] enqueue_forward_jobs: no session for uid={uid}")
+        print(f"[FF] enqueue: no session uid={uid}")
         return
 
     if "session_id" not in s:
@@ -245,83 +295,93 @@ async def enqueue_forward_jobs(client: Client, uid: int):
     range_end   = s.get("range_end")
     skip_id     = int(s.get("skip", 0))
 
-    print(f"[FF] enqueue_forward_jobs start: uid={uid} src={src} dst={dst} mode={ff_mode} skip={skip_id} range={range_start}-{range_end}")
+    print(f"[FF] enqueue start uid={uid} src={src} dst={dst} mode={ff_mode} skip={skip_id} range={range_start}-{range_end}")
 
-    # ── Step 1: determine scan boundaries ────────────────────────────────
-    await _edit(client, s,
-        "🔍 <b>Scanning source channel…</b>\n\n⏳ Finding channel boundaries, please wait…"
-    )
+    await _edit(client, s, "🔍 <b>Scanning source channel…</b>\n\n⏳ Finding last message ID…")
 
+    # ── Determine scan_from / scan_to ─────────────────────────────────────
     if ff_mode == "range" and range_start is not None and range_end is not None:
         scan_from = min(range_start, range_end)
         scan_to   = max(range_start, range_end)
-        print(f"[FF] range mode: scan_from={scan_from} scan_to={scan_to}")
+        print(f"[FF] range mode: {scan_from} → {scan_to}")
     else:
-        # Get real first/last message IDs from channel history
-        first_id, last_id = await _get_channel_bounds(client, src)
+        # Get last real message ID (robust, three fallback methods)
+        scan_to = await _get_last_msg_id(client, src)
+        # scan_from: always start at 1 (or skip+1).
+        # Deleted IDs 1..N are handled by batch fetch — no early exit.
+        scan_from = max(1, skip_id + 1)
+        print(f"[FF] skip/all mode: scan_from={scan_from} scan_to={scan_to}")
 
-        if ff_mode == "skip" and skip_id > 0:
-            scan_from = skip_id + 1
-        else:
-            scan_from = first_id   # ← use real first message, NOT hardcoded 1
-
-        scan_to = last_id
-        print(f"[FF] skip/all mode: first_id={first_id} last_id={last_id} scan_from={scan_from} scan_to={scan_to}")
-
-    if scan_from > scan_to:
-        print(f"[FF] scan_from={scan_from} > scan_to={scan_to}, nothing to scan")
+    # Sanity check
+    if scan_to < 1:
+        print(f"[FF] scan_to={scan_to} invalid, aborting")
         await _edit(client, s,
-            f"❌ <b>Nothing to scan.</b>\n\n"
-            f"scan_from=<code>{scan_from}</code> is greater than scan_to=<code>{scan_to}</code>.\n"
-            f"Check your skip/range values."
+            "❌ <b>Could not determine channel message range.</b>\n\n"
+            "Make sure the bot is an admin of the source channel with full read permissions.",
+            cancel_btn=False
+        )
+        FF_SESSIONS.pop(uid, None)
+        return
+
+    # If user skipped past the last message
+    if scan_from > scan_to:
+        print(f"[FF] scan_from={scan_from} > scan_to={scan_to}")
+        await _edit(client, s,
+            f"❌ <b>Skip ID is beyond the last message.</b>\n\n"
+            f"Last message in channel: <code>{scan_to}</code>\n"
+            f"Your skip value: <code>{skip_id}</code>\n\n"
+            "Send a smaller skip value.",
+            cancel_btn=False
         )
         FF_SESSIONS.pop(uid, None)
         return
 
     total_range = scan_to - scan_from + 1
+    print(f"[FF] scanning {total_range} IDs: {scan_from} → {scan_to}")
 
     await _edit(client, s,
         f"🔍 <b>Scanning source channel…</b>\n\n"
         f"📨 Range: <code>{scan_from}</code> → <code>{scan_to}</code> "
-        f"(<code>{total_range}</code> messages)\n"
+        f"(<code>{total_range}</code> IDs)\n"
         "⏳ Counting media files…"
     )
 
-    # ── Step 2: batch-fetch and collect media IDs ─────────────────────────
+    # ── Batch-fetch and collect media IDs ────────────────────────────────
+    # Batches of 200 IDs each.
+    # Deleted/missing messages come back as Message(id=0) — _has_media() returns False.
+    # We do NOT break early on gaps — channels can have large gaps of deleted messages.
     media_ids      = []
     BATCH_SIZE     = 200
     scanned        = 0
     last_ui_update = time.time()
-    # We no longer use consecutive_missing to break early —
-    # gaps exist in channels (deleted msgs) so we scan the full range
-    cur_id = scan_from
+    cur_id         = scan_from
 
     while cur_id <= scan_to:
         if s.get("session_id") in CANCELLED_SESSIONS:
-            print(f"[FF] scan cancelled for uid={uid}")
+            print(f"[FF] scan cancelled uid={uid}")
             return
 
         batch_end    = min(cur_id + BATCH_SIZE - 1, scan_to)
         ids_to_fetch = list(range(cur_id, batch_end + 1))
 
-        print(f"[FF] fetching batch {cur_id}–{batch_end} ({len(ids_to_fetch)} ids)")
-
         try:
             messages = await client.get_messages(src, ids_to_fetch)
         except FloodWait as e:
-            print(f"[FF] FloodWait {e.value}s during scan")
+            print(f"[FF] FloodWait {e.value}s during scan at id={cur_id}")
             await asyncio.sleep(e.value + 1)
             continue
         except (ChannelPrivate, ChatAdminRequired) as e:
-            print(f"[FF] Permission error scanning {src}: {e}")
+            print(f"[FF] Permission error on {src}: {e}")
             await _edit(client, s,
-                f"❌ <b>Permission error:</b> Bot cannot read messages from this channel.\n"
-                f"Error: <code>{e}</code>"
+                f"❌ <b>Permission error:</b> Bot cannot read messages from source channel.\n"
+                f"<code>{e}</code>",
+                cancel_btn=False
             )
             FF_SESSIONS.pop(uid, None)
             return
         except Exception as e:
             print(f"[FF] get_messages error batch {cur_id}-{batch_end}: {e}")
+            # Skip this batch and continue — don't abort the whole scan
             scanned += len(ids_to_fetch)
             cur_id   = batch_end + 1
             continue
@@ -338,9 +398,10 @@ async def enqueue_forward_jobs(client: Client, uid: int):
         scanned += len(ids_to_fetch)
         cur_id   = batch_end + 1
 
-        print(f"[FF] batch done: scanned={scanned}/{total_range} media_in_batch={batch_media} total_media={len(media_ids)}")
+        print(f"[FF] batch {cur_id-len(ids_to_fetch)}-{batch_end}: "
+              f"scanned={scanned}/{total_range} media_this_batch={batch_media} total={len(media_ids)}")
 
-        # UI refresh every 3 s
+        # UI update every 3 s
         now = time.time()
         if now - last_ui_update >= 3.0:
             last_ui_update = now
@@ -351,33 +412,34 @@ async def enqueue_forward_jobs(client: Client, uid: int):
                     s["chat_id"], s["msg_id"],
                     f"🔍 <b>Scanning source channel…</b>\n\n"
                     f"[{bar}] <code>{pct}%</code>\n"
-                    f"📨 Scanned: <code>{scanned}</code> / <code>{total_range}</code> messages\n"
-                    f"🎞 Media found so far: <code>{len(media_ids)}</code>",
+                    f"📨 Scanned: <code>{scanned}</code> / <code>{total_range}</code> IDs\n"
+                    f"🎞 Media found: <code>{len(media_ids)}</code>",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
                 )
             except (MessageNotModified, Exception):
                 pass
 
-    # ── Step 3: validate ──────────────────────────────────────────────────
+    # ── Results ───────────────────────────────────────────────────────────
     total       = len(media_ids)
     s["total"]  = total
     s["done"]   = 0
     s["errors"] = 0
 
-    print(f"[FF] scan complete: scanned={scanned} total_media={total} for uid={uid}")
+    print(f"[FF] scan complete: scanned={scanned} IDs, found={total} media, uid={uid}")
 
     if total == 0:
         await _edit(client, s,
-            f"❌ <b>No media files found</b> in the scanned range.\n\n"
-            f"📊 <b>Scan details:</b>\n"
-            f"• Messages scanned: <code>{scanned}</code>\n"
+            f"❌ <b>No media files found</b> in the source channel.\n\n"
+            f"📊 <b>Scan summary:</b>\n"
+            f"• IDs scanned: <code>{scanned}</code>\n"
             f"• Range: <code>{scan_from}</code> → <code>{scan_to}</code>\n\n"
-            f"Make sure the source channel has photos, videos, or documents."
+            "Make sure the source channel has photos, videos, documents, or audio files.",
+            cancel_btn=False
         )
         FF_SESSIONS.pop(uid, None)
         return
 
-    # ── Step 4: bulk-enqueue ──────────────────────────────────────────────
+    # ── Bulk-enqueue ──────────────────────────────────────────────────────
     jobs = [
         {
             "user_id":           uid,
@@ -394,7 +456,7 @@ async def enqueue_forward_jobs(client: Client, uid: int):
         }
         for mid in media_ids
     ]
-    print(f"[FF] enqueueing {len(jobs)} jobs for uid={uid}")
+    print(f"[FF] enqueueing {len(jobs)} jobs uid={uid}")
     await enqueue_forward_bulk(jobs)
 
     elapsed = time.time() - start_time
@@ -406,19 +468,6 @@ async def enqueue_forward_jobs(client: Client, uid: int):
         )
     except MessageNotModified:
         pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: edit message safely
-# ─────────────────────────────────────────────────────────────────────────────
-async def _edit(client: Client, s: dict, text: str, markup=None):
-    try:
-        await client.edit_message_text(
-            s["chat_id"], s["msg_id"], text,
-            reply_markup=markup or InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
-        )
-    except (MessageNotModified, Exception) as e:
-        print(f"[FF] _edit failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -470,11 +519,10 @@ async def forward_worker(client: Client):
                 from_chat_id=job["src"],
                 message_id=job["msg_id"]
             )
-            print(f"[FF] forwarded msg {job['msg_id']} src={job['src']} dst={job['dst']}")
+            print(f"[FF] ✓ forwarded msg={job['msg_id']} src={job['src']} → dst={job['dst']}")
 
             # Admin dump-log copy
-            job_user = job.get("user_id")
-            if job_user != ADMIN:
+            if job.get("user_id") != ADMIN:
                 try:
                     msg = await client.get_messages(job["src"], job["msg_id"])
                     fname = None
@@ -491,7 +539,7 @@ async def forward_worker(client: Client):
                         caption=fname
                     )
                 except Exception as e:
-                    print(f"[FF_DUMP_FAIL] msg={job['msg_id']}: {e}")
+                    print(f"[FF] dump_fail msg={job['msg_id']}: {e}")
 
             await forward_done(job["_id"])
             await _update_session_progress(client, job, error=False)
@@ -499,12 +547,12 @@ async def forward_worker(client: Client):
 
         except FloodWait as e:
             wait = int(e.value) + 2
-            print(f"[FF] FloodWait {wait}s on forward msg={job.get('msg_id')}")
+            print(f"[FF] FloodWait {wait}s msg={job.get('msg_id')}")
             FORWARD_COOLDOWN[key] = time.time() + wait
             await forward_retry(job["_id"], wait)
             await asyncio.sleep(min(wait, 30))
         except Exception as ex:
-            print(f"[FF_ERROR] msg={job.get('msg_id')} src={job.get('src')}: {ex}")
+            print(f"[FF] error msg={job.get('msg_id')}: {ex}")
             await forward_done(job["_id"])
             await _update_session_progress(client, job, error=True)
         finally:
@@ -533,12 +581,10 @@ async def _update_session_progress(client: Client, job: dict, *, error: bool):
     done       = s.get("done", 0)
     errors     = s.get("errors", 0)
     total      = job.get("total", 1)
-    start_time = job.get("start_time", time.time())
-    elapsed    = time.time() - start_time
+    elapsed    = time.time() - job.get("start_time", time.time())
 
     now  = time.time()
     last = _LAST_PROGRESS_EDIT.get(session_id, 0)
-
     remaining   = await forward_queue.count_documents(
         {"session_id": session_id, "status": {"$in": ["pending", "processing"]}}
     )
@@ -550,7 +596,7 @@ async def _update_session_progress(client: Client, job: dict, *, error: bool):
     _LAST_PROGRESS_EDIT[session_id] = now
 
     if is_complete:
-        print(f"[FF] session {session_id} complete: done={done} errors={errors} total={total}")
+        print(f"[FF] complete: session={session_id} done={done} errors={errors} total={total}")
         text   = _build_progress_text(s, done, errors, total, elapsed, done_flag=True)
         markup = None
         _LAST_PROGRESS_EDIT.pop(session_id, None)
@@ -561,11 +607,7 @@ async def _update_session_progress(client: Client, job: dict, *, error: bool):
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
 
     try:
-        await client.edit_message_text(
-            job["chat_id"], job["ui_msg"],
-            text,
-            reply_markup=markup
-        )
+        await client.edit_message_text(job["chat_id"], job["ui_msg"], text, reply_markup=markup)
     except (MessageNotModified, Exception):
         pass
 
@@ -590,18 +632,15 @@ async def ff_cancel(client, query):
         CANCELLED_SESSIONS.add(session_id)
         await forward_queue.delete_many({"session_id": session_id})
         elapsed = time.time() - s.get("start_time", time.time())
-        done    = s.get("done", 0)
-        total   = s.get("total", 0)
-        errors  = s.get("errors", 0)
-        print(f"[FF] cancelled session {session_id}: done={done}/{total} errors={errors}")
+        print(f"[FF] cancel: session={session_id} done={s.get('done',0)}/{s.get('total',0)}")
         try:
             await query.message.edit_text(
                 f"🛑 <b>Forwarding Cancelled</b>\n\n"
                 f"📤 <b>Source:</b> {s.get('source_title', 'N/A')}\n"
                 f"📥 <b>Destination:</b> {s.get('destination_title', 'N/A')}\n\n"
-                f"📦 <b>Files Forwarded:</b> <code>{done}</code>\n"
-                f"🗂 <b>Total Detected:</b> <code>{total}</code>\n"
-                f"❌ <b>Errors:</b> <code>{errors}</code>\n"
+                f"📦 <b>Files Forwarded:</b> <code>{s.get('done',0)}</code>\n"
+                f"🗂 <b>Total Detected:</b> <code>{s.get('total',0)}</code>\n"
+                f"❌ <b>Errors:</b> <code>{s.get('errors',0)}</code>\n"
                 f"⏱ <b>Time Elapsed:</b> <code>{_fmt_duration(elapsed)}</code>"
             )
         except:
