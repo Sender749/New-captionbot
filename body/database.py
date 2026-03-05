@@ -302,12 +302,8 @@ async def delete_url_buttons(channel_id: int):
 
 # ---------------- Delete Channel (full wipe) ----------------
 async def delete_all_channel_data(user_id: int, channel_id: int):
-    """Remove a channel from user's list and wipe all its settings from DB."""
-    # Remove from user's channel list
+    """Remove channel from user's list and wipe ALL its settings from DB."""
     await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": channel_id}}})
-    # Wipe all channel settings doc
     await chnl_ids.delete_one({"chnl_id": channel_id})
-    # Clear caches
     _CHANNEL_CACHE.pop(channel_id, None)
     _CHAT_TITLE_CACHE.pop(channel_id, None)
-    invalidate_user_channels_cache(user_id)
