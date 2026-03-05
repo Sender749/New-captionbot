@@ -430,7 +430,12 @@ async def ff_start(client, message):
         return await message.reply_text("❌ No admin channels found. Add me to a channel first.")
     if len(channels) < 2:
         return await message.reply_text("❌ You need at least 2 channels to use file forward.")
-    FF_SESSIONS[uid] = {"step": "src", "channels": channels, "expires": None}
+    FF_SESSIONS[uid] = {
+        "step": "src",
+        "all_channels": channels,   # kept for back navigation
+        "channels": channels,
+        "expires": None,
+    }
     kb = [[InlineKeyboardButton(ch["channel_title"], callback_data=f"ff_src_{ch['channel_id']}")] for ch in channels]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")])
     await message.reply_text("📤 <b>Select SOURCE channel</b>", reply_markup=InlineKeyboardMarkup(kb))
@@ -1055,67 +1060,75 @@ async def capture_user_input(client, message):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=f"seturl_{channel_id}")]]))
         return
 
-    # ---------- FILE FORWARD SKIP ----------
-    # ---------- FILE FORWARD SKIP / RANGE ----------
+    # ---------- FILE FORWARD INPUT ----------
     if user_id in FF_SESSIONS:
         session = FF_SESSIONS[user_id]
         if session.get("expires") and session["expires"] < time.time():
             FF_SESSIONS.pop(user_id, None)
             return await message.reply_text("⏰ Session expired. Start again with /file_forward")
 
-        # ── SKIP mode ──
         if session.get("step") == "skip":
             raw = (message.text or "").strip()
-            msg_id = extract_msg_id_from_text(raw)
-            if msg_id is None:
-                return await message.reply_text("❌ Invalid. Send a Telegram message link or a message ID number.")
-            session["skip"] = int(msg_id)
-            session["step"] = "queue"
             try:
                 await message.delete()
             except:
                 pass
-            # Always edit the existing bot message — never send a new one
-            try:
-                await client.edit_message_text(
-                    session["chat_id"], session["msg_id"],
-                    "🔍 <b>Scanning source channel…</b>\n\nStarting from message <code>{}</code>, please wait.".format(msg_id),
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
-                )
-            except:
-                pass
-            asyncio.create_task(enqueue_forward_jobs(client, user_id))
-            return
 
-        # ── RANGE mode ──
-        if session.get("step") == "range_input":
-            raw = (message.text or "").strip()
-            # Accept: "100 500", "100\n500", or two links separated by space/newline
-            parts = re.split(r"[\s\n]+", raw.strip())
-            # Filter out empty strings
-            parts = [p for p in parts if p]
-            id1 = extract_msg_id_from_text(parts[0]) if len(parts) >= 1 else None
-            id2 = extract_msg_id_from_text(parts[1]) if len(parts) >= 2 else None
-            if id1 is None or id2 is None:
-                return await message.reply_text(
-                    "❌ Invalid format. Send two message IDs or links:\n"
-                    "<code>100 500</code>\nor\n"
-                    "<code>https://t.me/c/.../100 https://t.me/c/.../500</code>"
-                )
-            session["range_start"] = int(id1)
-            session["range_end"]   = int(id2)
-            session["step"] = "queue"
-            try:
-                await message.delete()
-            except:
-                pass
-            # Always edit the existing bot message
+            # ── Format 3: "start - end"  (range separated by " - ", "-", or newline) ──
+            # Match two IDs/links with a separator between them
+            range_sep = re.split(r"\s*[-–]\s*|\n", raw, maxsplit=1)
+            range_sep = [p.strip() for p in range_sep if p.strip()]
+
+            if len(range_sep) == 2:
+                id1 = extract_msg_id_from_text(range_sep[0])
+                id2 = extract_msg_id_from_text(range_sep[1])
+                if id1 is not None and id2 is not None:
+                    session["ff_mode"]     = "range"
+                    session["range_start"] = int(id1)
+                    session["range_end"]   = int(id2)
+                    session["step"]        = "queue"
+                    try:
+                        await client.edit_message_text(
+                            session["chat_id"], session["msg_id"],
+                            f"🔍 <b>Scanning source channel…</b>\n\n"
+                            f"📌 Range: <code>{min(id1,id2)}</code> → <code>{max(id1,id2)}</code>\n"
+                            "⏳ Please wait…",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
+                        )
+                    except:
+                        pass
+                    asyncio.create_task(enqueue_forward_jobs(client, user_id))
+                    return
+                # fall through to single-id parse below
+
+            # ── Format 1: "0" → forward all ──
+            # ── Format 2: single ID/link → skip up to that ID ──
+            msg_id_val = extract_msg_id_from_text(raw)
+            if msg_id_val is None:
+                # Invalid — re-ask (edit same message)
+                try:
+                    await client.edit_message_text(
+                        session["chat_id"], session["msg_id"],
+                        "❌ <b>Invalid input.</b> Please send one of:\n\n"
+                        "• <code>0</code> — forward all files\n"
+                        "• <code>2500</code> or a message link — forward from that message onwards\n"
+                        "• <code>100 - 500</code> or two links — forward a specific range",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]),
+                        disable_web_page_preview=True
+                    )
+                except:
+                    pass
+                return
+
+            session["ff_mode"] = "skip"
+            session["skip"]    = int(msg_id_val)
+            session["step"]    = "queue"
             try:
                 await client.edit_message_text(
                     session["chat_id"], session["msg_id"],
                     f"🔍 <b>Scanning source channel…</b>\n\n"
-                    f"📌 Range: <code>{min(id1,id2)}</code> → <code>{max(id1,id2)}</code>\n"
-                    f"⏳ Please wait…",
+                    f"⏭ Starting after message <code>{msg_id_val}</code>\n"
+                    "⏳ Please wait…",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]])
                 )
             except:
