@@ -7,7 +7,6 @@ from pyrogram.enums import ParseMode
 from info import *
 from Script import script
 from body.database import *
-from body.file_forward import FF_SESSIONS
 from collections import deque, defaultdict
 
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
@@ -530,8 +529,6 @@ async def reset_db(client, message):
 async def queue_status(client, message):
     cap_pending    = await queue_col.count_documents({"status": "pending"})
     cap_processing = await queue_col.count_documents({"status": "processing"})
-    f_pending      = await forward_queue.count_documents({"status": "pending"})
-    f_processing   = await forward_queue.count_documents({"status": "processing"})
 
     cap_pipeline = [
         {"$match": {"status": "pending"}},
@@ -552,7 +549,6 @@ async def queue_status(client, message):
     text = (
         "📊 <b>QUEUE STATUS</b>\n\n"
         f"📝 Caption — Pending: <code>{cap_pending}</code> | Processing: <code>{cap_processing}</code>\n"
-        f"📦 Forward — Pending: <code>{f_pending}</code> | Processing: <code>{f_processing}</code>\n"
     )
     if cap_lines:
         text += "\n🔥 <b>Busy Caption Channels</b>\n" + "\n".join(cap_lines)
@@ -943,7 +939,6 @@ async def capture_user_input(client, message):
     active_users = set()
     for key in ("caption_set", "block_words_set", "replace_words_set", "prefix_set", "suffix_set", "url_set"):
         active_users.update(bot_data.get(key, {}).keys())
-    active_users.update(FF_SESSIONS.keys())
 
     if user_id not in active_users:
         return
@@ -1043,8 +1038,3 @@ async def capture_user_input(client, message):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=f"seturl_{channel_id}")]]))
         return
 
-    # ---------- FILE FORWARD INPUT ----------
-    if user_id in FF_SESSIONS:
-        from body.file_forward import handle_ff_input
-        if await handle_ff_input(client, message, user_id):
-            return
