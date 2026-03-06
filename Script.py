@@ -133,10 +133,18 @@ Your channel captions will now be fully automatic ✨
 • /dump_skip – Set channel to skip forwarding.
 • /remove_dump – Set channel to remove from skip forwarding.
 
+<b>File Forwarding</b>
+• /file_forward – Start interactive file forwarding wizard
+  → Select source channel → destination channel → skip/range
+  → Supports: 0 (all), msg_id/link (from there to end), start-end range
+  → Automatically resumes after bot restart
+• /ff_status – View active and pending forwarding tasks
+
 <b>System Info</b>
 • Workers: {workers}
 • Edit Delay: {delay}s
 • Queue Mode: Persistent (MongoDB)
 • FloodWait Handling: Enabled
 • Crash Recovery: Enabled
+• FF Dump Channel: Set via FF_CH env variable
 """
