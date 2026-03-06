@@ -82,27 +82,37 @@ def _parse_msg_ref(text: str) -> Optional[int]:
 
 
 async def _get_bot_admin_channels(client: Client, user_id: int) -> list:
+    """Return channels where bot is admin — uses asyncio.gather for speed."""
+    from pyrogram.errors import ChatAdminRequired, RPCError
     raw = await get_user_channels(user_id)
-    result = []
-    for ch in raw:
-        ch_id = ch.get("channel_id")
+    if not raw:
+        return []
+
+    async def _check(ch):
+        ch_id    = ch.get("channel_id")
         ch_title = ch.get("channel_title", str(ch_id))
-        cached = get_cached_chat_title(ch_id)
+        cached   = get_cached_chat_title(ch_id)
         if cached:
             ch_title = cached
         try:
             member = await client.get_chat_member(ch_id, "me")
             if _is_admin_member(member):
-                try:
-                    chat = await client.get_chat(ch_id)
-                    ch_title = getattr(chat, "title", ch_title) or ch_title
-                    set_cached_chat_title(ch_id, ch_title)
-                except Exception:
-                    pass
-                result.append({"id": ch_id, "title": ch_title})
+                if not cached:
+                    try:
+                        chat = await client.get_chat(ch_id)
+                        ch_title = getattr(chat, "title", ch_title) or ch_title
+                        set_cached_chat_title(ch_id, ch_title)
+                    except Exception:
+                        pass
+                return {"id": ch_id, "title": ch_title}
+        except (ChatAdminRequired, RPCError):
+            pass
         except Exception:
             pass
-    return result
+        return None
+
+    results = await asyncio.gather(*[_check(ch) for ch in raw])
+    return [r for r in results if r is not None]
 
 
 def _channel_keyboard(channels: list, cb_prefix: str, cancel_cb: str) -> InlineKeyboardMarkup:
