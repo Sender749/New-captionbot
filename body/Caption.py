@@ -936,6 +936,16 @@ def clean_text(text: str) -> str:
 @Client.on_message(filters.private)
 async def capture_user_input(client, message):
     user_id = message.from_user.id
+
+    # ── File Forwarding skip/range input takes priority ──
+    try:
+        from body.FileForward import handle_ff_skip_input
+        if await handle_ff_skip_input(client, message):
+            return
+    except Exception:
+        pass
+    # ────────────────────────────────────────────────────
+
     active_users = set()
     for key in ("caption_set", "block_words_set", "replace_words_set", "prefix_set", "suffix_set", "url_set"):
         active_users.update(bot_data.get(key, {}).keys())
