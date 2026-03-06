@@ -32,7 +32,6 @@ class Bot(Client):
             await super().start()
         await self._run_plugin_startup_hooks()
         await ensure_queue_indexes()
-        await ensure_forward_indexes()
         await recover_stuck_jobs()
         from body.Caption import caption_worker
         for _ in range(EXECUTORS):
@@ -45,7 +44,6 @@ class Bot(Client):
             except Exception:
                 print("⚠️ Bot must be admin in force-sub channel")
                 self.force_channel = None
-        print(f"FF_CH = {FF_CH!r}  CP_CH = {CP_CH!r}")
         print(f"{me.first_name} started ✨")
         try:
             await self.send_message(ADMIN, f"<b>{me.first_name} started ✨</b>")
