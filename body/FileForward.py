@@ -162,7 +162,7 @@ def _get_ff_ch():
 
 # ── /file_forward command (ALL users) ────────────────────────────────────────
 
-@Client.on_message(filters.command("file_forward") & filters.private)
+@Client.on_message(filters.command("file_forward") & filters.private, group=-1)
 async def cmd_file_forward(client: Client, message: Message):
     user_id = message.from_user.id
     task = _active_tasks.get(user_id)
@@ -195,7 +195,7 @@ async def cmd_file_forward(client: Client, message: Message):
 
 # ── Source selected ───────────────────────────────────────────────────────────
 
-@Client.on_callback_query(filters.regex(r"^ff_src_-?\d+$"))
+@Client.on_callback_query(filters.regex(r"^ff_src_-?\d+$"), group=-1)
 async def cb_ff_source(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
     src_id = int(query.data[7:])   # strip "ff_src_" prefix
@@ -238,7 +238,7 @@ async def cb_ff_source(client: Client, query: CallbackQuery):
 
 # ── Destination selected ──────────────────────────────────────────────────────
 
-@Client.on_callback_query(filters.regex(r"^ff_dst_-?\d+$"))
+@Client.on_callback_query(filters.regex(r"^ff_dst_-?\d+$"), group=-1)
 async def cb_ff_dest(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
     dst_id = int(query.data[7:])   # strip "ff_dst_" prefix
@@ -278,14 +278,14 @@ async def cb_ff_dest(client: Client, query: CallbackQuery):
 
 # ── Cancel ────────────────────────────────────────────────────────────────────
 
-@Client.on_callback_query(filters.regex(r"^ff_cancel_main$"))
+@Client.on_callback_query(filters.regex(r"^ff_cancel_main$"), group=-1)
 async def cb_ff_cancel_main(client: Client, query: CallbackQuery):
     _ff_sessions.pop(query.from_user.id, None)
     await query.message.edit_text("❌ File forwarding cancelled.")
     await query.answer("Cancelled")
 
 
-@Client.on_callback_query(filters.regex(r"^ff_cancel_task_\d+$"))
+@Client.on_callback_query(filters.regex(r"^ff_cancel_task_\d+$"), group=-1)
 async def cb_ff_cancel_task(client: Client, query: CallbackQuery):
     uid = int(query.data[len("ff_cancel_task_"):])
     if uid != query.from_user.id:
@@ -645,7 +645,7 @@ async def resume_pending_ff_tasks(client: Client):
 
 # ── /ff_status ────────────────────────────────────────────────────────────────
 
-@Client.on_message(filters.command("ff_status") & filters.private)
+@Client.on_message(filters.command("ff_status") & filters.private, group=-1)
 async def cmd_ff_status(client: Client, message: Message):
     user_id = message.from_user.id
     col = await _get_ff_col()
