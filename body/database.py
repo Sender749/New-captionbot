@@ -28,7 +28,6 @@ chnl_ids = db.chnl_ids
 users = db.users
 user_channels = db.user_channels
 queue_col = db.caption_queue
-forward_queue = db.forward_queue
 
 # ---------------- Chat Title Cache ----------------
 def get_cached_chat_title(channel_id: int) -> Optional[str]:
@@ -40,38 +39,6 @@ def get_cached_chat_title(channel_id: int) -> Optional[str]:
 
 def set_cached_chat_title(channel_id: int, title: str):
     _CHAT_TITLE_CACHE[channel_id] = {"title": title, "ts": time.time()}
-
-# ---------------- Queue System for Forwarding ----------------
-async def ensure_forward_indexes():
-    await forward_queue.create_index([("status", 1), ("ts", 1)])
-    await forward_queue.create_index([("src", 1)])
-    await forward_queue.create_index([("dst", 1)])
-    await forward_queue.create_index([("session_id", 1)])
-
-async def enqueue_forward(job: dict):
-    await forward_queue.insert_one({
-        **job,
-        "status": "pending",
-        "retries": 0,
-        "ts": time.time()
-    })
-
-async def enqueue_forward_bulk(jobs: list):
-    """Bulk insert for faster enqueue of many jobs."""
-    if not jobs:
-        return
-    docs = [{"status": "pending", "retries": 0, "ts": time.time(), **j} for j in jobs]
-    await forward_queue.insert_many(docs, ordered=False)
-
-async def forward_done(job_id):
-    await forward_queue.delete_one({"_id": job_id})
-
-async def forward_retry(job_id, delay):
-    await forward_queue.update_one(
-        {"_id": job_id},
-        {"$set": {"status": "pending", "ts": time.time() + delay},
-         "$inc": {"retries": 1}}
-    )
 
 # ---------------- Dump skip functions ----------------
 async def set_dump_skip(channel_id: int, status: bool):
