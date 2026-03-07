@@ -63,6 +63,7 @@ async def when_added_as_admin(client, chat_member_update):
         owner_id = owner.id
         owner_name = owner.first_name or "Unknown User"
         await add_user_channel(owner_id, chat.id, chat.title or "Unnamed Channel")
+        await set_channel_title_cache(chat.id, chat.title or "Unnamed Channel")
         existing = await get_channel_caption(chat.id)
         if not existing:
             await set_block_words(chat.id, "")
@@ -588,26 +589,38 @@ async def reCap(client, msg):
     prefix = cap_doc.get("prefix", "") or ""
     replace_raw = cap_doc.get("replace_words", None)
     url_buttons = cap_doc.get("url_buttons", [])
-    # Extract info from caption
-    audio_lang_list = extract_audio_languages(default_caption)
-    language = " ".join(audio_lang_list)
-    year = extract_year(default_caption)
+    # Extract info from caption + filename
+    audio_lang_list = extract_audio_languages(f"{file_name} {default_caption}")
+    language = " + ".join(audio_lang_list) if audio_lang_list else ""
+    year = extract_year(default_caption) or extract_year(file_name) or ""
     # Build caption
     try:
         raw_file_name = normalize_series_name(file_name)
+        # Parse all metadata once
+        file_info = parse_file_info(raw_file_name, default_caption)
         smart_file_name = ""
         if "{smart_file_name}" in cap_template:
-            smart_file_name = build_smart_filename(
-                raw_file_name,
-                default_caption
-            )
+            smart_file_name = build_smart_filename(raw_file_name, default_caption)
         new_caption = cap_template.format(
             file_name=raw_file_name,
             smart_file_name=smart_file_name,
             file_size=file_size,
             default_caption=default_caption,
-            language=language or "",
-            year=year or ""
+            language=language or file_info.get("audio", ""),
+            year=year or file_info.get("year", ""),
+            title=file_info.get("title", ""),
+            season=file_info.get("season", ""),
+            episode=file_info.get("episode", ""),
+            audio=file_info.get("audio", ""),
+            subtitle=file_info.get("subtitle", ""),
+            quality=file_info.get("quality", ""),
+            resolution=file_info.get("resolution", ""),
+            source=file_info.get("source", ""),
+            vcodec=file_info.get("vcodec", ""),
+            acodec=file_info.get("acodec", ""),
+            extension=file_info.get("extension", ""),
+            duration="",
+            empty="",
         )
     except Exception as e:
         new_caption = cap_template
@@ -644,22 +657,40 @@ async def reCap(client, msg):
 
 # ---------------- Smart File Name Helper ----------------
 LANG_LIST = [
-    "Hindi","English","Tamil","Telugu","Malayalam","Kannada",
-    "Marathi","Gujarati","Bengali","Punjabi","Urdu",
-    "Japanese","Korean","Chinese","Spanish","French","German",
-    "Italian","Russian"
+    "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada",
+    "Marathi", "Gujarati", "Bengali", "Punjabi", "Urdu",
+    "Japanese", "Korean", "Chinese", "Spanish", "French", "German",
+    "Italian", "Russian"
 ]
-QUALITY_LIST = ["480p","720p","1080p","2160p","4k"]
-SOURCE_LIST = ["WEB-DL","WEBRip","BluRay","HDRip","DVDRip"]
-VIDEO_CODEC_LIST = ["x265","x264","HEVC","AV1"]
-AUDIO_CODEC_LIST = ["AAC","DDP","AC3","DTS","Atmos"]
-EXT_LIST = ["mkv","mp4","avi","webm"]
+# Short lang codes found in filenames like "Hin Eng"
+LANG_CODE_MAP = {
+    "hin": "Hindi", "eng": "English", "tam": "Tamil", "tel": "Telugu",
+    "mal": "Malayalam", "kan": "Kannada", "mar": "Marathi", "guj": "Gujarati",
+    "ben": "Bengali", "pan": "Punjabi", "urd": "Urdu",
+    "jpn": "Japanese", "kor": "Korean", "chi": "Chinese",
+    "spa": "Spanish", "fre": "French", "ger": "German",
+    "ita": "Italian", "rus": "Russian"
+}
+QUALITY_LIST = ["2160p", "4K", "1080p", "720p", "480p", "360p"]
+SOURCE_LIST = ["WEB-DL", "WEBRip", "BluRay", "Blu-Ray", "HDRip", "DVDRip", "HDTV", "AMZN", "NF", "DSNP"]
+VIDEO_CODEC_LIST = ["HEVC", "x265", "x264", "AV1", "H.264", "H.265"]
+AUDIO_CODEC_LIST = ["DD5.1", "DD+", "DDP5.1", "DDP", "DTS-HD", "DTS", "Atmos", "AAC", "AC3", "MP3"]
+EXT_LIST = ["mkv", "mp4", "avi", "webm", "mov"]
+
+# Tags that mark ESub/HSub/Sub presence
+ESUB_RE = re.compile(r'\bE\.?Subs?\b', re.I)
+HSUB_RE = re.compile(r'\bH\.?Subs?\b', re.I)
+SUB_RE  = re.compile(r'\b(?:M\.?Subs?|MSub|Subs?|Subtitles?)\b', re.I)
 
 def _norm(text: str) -> str:
     return re.sub(r'\s+', ' ', text.lower()).strip()
 
+def _clean_raw(text: str) -> str:
+    """Normalise separators for easier parsing."""
+    return re.sub(r'[._]', ' ', text)
+
 def imdb_enrich_title(title: str, year: str):
-    if not title or not year or len(title) < 10:
+    if not title or not year or len(title) < 6:
         return title, year
     try:
         results = ia.search_movie(title)
@@ -670,132 +701,219 @@ def imdb_enrich_title(title: str, year: str):
         pass
     return title, year
 
-def extract_title_year(text: str):
-    text = re.sub(r'[._\-]', ' ', text)
-    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', text)
-    year = year_match.group(1) if year_match else ""
-    cut = year_match.start() if year_match else len(text)
-    title = text[:cut]
-    title = re.sub(
-        r'\b(480p|720p|1080p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|av1)\b',
-        '',
-        title,
+def extract_title_year(raw: str):
+    """
+    Extract clean movie/show title and year.
+    Works for:
+      • "Lara Croft: Tomb Raider (2001) 480p …"
+      • "Himmatwar (Poojai) 2014 Dual Audio …"
+      • "Sangamarmar S01 (Ep.01-09) (2026) …"
+      • "The Lost Flowers of Alice Hart S01 E02 WebRip …"
+    """
+    text = _clean_raw(raw)
+    # Find the first 4-digit year
+    year_m = re.search(r'\b((?:19|20)\d{2})\b', text)
+    year = year_m.group(1) if year_m else ""
+    cut = year_m.start() if year_m else len(text)
+    title_raw = text[:cut]
+    # Remove season/episode markers from end of title
+    title_raw = re.sub(
+        r'\s*\bS\d{1,3}\b.*$', '', title_raw,
         flags=re.I
     )
-    return title.strip().title(), year
+    title_raw = re.sub(
+        r'\s*\bEp?\.?\d{1,3}\b.*$', '', title_raw,
+        flags=re.I
+    )
+    # Remove quality/codec/source noise leftover
+    title_raw = re.sub(
+        r'\b(480p|720p|1080p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|av1|esub|hsub|sub|dual|multi|audio|hindi|english|tamil|telugu)\b',
+        '', title_raw, flags=re.I
+    )
+    # Remove parenthesised alt-title noise like "(Poojai)"
+    title_raw = re.sub(r'\([^)]{1,30}\)', '', title_raw)
+    # Strip trailing punctuation / junk
+    title_raw = re.sub(r'[\[\]()\-:,]+\s*$', '', title_raw.strip())
+    title = re.sub(r'\s{2,}', ' ', title_raw).strip().title()
+    return title, year
 
-def detect_media_type(text: str):
-    if re.search(r'\bS\d{1,2}E\d{1,2}\b', text, re.I):
+def detect_media_type(text: str) -> str:
+    if re.search(r'\bS\d{1,3}\s*(?:E\d|Ep)', text, re.I):
+        return "series"
+    if re.search(r'\bS\d{1,3}\b', text, re.I) and re.search(r'\bE\d{1,3}\b', text, re.I):
+        return "series"
+    if re.search(r'\bEp?\.?\s*\d+', text, re.I):
         return "series"
     if re.search(r'\banime\b', text, re.I):
         return "anime"
     return "movie"
 
 def extract_season_episode(text: str):
-    text = text.replace("–", "-").replace("to", "-")
+    """
+    Handles:
+      S01 (Ep.01-09)  →  S01, Ep.01-09
+      S01 E02         →  S01, E02
+      S01E07          →  S01, E07
+    Returns (season_str, episode_str) both as display strings.
+    """
+    text = re.sub(r'[._]', ' ', text)
     season = ""
-    s_match = re.search(r'\bS(?:eason)?\s*(\d+)\b', text, re.I)
-    if s_match:
-        s_num = int(s_match.group(1))
-        season = f"S{s_num:02d}"
-    ep_range = ""
-    r_match = re.search(
-        r'\b(?:E|EP|Episode|Episodes)?\s*(\d+)\s*-\s*(\d+)\b',
-        text,
-        re.I
-    )
-    if r_match:
-        start = int(r_match.group(1))
-        end = int(r_match.group(2))
-        ep_range = f"E{start:02d}-{end:02d}"
-        return season, ep_range
-    e_match = re.search(r'\bE(?:P)?\s*(\d+)\b', text, re.I)
-    if e_match:
-        e_num = int(e_match.group(1))
-        return season, f"E{e_num:02d}"
-    return season, ""
+    episode = ""
 
-def extract_audio_languages(text: str):
+    s_m = re.search(r'\bS(?:eason)?\s*0*(\d+)\b', text, re.I)
+    if s_m:
+        season = f"S{int(s_m.group(1)):02d}"
+
+    # Episode range like (Ep.01-09) or Ep.01-09
+    r_m = re.search(r'\bEp?\.?\s*0*(\d+)\s*[-–to]+\s*0*(\d+)\b', text, re.I)
+    if r_m:
+        episode = f"Ep.{int(r_m.group(1)):02d}-{int(r_m.group(2)):02d}"
+        return season, episode
+
+    # Single episode: E07 / EP07 / Ep.07
+    e_m = re.search(r'\bEp?\.?\s*0*(\d+)\b', text, re.I)
+    if e_m:
+        episode = f"E{int(e_m.group(1)):02d}"
+
+    return season, episode
+
+def extract_audio_languages(text: str) -> list:
+    """
+    Extracts languages from patterns like:
+      Dual Audio (Hindi + Tamil)
+      Hindi + English
+      [Hindi or English]
+      Hin Eng  (3-letter codes)
+    """
     found = []
-    block = re.search(r'(audio|dual audio|multi audio)[^a-z]*([a-z ,+/]+)', text, re.I)
-    src = block.group(2) if block else text
+    # Long names first
     for lang in LANG_LIST:
-        if re.search(rf'\b{lang}\b', src, re.I):
+        if re.search(rf'\b{re.escape(lang)}\b', text, re.I):
             found.append(lang)
+    # 3-letter codes (only if no long names found yet)
+    if not found:
+        for code, lang in LANG_CODE_MAP.items():
+            if re.search(rf'\b{code}\b', text, re.I) and lang not in found:
+                found.append(lang)
     return list(dict.fromkeys(found))
 
-def extract_subtitle_tag(text: str):
-    found = []
-    m = re.search(r'(subs?|subtitles?)[:\- ]+([a-z ,+/]+)', text, re.I)
-    if not m:
-        return ""
-    block = m.group(2)
-    for lang in LANG_LIST:
-        if re.search(rf'\b{lang}\b', block, re.I):
-            found.append(lang)
-    if not found:
-        return ""
-    if found == ["English"]:
+def extract_subtitle_tag(text: str) -> str:
+    """
+    Returns ESub / HSub / MSub / Sub based on filename/caption tags.
+    Priority: ESub > HSub > Sub
+    """
+    if ESUB_RE.search(text):
         return "ESub"
-    if found == ["Hindi"]:
+    if HSUB_RE.search(text):
         return "HSub"
-    return "Sub"
+    if SUB_RE.search(text):
+        return "MSub"
+    return ""
 
-def extract_quality(text: str):
+def extract_quality(text: str) -> str:
     for q in QUALITY_LIST:
-        if re.search(rf'\b{q}\b', text, re.I):
+        if re.search(rf'\b{re.escape(q)}\b', text, re.I):
             return q
     return ""
 
-def extract_source(text: str):
+def extract_source(text: str) -> str:
     for s in SOURCE_LIST:
-        if re.search(rf'\b{s}\b', text, re.I):
+        if re.search(rf'\b{re.escape(s)}\b', text, re.I):
             return s
     return ""
-    
-def extract_video_codec(text: str):
+
+def extract_video_codec(text: str) -> str:
     for c in VIDEO_CODEC_LIST:
-        if re.search(rf'\b{c}\b', text, re.I):
+        if re.search(rf'\b{re.escape(c)}\b', text, re.I):
             return c
     return ""
 
-def extract_audio_codec(text: str):
-    for c in AUDIO_CODEC_LIST:
-        if re.search(rf'\b{c}\b', text, re.I):
-            return c
+def extract_audio_codec(text: str) -> str:
+    """Extracts audio codec, including patterns like DD5.1-224Kbps."""
+    # Full patterns with bitrate first
+    m = re.search(r'\b(DD5\.1|DD\+|DDP5\.1|DDP|DTS-HD|DTS|Atmos|AAC|AC3|MP3)(?:[- ]\d+Kbps)?\b', text, re.I)
+    if m:
+        return m.group(1).upper()
     return ""
 
-def extract_extension(text: str):
+def extract_extension(text: str) -> str:
+    m = re.search(r'\.(mkv|mp4|avi|webm|mov)\b', text, re.I)
+    if m:
+        return m.group(1).lower()
+    # Fallback: bare word
     for e in EXT_LIST:
-        if re.search(rf'\.{e}\b|\b{e}\b', text, re.I):
-            return e.upper()
+        if re.search(rf'\b{e}\b', text, re.I):
+            return e.lower()
     return ""
 
-def build_smart_filename(filename: str, caption: str):
+def extract_resolution(text: str) -> str:
+    """Same as quality but returns the value for {resolution} placeholder."""
+    return extract_quality(text)
+
+def parse_file_info(filename: str, caption: str) -> dict:
+    """
+    Parse ALL metadata from filename + caption combined.
+    Returns a dict with all individual fields for placeholders.
+    """
     raw = f"{filename} {caption}"
     title, year = extract_title_year(raw)
     title, year = imdb_enrich_title(title, year)
-    media_type = detect_media_type(raw)
     season, episode = extract_season_episode(raw)
     audio_langs = extract_audio_languages(raw)
-    subs = extract_subtitle_tag(raw)
+    subtitle = extract_subtitle_tag(raw)
     quality = extract_quality(raw)
     source = extract_source(raw)
     vcodec = extract_video_codec(raw)
     acodec = extract_audio_codec(raw)
     ext = extract_extension(raw)
-    parts = [title]
-    if season or episode:
-        parts.append(f"{season}{episode}".strip())
-    if year:
-        parts.append(year)
-    if audio_langs:
-        parts.append("+".join(audio_langs))
-    if subs:
-        parts.append(subs)
-    for p in [quality, source, vcodec, acodec, ext]:
-        if p:
-            parts.append(p)
+
+    return {
+        "title": title,
+        "year": year,
+        "season": season,
+        "episode": episode,
+        "audio": " + ".join(audio_langs) if audio_langs else "",
+        "subtitle": subtitle,
+        "quality": quality,
+        "resolution": quality,   # alias
+        "source": source,
+        "vcodec": vcodec,
+        "acodec": acodec,
+        "extension": ext,
+    }
+
+def build_smart_filename(filename: str, caption: str) -> str:
+    """
+    Build a clean, well-structured display name from filename + caption.
+    Format: Title [Season Episode] (Year) Audio Subtitle Quality Source Codec.ext
+    Examples:
+      Lara Croft Tomb Raider (2001) Hindi+English ESub 480p BluRay x264
+      Sangamarmar S01 Ep.01-09 (2026) Hindi ESub 1080p HEVC
+      The Lost Flowers Of Alice Hart S01 E02 Hindi+English ESub 480p WEBRip
+    """
+    info = parse_file_info(filename, caption)
+    parts = []
+    if info["title"]:
+        parts.append(info["title"])
+    if info["season"] or info["episode"]:
+        se = f"{info['season']} {info['episode']}".strip()
+        parts.append(se)
+    if info["year"]:
+        parts.append(f"({info['year']})")
+    if info["audio"]:
+        parts.append(info["audio"])
+    if info["subtitle"]:
+        parts.append(info["subtitle"])
+    if info["quality"]:
+        parts.append(info["quality"])
+    if info["source"]:
+        parts.append(info["source"])
+    if info["vcodec"]:
+        parts.append(info["vcodec"])
+    if info["acodec"]:
+        parts.append(info["acodec"])
+    if info["extension"]:
+        parts.append(info["extension"])
     return " ".join(parts).strip()
 
 
@@ -991,8 +1109,6 @@ async def capture_user_input(client, message):
         channel_id = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
         await updateCap(channel_id, text)
-        if channel_id in CHANNEL_CACHE:
-            CHANNEL_CACHE[channel_id]["caption"] = text
         await client.delete_messages(user_id, message.id)
         await client.edit_message_text(
             chat_id=user_id,
@@ -1050,8 +1166,6 @@ async def capture_user_input(client, message):
         old_suffix, old_prefix = await get_suffix_prefix(channel_id)
         final_text = f"{old_prefix.rstrip()}\n{text.strip()}" if old_prefix else text.strip()
         await set_prefix(channel_id, final_text)
-        if channel_id in CHANNEL_CACHE:
-            CHANNEL_CACHE[channel_id]["prefix"] = final_text
         await client.delete_messages(user_id, message.id)
         await client.edit_message_text(
             chat_id=user_id,
@@ -1068,8 +1182,6 @@ async def capture_user_input(client, message):
         old_suffix, _ = await get_suffix_prefix(channel_id)
         final_text = f"{old_suffix.rstrip()}\n{text.strip()}" if old_suffix else text.strip()
         await set_suffix(channel_id, final_text)
-        if channel_id in CHANNEL_CACHE:
-            CHANNEL_CACHE[channel_id]["suffix"] = final_text
         await client.delete_messages(user_id, message.id)
         await client.edit_message_text(
             chat_id=user_id,
@@ -1103,8 +1215,6 @@ async def capture_user_input(client, message):
         if not rows:
             return await message.reply_text("❌ Invalid format. Try again.")
         await set_url_buttons(channel_id, rows)
-        if channel_id in CHANNEL_CACHE:
-            CHANNEL_CACHE[channel_id]["url_buttons"] = rows
         await client.delete_messages(user_id, message.id)
         await client.edit_message_text(
             chat_id=user_id,
