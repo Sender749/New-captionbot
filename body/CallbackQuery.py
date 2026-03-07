@@ -14,18 +14,23 @@ FONT_TXT = script.FONT_TXT
 async def channel_settings(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    try:
-        chat = await client.get_chat(channel_id)
-        chat_title = getattr(chat, "title", str(channel_id))
-    except Exception:
-        chat_title = str(channel_id)
     cap_doc = await get_channel_cached(channel_id)
+    # Get title from cache first (fast), fall back to get_chat only if missing
+    chat_title = cap_doc.get("_title")
+    if not chat_title:
+        try:
+            chat = await client.get_chat(channel_id)
+            chat_title = getattr(chat, "title", str(channel_id))
+            # Persist title so all future calls skip get_chat()
+            await set_channel_title_cache(channel_id, chat_title)
+        except Exception:
+            chat_title = str(channel_id)
     caption = cap_doc.get("caption", "")
     prefix = cap_doc.get("prefix", "")
     suffix = cap_doc.get("suffix", "")
-    link_status = await get_link_remover_status(channel_id)
+    link_status = bool(cap_doc.get("link_remover", False))
     link_text = "Link & Usernames Remover (ON)" if link_status else "Link & Usernames Remover (OFF)"
-    emoji_status = await get_emoji_remover_status(channel_id)
+    emoji_status = bool(cap_doc.get("emoji_remover", False))
     emoji_text = "Emoji Remover (ON)" if emoji_status else "Emoji Remover (OFF)"
     if not caption:
         caption_preview = "❌ No caption set for this channel."
@@ -68,11 +73,9 @@ async def channel_settings(client, query):
 async def set_caption_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
-
-    caption_data = await get_channel_caption(channel_id)
-    current_caption = caption_data.get("caption") if caption_data else None
+    cap_doc = await get_channel_cached(channel_id)
+    chat_title = cap_doc.get("_title", str(channel_id))
+    current_caption = cap_doc.get("caption")
     caption_display = f"📝 **Current Caption:**\n{current_caption}" if current_caption else "📝 **Current Caption:** None set yet."
 
     buttons = [
@@ -100,29 +103,52 @@ async def set_caption_message(client, query):
 
     instr = await query.message.edit_text(
         text=(
-            "📌 Send caption for this channel\n\n"
-
-            "🔹 Placeholders:\n"
-            "<b>File name</b> ⇛ <code>{file_name}</code> \n"
-            "<b>Smart file name</b> ⇛ <code>{smart_file_name}</code> \n"
-            "<b>File size</b> ⇛ <code>{file_size}</code>  \n"
-            "<b>Original caption</b> ⇛ <code>{default_caption}</code>  \n"
-            "<b>Language</b> ⇛ <code>{language}</code>  \n"
-            "<b>Year</b> ⇛ <code>{year}</code> \n\n"
- 
-            "🔹 Text Styles:\n"
-            "<b>Bold</b> ⇛ <code>&lt;b&gt;Text&lt;/b&gt;</code> \n "
-            "<b>Italic</b> ⇛ <code>&lt;i&gt;Text&lt;/i&gt;</code> \n "
-            "<b>Underline</b> ⇛ <code>&lt;u&gt;Text&lt;/u&gt;</code> \n"
-            "<b>Strike</b> ⇛ <code>&lt;s&gt;Text&lt;/s&gt;</code> \n"
-            "<b>Mono</b> ⇛ <code>&lt;code&gt;Text&lt;/code&gt;</code> \n"
-            "<b>Spoiler</b> ⇛ <code>&lt;spoiler&gt;Text&lt;/spoiler&gt;</code> \n"
-            "<b>Preformatted</b> ⇛ <code>&lt;pre&gt;Text&lt;/pre&gt;</code> \n"
-            "<b>Block Quote</b> ⇛ <code>&lt;blockquote&gt;Text&lt;/blockquote&gt;</code> \n"
-            "<b>Link</b> ⇛  <code>&lt;a href=\"url\"&gt;Text&lt;/a&gt;</code> \n\n"
-            "✍️ Example:\n"
-            "<code>&lt;b&gt;{file_name}&lt;/b&gt;</code>\n <code>&lt;i&gt;{file_size}&lt;/i&gt;</code>"
-         ),
+            "📌 <b>Send caption for this channel</b>\n\n"
+            "<blockquote expandable>"
+            "📦 <b>Placeholders</b>\n\n"
+            "<b>🗂 File Info</b>\n"
+            "File name ⇛ <code>{file_name}</code>\n"
+            "File size ⇛ <code>{file_size}</code>\n"
+            "Extension ⇛ <code>{extension}</code>\n"
+            "Duration ⇛ <code>{duration}</code>\n"
+            "Original caption ⇛ <code>{default_caption}</code>\n"
+            "Empty line ⇛ <code>{empty}</code>\n\n"
+            "<b>🎬 Smart File Name</b>\n"
+            "Full smart name ⇛ <code>{smart_file_name}</code>\n"
+            "  ↳ Auto-builds clean caption from filename\n"
+            "  ↳ Detects title, year, season, episode,\n"
+            "     audio, subtitle, quality, codec, ext\n\n"
+            "<b>🏷 Individual Smart Fields</b>\n"
+            "Title ⇛ <code>{title}</code>\n"
+            "Year ⇛ <code>{year}</code>\n"
+            "Season ⇛ <code>{season}</code>\n"
+            "Episode ⇛ <code>{episode}</code>\n"
+            "Audio / Language ⇛ <code>{audio}</code>\n"
+            "Language (alt) ⇛ <code>{language}</code>\n"
+            "Subtitle tag ⇛ <code>{subtitle}</code>\n"
+            "Quality ⇛ <code>{quality}</code>\n"
+            "Resolution ⇛ <code>{resolution}</code>\n"
+            "Video codec ⇛ <code>{vcodec}</code>\n"
+            "Audio codec ⇛ <code>{acodec}</code>\n"
+            "Source ⇛ <code>{source}</code>"
+            "</blockquote>\n\n"
+            "<blockquote expandable>"
+            "🖋 <b>Text Styles</b>\n\n"
+            "Bold ⇛ <code>&lt;b&gt;Text&lt;/b&gt;</code>\n"
+            "Italic ⇛ <code>&lt;i&gt;Text&lt;/i&gt;</code>\n"
+            "Underline ⇛ <code>&lt;u&gt;Text&lt;/u&gt;</code>\n"
+            "Strike ⇛ <code>&lt;s&gt;Text&lt;/s&gt;</code>\n"
+            "Mono ⇛ <code>&lt;code&gt;Text&lt;/code&gt;</code>\n"
+            "Spoiler ⇛ <code>&lt;spoiler&gt;Text&lt;/spoiler&gt;</code>\n"
+            "Pre ⇛ <code>&lt;pre&gt;Text&lt;/pre&gt;</code>\n"
+            "Block Quote ⇛ <code>&lt;blockquote&gt;Text&lt;/blockquote&gt;</code>\n"
+            "Link ⇛ <code>&lt;a href=\"url\"&gt;Text&lt;/a&gt;</code>"
+            "</blockquote>\n\n"
+            "✍️ <b>Example:</b>\n"
+            "<code>&lt;b&gt;{title}&lt;/b&gt; {season}{episode} ({year})\n"
+            "{audio} | {quality} | {subtitle}\n"
+            "💾 {file_size}</code>"
+        ),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup(
@@ -152,8 +178,8 @@ async def delete_caption(client, query):
 async def caption_font(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    current_cap = await get_channel_caption(channel_id)
-    cap_txt = current_cap.get("caption") if current_cap else "No custom caption set."
+    cap_doc = await get_channel_cached(channel_id)
+    cap_txt = cap_doc.get("caption") or "No custom caption set."
     disable_web_page_preview=True
     buttons = [[InlineKeyboardButton("↩ Back", callback_data=f"setcap_{channel_id}")]]
     text = f"📝 Current Caption: {cap_txt}\n\n🖋️ Available Fonts:\n\n{FONT_TXT}"
@@ -165,10 +191,9 @@ async def caption_font(client, query):
 async def set_words_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
-
-    blocked_words = await get_block_words(channel_id)
+    cap_doc = await get_channel_cached(channel_id)
+    chat_title = cap_doc.get("_title", str(channel_id))
+    blocked_words = cap_doc.get("block_words", "")
     if blocked_words:
         words_text = "\n".join(
             f"• {w.strip()}"
@@ -177,7 +202,6 @@ async def set_words_menu(client, query):
         )
     else:
         words_text = "None set yet."
-
 
     text = (
         f"📛 **Channel:** {chat_title}\n\n"
@@ -228,8 +252,8 @@ async def delete_blocked_words(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
     await delete_block_words(channel_id)
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    cap_doc = await get_channel_cached(channel_id)
+    chat_title = cap_doc.get("_title", str(channel_id))
     buttons = [[InlineKeyboardButton("↩ Back", callback_data=f"setwords_{channel_id}")]]
     await query.message.edit_text(
         f"✅ **All blocked words deleted successfully.**\n\n📛 **Channel:** {chat_title}",
@@ -241,9 +265,10 @@ async def delete_blocked_words(client, query):
 async def suffix_prefix_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
-    suffix, prefix = await get_suffix_prefix(channel_id)
+    cap_doc = await get_channel_cached(channel_id)
+    chat_title = cap_doc.get("_title", str(channel_id))
+    suffix = cap_doc.get("suffix", "")
+    prefix = cap_doc.get("prefix", "")
 
     buttons = [
         [InlineKeyboardButton("Set Suffix", callback_data=f"set_suf_{channel_id}"),
@@ -313,9 +338,9 @@ async def delete_prefix_cb(client, query):
 async def set_replace_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
-    replace_raw = await get_replace_words(channel_id)
+    cap_doc = await get_channel_cached(channel_id)
+    chat_title = cap_doc.get("_title", str(channel_id))
+    replace_raw = cap_doc.get("replace_words", "")
     if replace_raw:
         replace_text = "\n".join(
             line.strip()
@@ -371,8 +396,8 @@ async def delete_replace_words(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
     await delete_replace_words_db(channel_id)
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
+    cap_doc = await get_channel_cached(channel_id)
+    chat_title = cap_doc.get("_title", str(channel_id))
     buttons = [[InlineKeyboardButton("↩ Back", callback_data=f"setreplace_{channel_id}")]]
     await query.message.edit_text(
         f"✅ **All replace words deleted successfully.**\n\n📛 **Channel:** {chat_title}",
@@ -384,12 +409,12 @@ async def delete_replace_words(client, query):
 async def url_button_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    chat = await client.get_chat(channel_id)
-    chat_title = getattr(chat, "title", str(channel_id))
-    buttons = await get_url_buttons(channel_id)
-    if buttons:
+    cap_doc = await get_channel_cached(channel_id)
+    chat_title = cap_doc.get("_title", str(channel_id))
+    url_btns = cap_doc.get("url_buttons", [])
+    if url_btns:
         lines = []
-        for row in buttons:
+        for row in url_btns:
             row_txt = " | ".join(f"[{b['text']}]({b['url']})" for b in row)
             lines.append(f"• {row_txt}")
         preview = "\n".join(lines)
@@ -459,6 +484,7 @@ async def delete_url_buttons_cb(client, query):
 # ======================== Link Remover ==================================
 @Client.on_callback_query(filters.regex(r'^togglelink_(-?\d+)$'))
 async def toggle_link_remover(client, query):
+    await query.answer()
     channel_id = int(query.matches[0].group(1))
     current_status = await get_link_remover_status(channel_id)
     new_status = not current_status
@@ -468,6 +494,7 @@ async def toggle_link_remover(client, query):
 # ======================== Emoji Remover ==================================
 @Client.on_callback_query(filters.regex(r'^toggleemoji_(-?\d+)$'))
 async def toggle_emoji_remover(client, query):
+    await query.answer()
     channel_id = int(query.matches[0].group(1))
     current = await get_emoji_remover_status(channel_id)
     await set_emoji_remover_status(channel_id, not current)
