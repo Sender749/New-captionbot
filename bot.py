@@ -6,10 +6,11 @@ from pyrogram import Client, errors
 from pyrogram.errors import FloodWait
 from info import *
 from body.database import *
+from body.Caption import *
+from body.file_forward import *
+EXECUTORS = 20
 
-EXECUTORS   = 30
 PLUGIN_ROOT = "body"
-
 
 class Bot(Client):
     def __init__(self):
@@ -32,8 +33,8 @@ class Bot(Client):
             await super().start()
         await self._run_plugin_startup_hooks()
         await ensure_queue_indexes()
+        await ensure_forward_indexes()
         await recover_stuck_jobs()
-        from body.Caption import caption_worker
         for _ in range(EXECUTORS):
             asyncio.create_task(caption_worker(self))
         me = await self.get_me()
@@ -44,9 +45,13 @@ class Bot(Client):
             except Exception:
                 print("⚠️ Bot must be admin in force-sub channel")
                 self.force_channel = None
-        print(f"{me.first_name} started ✨")
+        print("========== DUMP CHANNEL DEBUG ==========")
+        print(f"FF_CH = {FF_CH} | type = {type(FF_CH)}")
+        print(f"CP_CH = {CP_CH} | type = {type(CP_CH)}")
+        print("========================================")
+        print(f"{me.first_name} is started ✨")
         try:
-            await self.send_message(ADMIN, f"<b>{me.first_name} started ✨</b>")
+            await self.send_message(ADMIN, f"**{me.first_name} started ✨**")
         except:
             pass
 
@@ -58,6 +63,5 @@ class Bot(Client):
             if callable(hook):
                 print(f"🔌 Running startup hook: {module_name}.on_bot_start()")
                 hook(self)
-
 
 Bot().run()
