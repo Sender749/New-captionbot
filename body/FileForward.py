@@ -1,7 +1,6 @@
 """
 FileForward.py — File Forwarding System for CaptionBot
-Works for ALL users (not just admins).
-Skip/range input is routed via _ff_sessions which Caption.py checks.
+Works for ALL users. Skip/range input is routed via _ff_sessions.
 """
 
 import re
@@ -17,13 +16,14 @@ from pyrogram.types import (
     CallbackQuery,
     Message,
 )
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, ChatAdminRequired, RPCError
 
 from body.database import (
     db,
     get_user_channels,
     get_cached_chat_title,
     set_cached_chat_title,
+    users,
 )
 from body.Caption import (
     _is_admin_member,
@@ -33,17 +33,25 @@ from body.Caption import (
     clean_text,
 )
 
-logger = logging.getLogger(__name__)
+# ── Logging — visible in Koyeb/stdout ────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("FileForward")
 
 MSG_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/(\d+)|([A-Za-z0-9_]+))/(\d+)")
 PROGRESS_UPDATE_EVERY = 15
 
 _active_tasks: dict = {}
 _cancel_flags: dict = {}
-_ff_sessions: dict = {}   # shared with Caption.py's capture_user_input
+_ff_sessions: dict = {}   # shared — Caption.py's capture_user_input checks this
 
 _FF_COL = None
 
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
 async def _get_ff_col():
     global _FF_COL
@@ -71,6 +79,8 @@ async def _update_ff_progress(task_id, forwarded: int, current_id: int):
                          {"$set": {"forwarded": forwarded, "current_id": current_id}})
 
 
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
 def _parse_msg_ref(text: str) -> Optional[int]:
     text = text.strip()
     m = MSG_LINK_RE.search(text)
@@ -82,37 +92,63 @@ def _parse_msg_ref(text: str) -> Optional[int]:
 
 
 async def _get_bot_admin_channels(client: Client, user_id: int) -> list:
-    """Return channels where bot is admin — uses asyncio.gather for speed."""
-    from pyrogram.errors import ChatAdminRequired, RPCError
+    """
+    Return list of {id, title} dicts for channels where:
+      - the user has registered the channel (via /settings)
+      - the bot is currently an admin
+
+    Uses asyncio.gather for parallel checks (fast even with many channels).
+    Mirrors the logic of Caption.py's user_settings() which is known to work.
+    """
+    logger.info(f"[FF] _get_bot_admin_channels called for user_id={user_id}")
     raw = await get_user_channels(user_id)
+    logger.info(f"[FF] get_user_channels returned {len(raw)} raw channel(s): {raw}")
+
     if not raw:
+        logger.info(f"[FF] No channels in DB for user {user_id}")
         return []
 
     async def _check(ch):
         ch_id    = ch.get("channel_id")
         ch_title = ch.get("channel_title", str(ch_id))
-        cached   = get_cached_chat_title(ch_id)
+
+        cached = get_cached_chat_title(ch_id)
         if cached:
             ch_title = cached
+
         try:
             member = await client.get_chat_member(ch_id, "me")
-            if _is_admin_member(member):
-                if not cached:
-                    try:
-                        chat = await client.get_chat(ch_id)
-                        ch_title = getattr(chat, "title", ch_title) or ch_title
-                        set_cached_chat_title(ch_id, ch_title)
-                    except Exception:
-                        pass
-                return {"id": ch_id, "title": ch_title}
-        except (ChatAdminRequired, RPCError):
-            pass
-        except Exception:
-            pass
-        return None
+            logger.info(f"[FF] ch={ch_id} member_status={getattr(member, 'status', '?')}")
+        except (ChatAdminRequired, RPCError) as e:
+            logger.warning(f"[FF] ch={ch_id} get_chat_member RPC error: {e} — removing from user")
+            await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": ch_id}}})
+            return None
+        except Exception as e:
+            # Don't remove — might be a transient error; still include the channel
+            logger.warning(f"[FF] ch={ch_id} get_chat_member unexpected error: {e} — keeping channel")
+            return {"id": ch_id, "title": ch_title}
+
+        if not _is_admin_member(member):
+            logger.info(f"[FF] ch={ch_id} bot is NOT admin — skipping")
+            await users.update_one({"_id": user_id}, {"$pull": {"channels": {"channel_id": ch_id}}})
+            return None
+
+        # Bot is admin — refresh title if not cached
+        if not cached:
+            try:
+                chat = await client.get_chat(ch_id)
+                ch_title = getattr(chat, "title", ch_title) or ch_title
+                set_cached_chat_title(ch_id, ch_title)
+            except Exception as e:
+                logger.warning(f"[FF] ch={ch_id} get_chat error: {e}")
+
+        logger.info(f"[FF] ch={ch_id} '{ch_title}' — bot is admin ✓")
+        return {"id": ch_id, "title": ch_title}
 
     results = await asyncio.gather(*[_check(ch) for ch in raw])
-    return [r for r in results if r is not None]
+    valid = [r for r in results if r is not None]
+    logger.info(f"[FF] _get_bot_admin_channels returning {len(valid)} valid channel(s)")
+    return valid
 
 
 def _channel_keyboard(channels: list, cb_prefix: str, cancel_cb: str) -> InlineKeyboardMarkup:
@@ -155,18 +191,24 @@ def _progress_text(forwarded: int, total: int, skipped: int = 0, eta_s: float = 
 def _get_ff_ch():
     try:
         from info import FF_CH
-        return int(FF_CH) if FF_CH else None
-    except Exception:
+        val = int(FF_CH) if FF_CH else None
+        logger.debug(f"[FF] FF_CH={val}")
+        return val
+    except Exception as e:
+        logger.warning(f"[FF] FF_CH read error: {e}")
         return None
 
 
-# ── /file_forward command (ALL users) ────────────────────────────────────────
+# ── /file_forward command ─────────────────────────────────────────────────────
 
 @Client.on_message(filters.command("file_forward") & filters.private, group=-1)
 async def cmd_file_forward(client: Client, message: Message):
     user_id = message.from_user.id
+    logger.info(f"[FF] /file_forward from user_id={user_id}")
+
     task = _active_tasks.get(user_id)
     if task and not task.done():
+        logger.info(f"[FF] user {user_id} already has a running task")
         return await message.reply_text(
             "⚠️ <b>You already have a forwarding task running.</b>\n"
             "Press <b>🛑 Cancel</b> on the progress message to stop it first.",
@@ -174,13 +216,23 @@ async def cmd_file_forward(client: Client, message: Message):
         )
 
     loading = await message.reply_text("⏳ Loading your channels…")
-    channels = await _get_bot_admin_channels(client, user_id)
+
+    try:
+        channels = await _get_bot_admin_channels(client, user_id)
+    except Exception as e:
+        logger.error(f"[FF] _get_bot_admin_channels crashed: {e}", exc_info=True)
+        return await loading.edit_text(
+            f"❌ <b>Error loading channels:</b> <code>{e}</code>",
+            parse_mode="html"
+        )
+
+    logger.info(f"[FF] Got {len(channels)} channel(s) for user {user_id}: {channels}")
 
     if not channels:
         return await loading.edit_text(
             "❌ <b>No channels found.</b>\n\n"
             "Make sure the bot is added as admin to your channels "
-            "and you've registered them via /settings.",
+            "and they appear in /settings.",
             parse_mode="html"
         )
 
@@ -191,6 +243,7 @@ async def cmd_file_forward(client: Client, message: Message):
         reply_markup=markup,
         parse_mode="html"
     )
+    logger.info(f"[FF] Source channel list shown to user {user_id}")
 
 
 # ── Source selected ───────────────────────────────────────────────────────────
@@ -198,30 +251,41 @@ async def cmd_file_forward(client: Client, message: Message):
 @Client.on_callback_query(filters.regex(r"^ff_src_-?\d+$"), group=-1)
 async def cb_ff_source(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
-    src_id = int(query.data[7:])   # strip "ff_src_" prefix
+    src_id  = int(query.data[7:])   # strip "ff_src_"
+    logger.info(f"[FF] Source selected: ch={src_id} by user={user_id}")
 
     try:
         member = await client.get_chat_member(src_id, "me")
         if not _is_admin_member(member):
+            logger.warning(f"[FF] Bot not admin in src ch={src_id}")
             return await query.answer("Bot is no longer admin there!", show_alert=True)
-    except Exception:
-        return await query.answer("Cannot verify channel access!", show_alert=True)
+    except Exception as e:
+        logger.error(f"[FF] get_chat_member src={src_id}: {e}")
+        return await query.answer(f"Cannot verify channel: {e}", show_alert=True)
 
     try:
-        src_chat = await client.get_chat(src_id)
+        src_chat  = await client.get_chat(src_id)
         src_title = src_chat.title or str(src_id)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[FF] get_chat src={src_id}: {e}")
         src_title = str(src_id)
 
     _ff_sessions[user_id] = {"src_id": src_id, "src_title": src_title, "step": "dst"}
 
-    channels = await _get_bot_admin_channels(client, user_id)
+    try:
+        channels = await _get_bot_admin_channels(client, user_id)
+    except Exception as e:
+        logger.error(f"[FF] _get_bot_admin_channels (dst list) crashed: {e}", exc_info=True)
+        return await query.message.edit_text(f"❌ Error loading channels: <code>{e}</code>", parse_mode="html")
+
     channels = [c for c in channels if c["id"] != src_id]
 
     if not channels:
         _ff_sessions.pop(user_id, None)
+        logger.info(f"[FF] No destination channels available for user {user_id}")
         return await query.message.edit_text(
-            "❌ No other admin channels available as destination.",
+            "❌ No other admin channels available as destination.\n"
+            "Add the bot as admin to at least one more channel.",
             parse_mode="html"
         )
 
@@ -234,6 +298,7 @@ async def cb_ff_source(client: Client, query: CallbackQuery):
         parse_mode="html"
     )
     await query.answer()
+    logger.info(f"[FF] Destination channel list shown to user {user_id}")
 
 
 # ── Destination selected ──────────────────────────────────────────────────────
@@ -241,29 +306,31 @@ async def cb_ff_source(client: Client, query: CallbackQuery):
 @Client.on_callback_query(filters.regex(r"^ff_dst_-?\d+$"), group=-1)
 async def cb_ff_dest(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
-    dst_id = int(query.data[7:])   # strip "ff_dst_" prefix
+    dst_id  = int(query.data[7:])   # strip "ff_dst_"
+    logger.info(f"[FF] Destination selected: ch={dst_id} by user={user_id}")
 
     session = _ff_sessions.get(user_id)
     if not session or session.get("step") != "dst":
-        return await query.message.edit_text(
-            "❌ Session expired. Please run /file_forward again."
-        )
+        logger.warning(f"[FF] No active dst session for user {user_id}")
+        return await query.message.edit_text("❌ Session expired. Please run /file_forward again.")
 
     try:
-        dst_chat = await client.get_chat(dst_id)
+        dst_chat  = await client.get_chat(dst_id)
         dst_title = dst_chat.title or str(dst_id)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[FF] get_chat dst={dst_id}: {e}")
         dst_title = str(dst_id)
 
-    session["dst_id"] = dst_id
+    session["dst_id"]    = dst_id
     session["dst_title"] = dst_title
-    session["step"] = "skip"
+    session["step"]      = "skip"
+    logger.info(f"[FF] Session for user {user_id}: src={session['src_id']} dst={dst_id}, awaiting skip input")
 
     await query.message.edit_text(
         f"<b>⏭ Step 3 — Enter Range / Skip Number</b>\n\n"
         f"Source : <b>{session['src_title']}</b>\n"
         f"Dest   : <b>{dst_title}</b>\n\n"
-        f"<b>Now send one of these in this chat:</b>\n\n"
+        f"<b>Now type one of these in this chat:</b>\n\n"
         f"• <code>0</code> — Forward <b>all</b> files\n"
         f"• <code>12345</code> or a message link — Start from that message to end\n"
         f"• <code>100 - 500</code> or two links — Forward that exact range\n\n"
@@ -280,7 +347,9 @@ async def cb_ff_dest(client: Client, query: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^ff_cancel_main$"), group=-1)
 async def cb_ff_cancel_main(client: Client, query: CallbackQuery):
-    _ff_sessions.pop(query.from_user.id, None)
+    user_id = query.from_user.id
+    _ff_sessions.pop(user_id, None)
+    logger.info(f"[FF] Session cancelled by user {user_id}")
     await query.message.edit_text("❌ File forwarding cancelled.")
     await query.answer("Cancelled")
 
@@ -291,15 +360,16 @@ async def cb_ff_cancel_task(client: Client, query: CallbackQuery):
     if uid != query.from_user.id:
         return await query.answer("This is not your task!", show_alert=True)
     _cancel_flags[uid] = True
+    logger.info(f"[FF] Cancel flag set for user {uid}")
     await query.answer("⏹ Cancellation sent…")
 
 
-# ── Skip input handler — called from Caption.py capture_user_input ────────────
+# ── Skip input — called from Caption.py's capture_user_input ─────────────────
 
 async def handle_ff_skip_input(client: Client, message: Message) -> bool:
     """
     Returns True if this message was consumed as a forwarding skip/range input.
-    Caption.py's capture_user_input calls this FIRST before checking its own sessions.
+    Caption.py's capture_user_input calls this FIRST.
     """
     user_id = message.from_user.id
     session = _ff_sessions.get(user_id)
@@ -310,7 +380,8 @@ async def handle_ff_skip_input(client: Client, message: Message) -> bool:
     if not text:
         return False
 
-    _ff_sessions.pop(user_id, None)  # consume immediately
+    logger.info(f"[FF] Skip input from user {user_id}: '{text}'")
+    _ff_sessions.pop(user_id, None)   # consume immediately
 
     src_id    = session["src_id"]
     src_title = session["src_title"]
@@ -328,7 +399,9 @@ async def handle_ff_skip_input(client: Client, message: Message) -> bool:
         e = _parse_msg_ref(parts[1])
         if s and e:
             start_id, end_id = min(s, e), max(s, e)
+            logger.info(f"[FF] Range parsed: {start_id}–{end_id}")
         else:
+            logger.warning(f"[FF] Could not parse range from: {text}")
             try:
                 await message.delete()
             except Exception:
@@ -341,11 +414,14 @@ async def handle_ff_skip_input(client: Client, message: Message) -> bool:
             return True
     elif text == "0":
         start_id = 1
+        logger.info("[FF] Forward all: start_id=1")
     else:
         mid = _parse_msg_ref(text)
         if mid:
             start_id = mid
+            logger.info(f"[FF] Start from msg_id={mid}")
         else:
+            logger.warning(f"[FF] Invalid skip input: '{text}'")
             try:
                 await message.delete()
             except Exception:
@@ -362,7 +438,9 @@ async def handle_ff_skip_input(client: Client, message: Message) -> bool:
         try:
             async for last in client.get_chat_history(src_id, limit=1):
                 end_id = last.id
-        except Exception:
+            logger.info(f"[FF] Resolved end_id={end_id} from channel history")
+        except Exception as e:
+            logger.error(f"[FF] get_chat_history src={src_id}: {e}")
             end_id = start_id
 
     if start_id > end_id:
@@ -382,6 +460,7 @@ async def handle_ff_skip_input(client: Client, message: Message) -> bool:
         pass
 
     total = end_id - start_id + 1
+    logger.info(f"[FF] Task: src={src_id} dst={dst_id} range={start_id}-{end_id} total={total}")
 
     col = await _get_ff_col()
     task_doc = {
@@ -398,8 +477,9 @@ async def handle_ff_skip_input(client: Client, message: Message) -> bool:
         "status":     "pending",
         "ts":         time.time(),
     }
-    result = await col.insert_one(task_doc)
+    result  = await col.insert_one(task_doc)
     task_doc["_id"] = result.inserted_id
+    logger.info(f"[FF] Task inserted to DB: _id={result.inserted_id}")
 
     cancel_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🛑 Cancel", callback_data=f"ff_cancel_task_{user_id}")]
@@ -413,6 +493,7 @@ async def handle_ff_skip_input(client: Client, message: Message) -> bool:
     _cancel_flags[user_id] = False
     t = asyncio.create_task(_run_forwarding(client, task_doc["_id"], task_doc, progress_msg))
     _active_tasks[user_id] = t
+    logger.info(f"[FF] Forwarding task started for user {user_id}")
     return True
 
 
@@ -426,6 +507,7 @@ async def _run_forwarding(client: Client, task_id, task: dict, progress_msg: Mes
     end_id    = task["end_id"]
     total     = task["total"]
 
+    logger.info(f"[FF] _run_forwarding started: user={user_id} src={src_id} dst={dst_id} {start_id}-{end_id}")
     await _mark_ff_running(task_id)
 
     forwarded  = task.get("forwarded", 0)
@@ -443,6 +525,7 @@ async def _run_forwarding(client: Client, task_id, task: dict, progress_msg: Mes
     try:
         while current_id <= end_id:
             if _cancel_flags.get(user_id):
+                logger.info(f"[FF] Cancelled by user {user_id} at msg_id={current_id}")
                 await _mark_ff_done(task_id)
                 await _safe_edit(
                     progress_msg,
@@ -455,15 +538,16 @@ async def _run_forwarding(client: Client, task_id, task: dict, progress_msg: Mes
                 return
 
             batch_end = min(current_id + BATCH - 1, end_id)
-            msg_ids = list(range(current_id, batch_end + 1))
+            msg_ids   = list(range(current_id, batch_end + 1))
 
             try:
                 msgs = await client.get_messages(src_id, msg_ids)
             except FloodWait as e:
+                logger.warning(f"[FF] FloodWait {e.value}s on get_messages")
                 await asyncio.sleep(e.value + 2)
                 continue
             except Exception as e:
-                logger.error(f"[FF] get_messages error: {e}")
+                logger.error(f"[FF] get_messages src={src_id} ids={msg_ids[0]}-{msg_ids[-1]}: {e}")
                 await asyncio.sleep(5)
                 current_id = batch_end + 1
                 continue
@@ -494,14 +578,15 @@ async def _run_forwarding(client: Client, task_id, task: dict, progress_msg: Mes
                         asyncio.create_task(_send_to_ff_dump(client, msg, ff_ch))
                 else:
                     failed += 1
+                    logger.warning(f"[FF] Failed to copy msg_id={msg.id}")
 
                 current_id += 1
 
                 done_count = forwarded + skipped + failed
                 if done_count % PROGRESS_UPDATE_EVERY == 0 or current_id > end_id:
                     elapsed = time.time() - t_start
-                    rate = forwarded / elapsed if elapsed > 0 else 0
-                    eta = ((total - done_count) / rate) if rate > 0 else 0
+                    rate    = forwarded / elapsed if elapsed > 0 else 0
+                    eta     = ((total - done_count) / rate) if rate > 0 else 0
                     await _update_ff_progress(task_id, forwarded, current_id)
                     await _safe_edit(
                         progress_msg,
@@ -515,6 +600,7 @@ async def _run_forwarding(client: Client, task_id, task: dict, progress_msg: Mes
         await _mark_ff_done(task_id)
         elapsed = int(time.time() - t_start)
         m, s = divmod(elapsed, 60)
+        logger.info(f"[FF] Completed: user={user_id} forwarded={forwarded} skipped={skipped} failed={failed} time={m}m{s}s")
         await _safe_edit(
             progress_msg,
             f"🎉 <b>Forwarding Completed!</b>\n\n"
@@ -526,7 +612,7 @@ async def _run_forwarding(client: Client, task_id, task: dict, progress_msg: Mes
         )
 
     except Exception as e:
-        logger.error(f"[FF] Unexpected error: {e}", exc_info=True)
+        logger.error(f"[FF] _run_forwarding crashed: {e}", exc_info=True)
         try:
             await _mark_ff_done(task_id)
         except Exception:
@@ -550,6 +636,7 @@ async def _copy_one(client: Client, msg: Message, dst_id: int, attempt: int = 0)
         )
         return True
     except FloodWait as e:
+        logger.warning(f"[FF] FloodWait {e.value}s on copy_message msg={msg.id}")
         await asyncio.sleep(e.value + 2)
         return await _copy_one(client, msg, dst_id, attempt)
     except (errors.MessageIdInvalid, errors.ChannelInvalid):
@@ -558,7 +645,7 @@ async def _copy_one(client: Client, msg: Message, dst_id: int, attempt: int = 0)
         if attempt < 3:
             await asyncio.sleep(3)
             return await _copy_one(client, msg, dst_id, attempt + 1)
-        logger.warning(f"[FF] copy failed: {e}")
+        logger.warning(f"[FF] copy_message failed after retries: {e}")
         return False
 
 
@@ -573,9 +660,9 @@ async def _send_to_ff_dump(client: Client, msg: Message, ff_ch: int):
         if not file_name:
             file_name = "File"
 
-        raw_cap   = msg.caption or ""
-        clean_cap = strip_links_only(raw_cap)
-        clean_cap = remove_emojis(clean_cap)
+        raw_cap    = msg.caption or ""
+        clean_cap  = strip_links_only(raw_cap)
+        clean_cap  = remove_emojis(clean_cap)
         smart_name = build_smart_filename(file_name, clean_cap)
         if not smart_name:
             smart_name = clean_text(file_name)
@@ -590,7 +677,7 @@ async def _send_to_ff_dump(client: Client, msg: Message, ff_ch: int):
         await asyncio.sleep(e.value + 2)
         await _send_to_ff_dump(client, msg, ff_ch)
     except Exception as e:
-        logger.debug(f"[FF] dump send skipped: {e}")
+        logger.debug(f"[FF] dump send skipped msg={msg.id}: {e}")
 
 
 async def _safe_edit(msg: Message, text: str, **kwargs):
@@ -613,8 +700,9 @@ async def resume_pending_ff_tasks(client: Client):
         await col.update_many({"status": "running"}, {"$set": {"status": "pending"}})
         pending = [d async for d in col.find({"status": "pending"})]
         if not pending:
+            logger.info("[FF] No pending forwarding tasks to resume")
             return
-        logger.info(f"[FF] Resuming {len(pending)} forwarding task(s)…")
+        logger.info(f"[FF] Resuming {len(pending)} interrupted forwarding task(s)")
         for task_doc in pending:
             task_id = task_doc["_id"]
             user_id = task_doc["user_id"]
@@ -631,7 +719,9 @@ async def resume_pending_ff_tasks(client: Client):
                                               callback_data=f"ff_cancel_task_{user_id}")]
                     ])
                 )
-            except Exception:
+                logger.info(f"[FF] Resume notification sent to user {user_id}")
+            except Exception as e:
+                logger.error(f"[FF] Could not message user {user_id} for resume: {e} — deleting task")
                 await _mark_ff_done(task_id)
                 continue
 
@@ -640,7 +730,7 @@ async def resume_pending_ff_tasks(client: Client):
             _active_tasks[user_id] = t
 
     except Exception as e:
-        logger.error(f"[FF] resume: {e}", exc_info=True)
+        logger.error(f"[FF] resume_pending_ff_tasks: {e}", exc_info=True)
 
 
 # ── /ff_status ────────────────────────────────────────────────────────────────
@@ -648,10 +738,10 @@ async def resume_pending_ff_tasks(client: Client):
 @Client.on_message(filters.command("ff_status") & filters.private, group=-1)
 async def cmd_ff_status(client: Client, message: Message):
     user_id = message.from_user.id
-    col = await _get_ff_col()
-    running = [d async for d in col.find({"status": "running",  "user_id": user_id})]
-    pending = [d async for d in col.find({"status": "pending",  "user_id": user_id})]
-    task = _active_tasks.get(user_id)
+    col     = await _get_ff_col()
+    running = [d async for d in col.find({"status": "running", "user_id": user_id})]
+    pending = [d async for d in col.find({"status": "pending", "user_id": user_id})]
+    task    = _active_tasks.get(user_id)
 
     if not running and not pending and (not task or task.done()):
         return await message.reply_text("✅ No active or pending forwarding tasks.")
@@ -679,4 +769,5 @@ async def cmd_ff_status(client: Client, message: Message):
 # ── Startup hook ──────────────────────────────────────────────────────────────
 
 def on_bot_start(client: Client):
+    logger.info("[FF] FileForward module loaded, scheduling resume task")
     asyncio.get_event_loop().create_task(resume_pending_ff_tasks(client))
