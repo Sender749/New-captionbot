@@ -184,13 +184,17 @@ async def addCap(chnl_id: int, caption: str):
     await chnl_ids.insert_one(dets)
 
 async def updateCap(chnl_id: int, caption: str):
-    await chnl_ids.update_one({"chnl_id": chnl_id}, {"$set": {"caption": caption}})
+    await chnl_ids.update_one({"chnl_id": chnl_id}, {"$set": {"caption": caption}}, upsert=True)
+    if chnl_id in _CHANNEL_CACHE:
+        _CHANNEL_CACHE[chnl_id]["data"]["caption"] = caption
 
 async def get_channel_caption(chnl_id: int):
     return await chnl_ids.find_one({"chnl_id": chnl_id})
 
 async def delete_channel_caption(chnl_id: int):
-    await chnl_ids.delete_one({"chnl_id": chnl_id})
+    await chnl_ids.update_one({"chnl_id": chnl_id}, {"$unset": {"caption": ""}})
+    if chnl_id in _CHANNEL_CACHE:
+        _CHANNEL_CACHE[chnl_id]["data"].pop("caption", None)
 
 # ---------------- Blocked Words functions ----------------
 async def set_block_words(chnl_id: int, raw_text: str):
@@ -271,7 +275,22 @@ async def delete_replace_words_db(channel_id: int):
     await chnl_ids.update_one({"chnl_id": channel_id}, {"$unset": {"replace_words": ""}})
     _CHANNEL_CACHE.pop(channel_id, None)
 
-async def get_channel_title_fast(user_id: int, channel_id: int) -> str:
+async def set_channel_title_cache(channel_id: int, title: str):
+    """Store channel title in chnl_ids for fast retrieval without get_chat()."""
+    await chnl_ids.update_one(
+        {"chnl_id": channel_id},
+        {"$set": {"_title": title}},
+        upsert=True
+    )
+    if channel_id in _CHANNEL_CACHE:
+        _CHANNEL_CACHE[channel_id]["data"]["_title"] = title
+
+async def get_channel_title_cached(channel_id: int) -> str:
+    """Get channel title from cache without API call."""
+    doc = await get_channel_cached(channel_id)
+    return doc.get("_title", str(channel_id))
+
+
     user = await users.find_one(
         {"_id": user_id, "channels.channel_id": channel_id},
         {"channels.$": 1}
