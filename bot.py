@@ -38,9 +38,6 @@ class Bot(Client):
         for _ in range(EXECUTORS):
             asyncio.create_task(caption_worker(self))
         me = await self.get_me()
-        # Pre-warm bot_me cache — /start and /about respond instantly without API call
-        import body.Caption as _cap_mod
-        _cap_mod._BOT_ME_CACHE = me
         self.force_channel = FORCE_SUB
         if FORCE_SUB:
             try:
