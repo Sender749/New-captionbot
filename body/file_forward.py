@@ -12,7 +12,8 @@ FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
 
 MAX_FORWARD_PER_PAIR = 1
 FORWARD_DELAY = 0.3
-FORWARD_EXECUTORS = 4
+# Increased so many users/channels can forward simultaneously
+FORWARD_EXECUTORS = 12
 
 FF_SESSIONS = {}
 CANCELLED_SESSIONS = set()
@@ -166,38 +167,52 @@ async def ff_dst(client, query):
         disable_web_page_preview=True
     )
 
-# ---------- ENQUEUE ----------
-async def enqueue_forward_jobs(client: Client, uid: int):
-    s = FF_SESSIONS[uid]
-    if "session_id" not in s:
-        s["session_id"] = str(uuid.uuid4())
+# ---------- ENQUEUE (non-blocking) ----------
+async def _scan_and_enqueue(client: Client, uid: int):
+    """
+    Background task: scans source channel and inserts jobs into DB.
+    Runs independently — does NOT block the event loop or caption editing.
+    Each user's forwarding session runs in its own task concurrently.
+    """
+    s = FF_SESSIONS.get(uid)
+    if not s:
+        return
     session_id = s["session_id"]
     src = s["source"]
     dst = s["destination"]
-    start_id = int(s["skip"]) + 1        # inclusive start
-    end_id = s.get("end_id")             # None = no upper limit
+    start_id = int(s["skip"]) + 1
+    end_id = s.get("end_id")
 
     s["total"] = 0
     msg_id = start_id
     consecutive_missing = 0
     MAX_CONSECUTIVE_MISSING = 500
+
     while True:
         if end_id is not None and msg_id > end_id:
             break
+        # Yield every iteration so other handlers (caption edit, etc.) run freely
+        await asyncio.sleep(0)
         try:
             msg = await client.get_messages(src, msg_id)
+        except FloodWait as e:
+            await asyncio.sleep(int(e.value) + 1)
+            continue
         except Exception:
             msg = None
+
         if not msg or getattr(msg, 'empty', True):
             consecutive_missing += 1
             if consecutive_missing >= MAX_CONSECUTIVE_MISSING:
                 break
             msg_id += 1
             continue
+
         consecutive_missing = 0
         if not msg.media:
             msg_id += 1
             continue
+
         await enqueue_forward({
             "user_id": uid,
             "src": src,
@@ -212,20 +227,57 @@ async def enqueue_forward_jobs(client: Client, uid: int):
         })
         s["total"] += 1
         msg_id += 1
+
+    # Stamp the real total on all pending jobs for this session
     await forward_queue.update_many(
-        {"src": src, "dst": dst, "total": 0},
+        {"session_id": session_id, "total": 0},
         {"$set": {"total": s["total"]}}
     )
-    await client.edit_message_text(
-        s["chat_id"],
-        s["msg_id"],
-        (
-            f"📤 <b>{s['source_title']}</b>\n"
-            f"         ⬇️⬇️⬇️\n"
-            f"📥 <b>{s['destination_title']}</b>\n\n"
-            "🔄 Preparing files for transfer…"
-        ),
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
+
+    if session_id not in CANCELLED_SESSIONS:
+        try:
+            await client.edit_message_text(
+                s["chat_id"],
+                s["msg_id"],
+                (
+                    f"📤 <b>{s['source_title']}</b>\n"
+                    f"         ⬇️⬇️⬇️\n"
+                    f"📥 <b>{s['destination_title']}</b>\n\n"
+                    "🔄 Preparing files for transfer…"
+                ),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
+        except Exception:
+            pass
+
+
+async def enqueue_forward_jobs(client: Client, uid: int):
+    """
+    Entry point called from the message handler.
+    Shows instant 'Scanning…' feedback, then fires a background task and
+    returns immediately — the handler is freed for all other requests.
+    """
+    s = FF_SESSIONS.get(uid)
+    if not s:
+        return
+    if "session_id" not in s:
+        s["session_id"] = str(uuid.uuid4())
+
+    try:
+        await client.edit_message_text(
+            s["chat_id"],
+            s["msg_id"],
+            (
+                f"📤 <b>{s['source_title']}</b>\n"
+                f"         ⬇️⬇️⬇️\n"
+                f"📥 <b>{s['destination_title']}</b>\n\n"
+                "🔄 Scanning files…"
+            ),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
+    except Exception:
+        pass
+
+    # Fire-and-forget — each user runs concurrently in their own task
+    asyncio.create_task(_scan_and_enqueue(client, uid))
 
 # ================= FORWARD SCHEDULER STATE =================
 async def fetch_forward_fair_job():
@@ -240,10 +292,15 @@ async def fetch_forward_fair_job():
         if FORWARD_ACTIVE[key] >= MAX_FORWARD_PER_PAIR:
             continue
         FORWARD_ACTIVE[key] += 1
-        await forward_queue.update_one(
+        # Atomic claim — prevents two workers grabbing the same job
+        updated = await forward_queue.find_one_and_update(
             {"_id": job["_id"], "status": "pending"},
-            {"$set": {"status": "processing", "started": now}}
+            {"$set": {"status": "processing", "started": now}},
         )
+        if updated is None:
+            # Another worker grabbed it — release slot and keep scanning
+            FORWARD_ACTIVE[key] = max(0, FORWARD_ACTIVE[key] - 1)
+            continue
         return job
     return None
 
@@ -342,7 +399,9 @@ async def forward_worker(client: Client):
             await _forward_with_thumb(client, job["src"], job["dst"], msg)
 
             job_user = job.get("user_id")
-            if job_user != ADMIN:
+            # ADMIN can be a list — check membership correctly
+            is_admin = (job_user in ADMIN) if isinstance(ADMIN, (list, tuple, set)) else (job_user == ADMIN)
+            if not is_admin:
                 try:
                     fname = None
                     for t in ("document", "video", "audio", "voice"):
@@ -374,7 +433,7 @@ async def forward_worker(client: Client):
             print(f"[FF_WORKER_ERR] {e}")
             await forward_done(job["_id"])
         finally:
-            FORWARD_ACTIVE[key] -= 1
+            FORWARD_ACTIVE[key] = max(0, FORWARD_ACTIVE[key] - 1)
 
 # ---------- PROGRESS ----------
 async def update_forward_progress(client: Client, job):
