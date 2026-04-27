@@ -8,7 +8,7 @@ from collections import defaultdict
 # -------- Caption Scheduler State (GLOBAL) --------
 CHANNEL_ACTIVE = defaultdict(int)   # channel_id -> active workers
 CHANNEL_COOLDOWN = {}               # channel_id -> unblock timestamp
-DEFAULT_MAX_WORKERS = 2
+DEFAULT_MAX_WORKERS = 4             # concurrent edits per channel (up from 2)
 
 _CHANNEL_CACHE = {}
 CACHE_TTL = 120  # seconds – longer TTL for snappier UI
@@ -25,6 +25,8 @@ async def ensure_forward_indexes():
     await forward_queue.create_index([("status", 1), ("ts", 1)])
     await forward_queue.create_index([("src", 1)])
     await forward_queue.create_index([("dst", 1)])
+    await forward_queue.create_index([("session_id", 1)])
+    await forward_queue.create_index([("user_id", 1)])
 
 async def enqueue_forward(job: dict):
     await forward_queue.insert_one({
