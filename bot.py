@@ -8,7 +8,7 @@ from info import *
 from body.database import *
 from body.Caption import *
 from body.file_forward import *
-EXECUTORS = 20
+EXECUTORS = 30  # caption workers — more = faster parallel channel editing
 
 PLUGIN_ROOT = "body"
 
