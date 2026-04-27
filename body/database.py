@@ -73,8 +73,6 @@ async def get_all_dump_skip_channels():
 async def ensure_queue_indexes():
     await queue_col.create_index([("status", 1), ("ts", 1)])
     await queue_col.create_index([("chat_id", 1)])
-    # Fast channel settings lookups
-    await chnl_ids.create_index([("chnl_id", 1)], unique=True, background=True)
 
 async def enqueue_caption(job: dict):
     await queue_col.insert_one({
@@ -86,7 +84,9 @@ async def enqueue_caption(job: dict):
 
 async def fetch_channel_job():
     now = time.time()
-    cursor = queue_col.find({"status": "pending"}).sort("ts", 1)
+    cursor = queue_col.find(
+        {"status": "pending"}
+    ).sort("ts", 1)
     async for job in cursor:
         ch = job["chat_id"]
         if CHANNEL_COOLDOWN.get(ch, 0) > now:
@@ -94,14 +94,10 @@ async def fetch_channel_job():
         if CHANNEL_ACTIVE[ch] >= DEFAULT_MAX_WORKERS:
             continue
         CHANNEL_ACTIVE[ch] += 1
-        # Atomic claim — prevents two of the 30 workers grabbing the same job
-        updated = await queue_col.find_one_and_update(
+        await queue_col.update_one(
             {"_id": job["_id"], "status": "pending"},
-            {"$set": {"status": "processing", "started": now}},
+            {"$set": {"status": "processing", "started": now}}
         )
-        if updated is None:
-            CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
-            continue
         return job
     return None
 
