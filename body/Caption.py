@@ -14,8 +14,7 @@ from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANN
 
 ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-DEFAULT_EDIT_DELAY = 0.3                 # per channel (reduced from 0.5)
-_BOT_ME_CACHE = None   # cached get_me() result — avoids API call on every /start
+DEFAULT_EDIT_DELAY = 0.5                 # per channel
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
@@ -152,10 +151,8 @@ async def show_start_ui(
     mention: str,
     edit_message=None
 ):
-    global _BOT_ME_CACHE
-    if _BOT_ME_CACHE is None:
-        _BOT_ME_CACHE = await client.get_me()
-    bot_username = _BOT_ME_CACHE.username or BOT_USERNAME
+    bot_me = await client.get_me()
+    bot_username = bot_me.username or BOT_USERNAME
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("➕️ Add me to your channel ➕️", url=f"https://t.me/{bot_username}?startchannel=true")],
@@ -181,10 +178,7 @@ async def show_start_ui(
 @Client.on_callback_query(filters.regex("^about_cb$"))
 async def about_callback(client: Client, query: CallbackQuery):
     await query.answer()
-    global _BOT_ME_CACHE
-    if _BOT_ME_CACHE is None:
-        _BOT_ME_CACHE = await client.get_me()
-    bot = _BOT_ME_CACHE
+    bot = await client.get_me()
     text = script.ABOUT_TXT.format(
         bot_name=bot.first_name,
         bot_username=bot.username
@@ -207,14 +201,18 @@ async def start_cmd(client, message):
         user_id = int(user.id)
         user_name = user.first_name or "Unknown User"
         username = user.username
-        # Run UI send and DB insert concurrently — /start responds instantly
-        is_new_user, _ = await asyncio.gather(
-            insert_user_check_new(user_id),
-            show_start_ui(client, chat_id=message.chat.id, mention=user.mention)
+        is_new_user = await insert_user_check_new(user_id)
+        await show_start_ui(
+            client,
+            chat_id=message.chat.id,
+            mention=user.mention
         )
         if is_new_user:
             try:
-                user_clickable = f"<a href='https://t.me/{username}'>{user_name}</a>" if username else user_name
+                if username:
+                    user_clickable = f"<a href='https://t.me/{username}'>{user_name}</a>"
+                else:
+                    user_clickable = f"{user_name}"
                 log_text = script.NEW_USER_TXT.format(user=user_clickable, user_id=user_id)
                 await client.send_message(LOG_CH, log_text, disable_web_page_preview=True)
             except Exception as e:
@@ -271,85 +269,25 @@ async def ff_start(client, message):
         
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("admin"))
 async def admin_help(client, message):
-    text = (
-        "🛠 <b>Admin Commands</b>\n\n"
-        "📊 <b>Info &amp; Monitoring</b>\n"
-        "• /stats — DB size, users, channels, pending jobs &amp; bot load\n"
-        "• /queue — Live queue status: caption &amp; forward jobs per channel/session\n\n"
-        "⚙️ <b>Bot Management</b>\n"
-        "• /restart — Clear all queues &amp; restart the bot process cleanly\n"
-        "• /reset — ⚠️ Wipe ALL users, channels &amp; captions from DB\n\n"
-        "📢 <b>User Management</b>\n"
-        "• /broadcast — Reply to a message to broadcast it to all users\n\n"
-        "📁 <b>Forwarding</b>\n"
-        "• /file_forward — Start a file forwarding session (select src → dst → range)\n\n"
-        "📝 <b>Settings</b>\n"
-        "• /settings — Manage your channels &amp; caption settings\n"
+    text = "⚙️ Scheduler: Per-channel & per-session isolated\nFloodWait-safe"
+    await message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
     )
-    await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("stats"))
 async def bot_stats(client, message):
-    loading = await message.reply_text("📊 Fetching stats…")
-    try:
-        # Run all DB queries concurrently
-        cap_pending, cap_processing, f_pending, f_processing, users_count = await asyncio.gather(
-            queue_col.count_documents({"status": "pending"}),
-            queue_col.count_documents({"status": "processing"}),
-            forward_queue.count_documents({"status": "pending"}),
-            forward_queue.count_documents({"status": "processing"}),
-            total_user(),
-        )
-        # Channel count
-        try:
-            channel_count = await chnl_ids.count_documents({})
-        except Exception:
-            channel_count = 0
-
-        # DB stats (MongoDB command)
-        try:
-            db_stats = await db.command("dbStats")
-            data_size_mb = round(db_stats.get("dataSize", 0) / 1024 / 1024, 2)
-            storage_mb = round(db_stats.get("storageSize", 0) / 1024 / 1024, 2)
-            index_mb = round(db_stats.get("indexSize", 0) / 1024 / 1024, 2)
-            total_mb = round(data_size_mb + index_mb, 2)
-            db_text = (
-                f"• Data: <code>{data_size_mb} MB</code>\n"
-                f"• Storage: <code>{storage_mb} MB</code>\n"
-                f"• Indexes: <code>{index_mb} MB</code>\n"
-                f"• Total: <code>{total_mb} MB</code>"
-            )
-        except Exception:
-            db_text = "• <i>DB stats unavailable</i>"
-
-        # Bot load indicator
-        total_jobs = cap_pending + cap_processing + f_pending + f_processing
-        if total_jobs == 0:
-            load = "🟢 Idle"
-        elif total_jobs < 50:
-            load = "🟡 Low"
-        elif total_jobs < 300:
-            load = "🟠 Medium"
-        else:
-            load = "🔴 High"
-
-        text = (
-            "📊 <b>BOT STATS</b>\n\n"
-            f"👥 <b>Users:</b> <code>{users_count}</code>\n"
-            f"📺 <b>Channels:</b> <code>{channel_count}</code>\n\n"
-            "📝 <b>Caption Queue</b>\n"
-            f"  • Pending: <code>{cap_pending}</code>\n"
-            f"  • Processing: <code>{cap_processing}</code>\n\n"
-            "📦 <b>Forward Queue</b>\n"
-            f"  • Pending: <code>{f_pending}</code>\n"
-            f"  • Processing: <code>{f_processing}</code>\n\n"
-            f"⚡ <b>Bot Load:</b> {load}\n\n"
-            "🗄 <b>Database</b>\n"
-            f"{db_text}"
-        )
-        await loading.edit(text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        await loading.edit(f"❌ Error fetching stats: <code>{e}</code>", parse_mode=ParseMode.HTML)
+    pending = await queue_col.count_documents({"status": "pending"})
+    processing = await queue_col.count_documents({"status": "processing"})
+    users_count = await total_user()
+    text = (
+        "📊 <b>BOT STATS</b>\n\n"
+        f"• Users: <code>{users_count}</code>\n"
+        f"• Pending Jobs: <code>{pending}</code>\n"
+        f"• Processing Jobs: <code>{processing}</code>\n"
+    )
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command(["broadcast"]))
 async def broadcast(client, message):
@@ -389,43 +327,12 @@ async def broadcast(client, message):
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("restart"))
 async def restart_bot(client, message):
-    silicon = await message.reply_text("🔄 <b>Restarting…</b>\n\nClearing queues…", parse_mode=ParseMode.HTML)
-    try:
-        # Clear all in-memory scheduler state
-        CHANNEL_ACTIVE.clear()
-        CHANNEL_COOLDOWN.clear()
-        from body.file_forward import FORWARD_ACTIVE, FORWARD_COOLDOWN, CANCELLED_SESSIONS, FF_SESSIONS, _last_progress_update
-        FORWARD_ACTIVE.clear()
-        FORWARD_COOLDOWN.clear()
-        CANCELLED_SESSIONS.clear()
-        FF_SESSIONS.clear()
-        _last_progress_update.clear()
-
-        # Reset any stuck "processing" jobs back to "pending" so they rerun cleanly
-        await queue_col.update_many(
-            {"status": "processing"},
-            {"$set": {"status": "pending", "retries": 0}}
-        )
-        await forward_queue.update_many(
-            {"status": "processing"},
-            {"$set": {"status": "pending", "retries": 0}}
-        )
-
-        # Count what's left
-        cap_pending = await queue_col.count_documents({"status": "pending"})
-        fwd_pending = await forward_queue.count_documents({"status": "pending"})
-
-        await silicon.edit(
-            f"♻️ <b>Queues reset</b>\n"
-            f"• Caption jobs: <code>{cap_pending}</code> pending\n"
-            f"• Forward jobs: <code>{fwd_pending}</code> pending\n\n"
-            "🔄 Restarting process…",
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        await silicon.edit(f"⚠️ Queue reset error: <code>{e}</code>\nRestarting anyway…", parse_mode=ParseMode.HTML)
-
-    await asyncio.sleep(1)
+    silicon = await client.send_message(
+        chat_id=message.chat.id,
+        text="**🔄 𝙿𝚁𝙾𝙲𝙴𝚂𝚂𝙴𝚂 𝚂𝚃𝙾𝙿𝙿ᴇᴅ. 𝙱𝙾𝚃 𝙸𝚂 𝚁𝙴𝚂𝚃𝙰𝚁𝚃𝙸𝙽𝙶...**",
+    )
+    await asyncio.sleep(3)
+    await silicon.edit("**✅️ 𝙱𝙾𝚃 𝙸𝚂 𝚁𝙴𝚂𝚃𝙰𝚁𝚃𝙴𝙳. 𝙽𝙾𝚆 𝚈𝙾𝚄 𝙲𝙰𝙽 𝚄𝚂𝙴 𝙼𝙴**")
     os.execl(sys.executable, sys.executable, *sys.argv)
 
 @Client.on_message(filters.command("settings") & filters.private)
@@ -504,73 +411,85 @@ async def reset_db(client, message):
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("queue"))
 async def queue_status(client, message):
-    loading = await message.reply_text("📊 Loading queue…")
-    # Run all DB queries concurrently — no sequential await chains
-    cap_pending, cap_processing, f_pending, f_processing = await asyncio.gather(
-        queue_col.count_documents({"status": "pending"}),
-        queue_col.count_documents({"status": "processing"}),
-        forward_queue.count_documents({"status": "pending"}),
-        forward_queue.count_documents({"status": "processing"}),
-    )
+    cap_pending = await queue_col.count_documents({"status": "pending"})
+    cap_processing = await queue_col.count_documents({"status": "processing"})
     cap_pipeline = [
         {"$match": {"status": "pending"}},
         {"$group": {"_id": "$chat_id", "count": {"$sum": 1}}},
         {"$sort": {"count": -1}},
-        {"$limit": 8}
+        {"$limit": 10}
     ]
     cap_lines = []
     async for row in queue_col.aggregate(cap_pipeline):
         ch_id = row["_id"]
         count = row["count"]
-        # Use cached title — no Telegram API call
-        name = await get_channel_title_cached(ch_id)
+        try:
+            chat = await client.get_chat(ch_id)
+            name = chat.title
+        except:
+            name = "Unknown"
         eta = int((count / DEFAULT_MAX_WORKERS) * DEFAULT_EDIT_DELAY)
         cap_lines.append(
-            f"• <b>{name}</b> — <code>{count}</code> jobs (~{eta//60}m {eta%60}s)"
+            f"• <b>{name}</b>\n"
+            f"  ├ ID: <code>{ch_id}</code>\n"
+            f"  ├ Jobs: <code>{count}</code>\n"
+            f"  └ ETA (channel): ~{eta//60}m {eta%60}s"
         )
+    f_pending = await forward_queue.count_documents({"status": "pending"})
+    f_processing = await forward_queue.count_documents({"status": "processing"})
     f_pipeline = [
         {"$match": {"status": "pending"}},
         {"$group": {
-            "_id": {"src": "$src", "dst": "$dst", "session_id": "$session_id"},
-            "count": {"$sum": 1},
-            "total": {"$max": "$total"},
-            "src_title": {"$first": "$source_title"},
-            "dst_title": {"$first": "$destination_title"},
+            "_id": {
+                "src": "$src",
+                "dst": "$dst"
+            },
+            "count": {"$sum": 1}
         }},
         {"$sort": {"count": -1}},
-        {"$limit": 8}
+        {"$limit": 10}
     ]
     forward_lines = []
     async for row in forward_queue.aggregate(f_pipeline):
+        src = row["_id"]["src"]
+        dst = row["_id"]["dst"]
         count = row["count"]
-        total = row.get("total") or count
-        s_name = row.get("src_title") or str(row["_id"]["src"])
-        d_name = row.get("dst_title") or str(row["_id"]["dst"])
-        done = max(0, total - count)
-        pct = int(done / total * 100) if total else 0
+        try:
+            s_chat = await client.get_chat(src)
+            s_name = s_chat.title
+        except:
+            s_name = "Unknown"
+        try:
+            d_chat = await client.get_chat(dst)
+            d_name = d_chat.title
+        except:
+            d_name = "Unknown"
         eta = int(count * FORWARD_DELAY)
         forward_lines.append(
             f"• <b>{s_name}</b> ➜ <b>{d_name}</b>\n"
-            f"  {done}/{total} ({pct}%) — ETA ~{eta//60}m {eta%60}s"
+            f"  ├ Jobs: <code>{count}</code>\n"
+            f"  └ ETA (pair): ~{eta//60}m {eta%60}s"
         )
     text = (
         "📊 <b>QUEUE STATUS</b>\n\n"
         "📝 <b>Caption Queue</b>\n"
-        f"• Pending: <code>{cap_pending}</code>  Processing: <code>{cap_processing}</code>\n"
+        f"• Pending: <code>{cap_pending}</code>\n"
+        f"• Processing: <code>{cap_processing}</code>\n"
     )
     if cap_lines:
-        text += "\n".join(cap_lines) + "\n\n"
+        text += "🔥 <b>Top Busy Caption Channels</b>\n" + "\n".join(cap_lines) + "\n\n"
     else:
         text += "✅ No caption tasks\n\n"
     text += (
         "📦 <b>File Forward Queue</b>\n"
-        f"• Pending: <code>{f_pending}</code>  Processing: <code>{f_processing}</code>\n"
+        f"• Pending: <code>{f_pending}</code>\n"
+        f"• Processing: <code>{f_processing}</code>\n"
     )
     if forward_lines:
-        text += "\n".join(forward_lines)
+        text += "🚚 <b>Top Forward Sessions</b>\n" + "\n".join(forward_lines)
     else:
         text += "✅ No forward tasks"
-    await loading.edit(text, parse_mode=enums.ParseMode.HTML)
+    await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
 
 # ---------------- Auto Caption core ----------------
 def sanitize_caption_html(text: str) -> str:
@@ -586,7 +505,7 @@ async def caption_worker(client: Client):
     while True:
         job = await fetch_channel_job()
         if not job:
-            await asyncio.sleep(0.1)   # fast idle poll
+            await asyncio.sleep(0.5)
             continue
         ch = job["chat_id"]
         released = False
@@ -600,13 +519,12 @@ async def caption_worker(client: Client):
                               if job.get("url_buttons") else None
                              )
             )
-            # Use cached channel doc — no extra DB hit
-            ch_doc = await get_channel_cached(ch)
-            if not ch_doc.get("dump_skip", False):
+            if not await is_dump_skip(ch):
                 try:
+                    original = await client.get_messages(ch, job["message_id"])
                     fname = None
                     for t in ("document", "video", "audio", "voice"):
-                        obj = getattr(await client.get_messages(ch, job["message_id"]), t, None)
+                        obj = getattr(original, t, None)
                         if obj:
                             fname = getattr(obj, "file_name", None)
                             break
@@ -618,7 +536,7 @@ async def caption_worker(client: Client):
                         message_id=job["message_id"],
                         caption=fname
                     )
-                except Exception:
+                except:
                     pass
             await mark_done(job["_id"])
             await asyncio.sleep(DEFAULT_EDIT_DELAY)
