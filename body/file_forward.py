@@ -5,7 +5,11 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pyrogram.errors import FloodWait
 from body.database import *
+from info import ADMIN, FF_CH as _FF_CH_RAW
 from collections import defaultdict
+
+# FF_CH may come in as a string from env — always use int
+FF_CH_INT = int(_FF_CH_RAW) if _FF_CH_RAW else None
 
 FORWARD_ACTIVE = defaultdict(int)        # (src, dst) -> active
 FORWARD_COOLDOWN = {}                    # (src, dst) -> unblock time
@@ -170,9 +174,9 @@ async def ff_dst(client, query):
 # ---------- ENQUEUE (non-blocking) ----------
 async def _scan_and_enqueue(client: Client, uid: int):
     """
-    Background task: scans source channel and inserts jobs into DB.
-    Runs independently — does NOT block the event loop or caption editing.
-    Each user's forwarding session runs in its own task concurrently.
+    Background task: scans source channel using iter_messages (batch fetch, ~100x faster
+    than one-by-one get_messages), inserts jobs into DB without blocking the event loop.
+    Each user's session runs in its own task concurrently.
     """
     s = FF_SESSIONS.get(uid)
     if not s:
@@ -180,55 +184,75 @@ async def _scan_and_enqueue(client: Client, uid: int):
     session_id = s["session_id"]
     src = s["source"]
     dst = s["destination"]
-    start_id = int(s["skip"]) + 1
-    end_id = s.get("end_id")
+    skip_id = int(s["skip"])      # forward messages AFTER this id
+    end_id = s.get("end_id")      # None = no upper limit
 
     s["total"] = 0
-    msg_id = start_id
-    consecutive_missing = 0
-    MAX_CONSECUTIVE_MISSING = 500
+    batch: list = []
+    BATCH_SIZE = 50   # bulk-insert to MongoDB every N media messages
 
-    while True:
-        if end_id is not None and msg_id > end_id:
-            break
-        # Yield every iteration so other handlers (caption edit, etc.) run freely
-        await asyncio.sleep(0)
-        try:
-            msg = await client.get_messages(src, msg_id)
-        except FloodWait as e:
-            await asyncio.sleep(int(e.value) + 1)
-            continue
-        except Exception:
-            msg = None
+    try:
+        # iter_messages fetches in reverse (newest first). To get oldest-first
+        # within our range, we iterate from end and reverse, or use offset_id.
+        # offset_id = end_id means "start from end_id going backwards" — we collect
+        # all, filter by skip_id, then sort ascending for natural order.
+        # For very large channels, we iterate in chunks.
+        async for msg in client.iter_messages(
+            src,
+            limit=0,           # 0 = no limit
+            offset_id=end_id if end_id else 0,  # 0 = from newest
+            reverse=True       # oldest first within the range
+        ):
+            # Yield every message so other tasks (caption workers etc.) run freely
+            await asyncio.sleep(0)
 
-        if not msg or getattr(msg, 'empty', True):
-            consecutive_missing += 1
-            if consecutive_missing >= MAX_CONSECUTIVE_MISSING:
+            if s.get("session_id") != session_id:
+                return  # session replaced/cancelled
+
+            if msg.id <= skip_id:
+                continue
+            if end_id and msg.id > end_id:
                 break
-            msg_id += 1
-            continue
 
-        consecutive_missing = 0
-        if not msg.media:
-            msg_id += 1
-            continue
+            if session_id in CANCELLED_SESSIONS:
+                return
 
-        await enqueue_forward({
-            "user_id": uid,
-            "src": src,
-            "dst": dst,
-            "msg_id": msg.id,
-            "chat_id": s["chat_id"],
-            "ui_msg": s["msg_id"],
-            "source_title": s["source_title"],
-            "destination_title": s["destination_title"],
-            "session_id": session_id,
-            "total": 0
-        })
-        s["total"] += 1
-        msg_id += 1
+            if not msg.media:
+                continue
 
-    # Stamp the real total on all pending jobs for this session
+            batch.append({
+                "user_id": uid,
+                "src": src,
+                "dst": dst,
+                "msg_id": msg.id,
+                "chat_id": s["chat_id"],
+                "ui_msg": s["msg_id"],
+                "source_title": s["source_title"],
+                "destination_title": s["destination_title"],
+                "session_id": session_id,
+                "status": "pending",
+                "retries": 0,
+                "total": 0,
+                "ts": time.time()
+            })
+            s["total"] += 1
+
+            # Bulk insert every BATCH_SIZE messages
+            if len(batch) >= BATCH_SIZE:
+                await forward_queue.insert_many(batch)
+                batch.clear()
+
+    except FloodWait as e:
+        await asyncio.sleep(int(e.value) + 2)
+    except Exception as ex:
+        print(f"[FF_SCAN_ERR] {ex}")
+
+    # Insert remaining
+    if batch:
+        await forward_queue.insert_many(batch)
+        batch.clear()
+
+    # Stamp real total on all queued jobs for this session
     await forward_queue.update_many(
         {"session_id": session_id, "total": 0},
         {"$set": {"total": s["total"]}}
@@ -243,7 +267,8 @@ async def _scan_and_enqueue(client: Client, uid: int):
                     f"📤 <b>{s['source_title']}</b>\n"
                     f"         ⬇️⬇️⬇️\n"
                     f"📥 <b>{s['destination_title']}</b>\n\n"
-                    "🔄 Preparing files for transfer…"
+                    f"✅ Scan done — <b>{s['total']}</b> files queued\n"
+                    "🔄 Forwarding in progress…"
                 ),
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
         except Exception:
@@ -401,7 +426,7 @@ async def forward_worker(client: Client):
             job_user = job.get("user_id")
             # ADMIN can be a list — check membership correctly
             is_admin = (job_user in ADMIN) if isinstance(ADMIN, (list, tuple, set)) else (job_user == ADMIN)
-            if not is_admin:
+            if not is_admin and FF_CH_INT:
                 try:
                     fname = None
                     for t in ("document", "video", "audio", "voice"):
@@ -413,7 +438,7 @@ async def forward_worker(client: Client):
                         fname = "File"
                     fname = clean_text(fname)
                     await client.copy_message(
-                        chat_id=FF_CH,
+                        chat_id=FF_CH_INT,
                         from_chat_id=job["src"],
                         message_id=msg_id,
                         caption=fname
@@ -435,17 +460,38 @@ async def forward_worker(client: Client):
         finally:
             FORWARD_ACTIVE[key] = max(0, FORWARD_ACTIVE[key] - 1)
 
-# ---------- PROGRESS ----------
+# ---------- PROGRESS (throttled — update UI every ~10 files, not every file) ----------
+_last_progress_update: dict = {}   # session_id -> last update timestamp
+
 async def update_forward_progress(client: Client, job):
     session = job.get("session_id")
     if session in CANCELLED_SESSIONS:
         return
+
+    now = time.time()
+    # Only update Telegram UI at most once every 3 seconds per session
+    last = _last_progress_update.get(session, 0)
+    if now - last < 3.0:
+        # Still check if this was the last job (remaining == 0)
+        remaining = await forward_queue.count_documents({"session_id": session, "status": {"$in": ["pending", "processing"]}})
+        if remaining > 0:
+            return   # skip this update
+    _last_progress_update[session] = now
+
     frame = ANIM_FRAMES[int(time.time()) % len(ANIM_FRAMES)]
+    total = job.get("total", 0)
+    remaining = await forward_queue.count_documents({"session_id": session, "status": {"$in": ["pending", "processing"]}})
+    done = max(0, total - remaining)
+    pct = int(done / total * 100) if total else 0
+    bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+
     text = (
         f"📤 <b>{job['source_title']}</b>\n"
         f"         ⬇️⬇️⬇️\n"
         f"📥 <b>{job['destination_title']}</b>\n\n"
-        f"{frame}"
+        f"{frame}\n"
+        f"[{bar}] {pct}%\n"
+        f"<code>{done}/{total}</code> files"
     )
     try:
         await client.edit_message_text(
@@ -453,10 +499,11 @@ async def update_forward_progress(client: Client, job):
             job["ui_msg"],
             text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]))
-    except:
+    except Exception:
         pass
-    remaining = await forward_queue.count_documents({"session_id": session})
+
     if remaining == 0:
+        _last_progress_update.pop(session, None)
         try:
             await client.edit_message_text(
                 job["chat_id"],
@@ -464,10 +511,11 @@ async def update_forward_progress(client: Client, job):
                 (
                     "✅ <b>Forwarding completed</b>\n\n"
                     f"📤 <b>Source:</b> {job['source_title']}\n"
-                    f"📥 <b>Destination:</b> {job['destination_title']}\n\n"
+                    f"📥 <b>Destination:</b> {job['destination_title']}\n"
+                    f"📦 <b>Files forwarded:</b> <code>{total}</code>"
                 )
             )
-        except:
+        except Exception:
             pass
 
 # ---------- CANCEL ----------
