@@ -641,8 +641,34 @@ async def user_settings(client: Client, *, user, send_func):
 
 # ─────────────────────────────────────────────
 #  Auto-caption: channel media handler
-#  EXACT original logic — template.format() with real values
+#  Auto-caption: channel media handler
 # ─────────────────────────────────────────────
+
+class _SafeDict(dict):
+    """
+    Returns empty string for any unknown placeholder key so that
+    format_map() never raises KeyError — even if the user's caption
+    template contains a typo like {filename} instead of {file_name}.
+    """
+    def __missing__(self, key):
+        return ""
+
+
+def _fmt_duration(seconds) -> str:
+    """Convert seconds (int/float) to HH:MM:SS or MM:SS string."""
+    try:
+        secs = int(seconds)
+        if secs <= 0:
+            return ""
+        h, rem = divmod(secs, 3600)
+        m, s   = divmod(rem, 60)
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+    except Exception:
+        return ""
+
+
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
     if msg.edit_date or not msg.media:
@@ -651,6 +677,7 @@ async def reCap(client, msg):
     default_caption = msg.caption or ""
 
     file_name = file_size = None
+    duration  = ""
     for file_type in ("video", "audio", "document", "voice"):
         obj = getattr(msg, file_type, None)
         if obj:
@@ -661,6 +688,10 @@ async def reCap(client, msg):
                 file_name = "File"
             file_name = file_name.replace("_", " ").replace(".", " ")
             file_size = get_size(getattr(obj, "file_size", 0))
+            # Extract real duration for video/audio/voice
+            raw_dur   = getattr(obj, "duration", None)
+            if raw_dur:
+                duration = _fmt_duration(raw_dur)
             break
     if not file_name:
         return
@@ -684,14 +715,16 @@ async def reCap(client, msg):
     language        = " + ".join(audio_lang_list) if audio_lang_list else ""
     year            = extract_year(default_caption) or extract_year(file_name) or ""
 
-    # ── Build caption using template.format() with REAL extracted values ─
+    # ── Build caption — format_map with SafeDict so unknown keys → "" ──
+    # This guarantees placeholders are ALWAYS substituted, never left
+    # as literal text — even if the user's template has a typo.
     try:
         raw_file_name   = normalize_series_name(file_name)
         file_info       = parse_file_info(raw_file_name, default_caption)
         smart_file_name = ""
         if "{smart_file_name}" in cap_template:
             smart_file_name = build_smart_filename(raw_file_name, default_caption)
-        new_caption = cap_template.format(
+        new_caption = cap_template.format_map(_SafeDict(
             file_name=raw_file_name,
             smart_file_name=smart_file_name,
             file_size=file_size,
@@ -709,9 +742,9 @@ async def reCap(client, msg):
             vcodec=file_info.get("vcodec", ""),
             acodec=file_info.get("acodec", ""),
             extension=file_info.get("extension", ""),
-            duration="",
+            duration=duration,
             empty="",
-        )
+        ))
     except Exception as e:
         print(f"[WARN] caption format error: {e}")
         new_caption = cap_template
@@ -967,7 +1000,7 @@ def sanitize_caption_html(text: str) -> str:
     def repl(match):
         tag = match.group(1).casefold()
         return match.group(0) if tag in allowed_tags else ""
-    return re.sub(r"</?\\s*([a-zA-Z0-9]+)(?:\\s[^>]*)?>", repl, text)
+    return re.sub(r"</?([a-zA-Z0-9]+)(\s[^>]*)?>", repl, text)
 
 
 # ─────────────────────────────────────────────
