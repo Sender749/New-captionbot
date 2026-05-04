@@ -6,7 +6,7 @@ from pyrogram.errors import ChatAdminRequired, RPCError, FloodWait
 from pyrogram.enums import ParseMode
 from info import *
 from Script import script
-from body.database import *
+from body.database import *  
 from body.file_forward import *
 from collections import deque, defaultdict
 from imdb import IMDb
@@ -23,17 +23,6 @@ bot_data = {
     "replace_words_set": {},
     "url_set": {}
 }
-
-# ─── Bot-info cache (avoid get_me() on every button press) ──────────────────
-_BOT_ME_CACHE = {"me": None, "ts": 0}
-_BOT_ME_TTL = 3600  # 1 hour — bot info never changes mid-run
-
-async def _get_bot_me(client: Client):
-    now = time.time()
-    if _BOT_ME_CACHE["me"] is None or now - _BOT_ME_CACHE["ts"] > _BOT_ME_TTL:
-        _BOT_ME_CACHE["me"] = await client.get_me()
-        _BOT_ME_CACHE["ts"] = now
-    return _BOT_ME_CACHE["me"]
 
 def extract_msg_id_from_text(text: str) -> int | None:
     if not text:
@@ -133,7 +122,7 @@ async def settings_button_handler(client: Client, query: CallbackQuery):
 @Client.on_callback_query(filters.regex("^help$"))
 async def help_callback(client, query: CallbackQuery):
     await query.answer()
-    bot_me = await _get_bot_me(client)
+    bot_me = await client.get_me()
     bot_username = bot_me.username
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕️ Add me to your channel ➕️", url=f"https://t.me/{bot_username}?startchannel=true")],
@@ -162,7 +151,7 @@ async def show_start_ui(
     mention: str,
     edit_message=None
 ):
-    bot_me = await _get_bot_me(client)
+    bot_me = await client.get_me()
     bot_username = bot_me.username or BOT_USERNAME
     keyboard = InlineKeyboardMarkup(
         [
@@ -189,13 +178,13 @@ async def show_start_ui(
 @Client.on_callback_query(filters.regex("^about_cb$"))
 async def about_callback(client: Client, query: CallbackQuery):
     await query.answer()
-    bot = await _get_bot_me(client)
+    bot = await client.get_me()
     text = script.ABOUT_TXT.format(
         bot_name=bot.first_name,
         bot_username=bot.username
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Owner", url="https://t.me/Navex_69"), InlineKeyboardButton("⬅️ Back", callback_data="start")]
+        [InlineKeyboardButton("🌐 Owner", url="https://t.me/Navex_69"),InlineKeyboardButton("⬅️ Back", callback_data="start")]
     ])
     await query.message.edit_text(
         text=text,
@@ -272,12 +261,12 @@ async def ff_start(client, message):
     FF_SESSIONS[uid] = {
         "step": "src",
         "channels": channels,
-        "expires": None
+        "expires": None  
     }
     kb = [[InlineKeyboardButton(ch["channel_title"], callback_data=f"ff_src_{ch['channel_id']}")] for ch in channels]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")])
-    await message.reply_text("📤 <b>Select SOURCE channel</b>", reply_markup=InlineKeyboardMarkup(kb))
-
+    await message.reply_text("📤 **Select SOURCE channel**", reply_markup=InlineKeyboardMarkup(kb))
+        
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("admin"))
 async def admin_help(client, message):
     text = "⚙️ Scheduler: Per-channel & per-session isolated\nFloodWait-safe"
@@ -335,6 +324,7 @@ async def broadcast(client, message):
             f"• ᴛᴏᴛᴀʟ ᴜsᴇʀs: {tot}\n• sᴜᴄᴄᴇssғᴜʟ: {success}\n• ʙʟᴏᴄᴋᴇᴅ ᴜsᴇʀs: {blocked}\n• ᴅᴇʟᴇᴛᴇᴅ ᴀᴄᴄᴏᴜɴᴛs: {deactivated}\n• ᴜɴsᴜᴄᴄᴇssғᴜʟ: {failed}"
         )
 
+
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("restart"))
 async def restart_bot(client, message):
     silicon = await client.send_message(
@@ -350,21 +340,21 @@ async def settings_cmd(client, message):
     loading = await message.reply_text("⚙️ Loading your channels...")
     await user_settings(client, user=message.from_user, send_func=loading.edit_text)
 
-async def user_settings(client: Client, *, user, send_func):
+async def user_settings(client: Client,*,user,send_func,):
     user_id = user.id
     channels = await get_user_channels(user_id)
     if not channels:
-        bot = await _get_bot_me(client)
+        bot = await client.get_me()
         bot_username = bot.username or BOT_USERNAME
         return await send_func(
-            "You haven't added me to any channels yet!\n\n"
-            "➕ Add me as admin in your channel by below button. 👇",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add me to your channel", url=f"https://t.me/{bot_username}?startchannel=true")]]),
+            "You haven’t added me to any channels yet!\n\n"
+            "➕ Add me as admin in your channel by below buttonx. 👇",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add me to your channel",url=f"https://t.me/{bot_username}?startchannel=true")]]
+            ),
             disable_web_page_preview=True
         )
     valid_channels = []
     removed_titles = []
-
     async def check_channel(ch):
         ch_id = ch.get("channel_id")
         ch_title = ch.get("channel_title", str(ch_id))
@@ -385,7 +375,6 @@ async def user_settings(client: Client, *, user, send_func):
             return {"valid": False, "title": ch_title}
         except Exception:
             return {"valid": True, "channel_id": ch_id, "channel_title": ch_title}
-
     results = await asyncio.gather(*[check_channel(ch) for ch in channels])
     for res in results:
         if res["valid"]:
@@ -408,14 +397,16 @@ async def close_message(client, query):
         await query.message.delete()
     except:
         pass
-
+    
 @Client.on_message(filters.command("reset") & filters.user(ADMIN))
 async def reset_db(client, message):
     await message.reply_text("⚠️ This will delete all users, channels, captions, and settings from the database.\nProcessing...")
+
     await users.delete_many({})
     await chnl_ids.delete_many({})
     await user_channels.delete_many({})
     CHANNEL_CACHE.clear()
+
     await message.reply_text("✅ All database records have been deleted successfully!")
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("queue"))
@@ -508,34 +499,25 @@ def sanitize_caption_html(text: str) -> str:
     def repl(match):
         tag = match.group(1).casefold()
         return match.group(0) if tag in allowed_tags else ""
-    return re.sub(r"</?\\s*([a-zA-Z0-9]+)(?:\\s[^>]*)?>", repl, text)
+    return re.sub(r"</?\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>", repl, text)
 
 async def caption_worker(client: Client):
-    """
-    Processes one caption edit job at a time.
-    CHANNEL_ACTIVE slot is released in `finally` — guaranteed even if mark_done raises.
-    fetch_channel_job() now uses atomic find_one_and_update so no two workers
-    grab the same job, and already increments CHANNEL_ACTIVE before returning.
-    """
     while True:
         job = await fetch_channel_job()
         if not job:
             await asyncio.sleep(0.5)
             continue
         ch = job["chat_id"]
+        released = False
         try:
             await client.edit_message_caption(
                 chat_id=ch,
                 message_id=job["message_id"],
                 caption=job["caption"],
                 parse_mode=ParseMode.HTML,
-                reply_markup=(
-                    InlineKeyboardMarkup([
-                        [InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row]
-                        for row in job.get("url_buttons", [])
-                    ])
-                    if job.get("url_buttons") else None
-                )
+                reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row] for row in job.get("url_buttons", [])]) 
+                              if job.get("url_buttons") else None
+                             )
             )
             if not await is_dump_skip(ch):
                 try:
@@ -570,8 +552,9 @@ async def caption_worker(client: Client):
             else:
                 await reschedule(job["_id"], delay=10)
         finally:
-            # Always release the channel slot — no matter what happened above
-            CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
+            if not released:
+                CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
+                released = True
 
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
@@ -595,6 +578,7 @@ async def reCap(client, msg):
     if not file_name:
         return
     cap_doc = await get_channel_cached(chnl_id)
+    # Fetch channel settings
     cap_template = cap_doc.get("caption")
     if not cap_template:
         return
@@ -605,11 +589,14 @@ async def reCap(client, msg):
     prefix = cap_doc.get("prefix", "") or ""
     replace_raw = cap_doc.get("replace_words", None)
     url_buttons = cap_doc.get("url_buttons", [])
+    # Extract info from caption + filename
     audio_lang_list = extract_audio_languages(f"{file_name} {default_caption}")
     language = " + ".join(audio_lang_list) if audio_lang_list else ""
     year = extract_year(default_caption) or extract_year(file_name) or ""
+    # Build caption
     try:
         raw_file_name = normalize_series_name(file_name)
+        # Parse all metadata once
         file_info = parse_file_info(raw_file_name, default_caption)
         smart_file_name = ""
         if "{smart_file_name}" in cap_template:
@@ -635,7 +622,7 @@ async def reCap(client, msg):
             duration="",
             empty="",
         )
-    except Exception:
+    except Exception as e:
         new_caption = cap_template
     if blocked_words_raw:
         new_caption = apply_block_words(new_caption, blocked_words_raw)
@@ -654,6 +641,12 @@ async def reCap(client, msg):
     new_caption = new_caption.strip()
     if "<" in new_caption and ">" in new_caption:
         new_caption = sanitize_caption_html(new_caption)
+    reply_markup = None
+    if url_buttons:
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row]
+            for row in url_buttons
+        ])
     await enqueue_caption({
         "chat_id": msg.chat.id,
         "message_id": msg.id,
@@ -669,6 +662,7 @@ LANG_LIST = [
     "Japanese", "Korean", "Chinese", "Spanish", "French", "German",
     "Italian", "Russian"
 ]
+# Short lang codes found in filenames like "Hin Eng"
 LANG_CODE_MAP = {
     "hin": "Hindi", "eng": "English", "tam": "Tamil", "tel": "Telugu",
     "mal": "Malayalam", "kan": "Kannada", "mar": "Marathi", "guj": "Gujarati",
@@ -683,6 +677,7 @@ VIDEO_CODEC_LIST = ["HEVC", "x265", "x264", "AV1", "H.264", "H.265"]
 AUDIO_CODEC_LIST = ["DD5.1", "DD+", "DDP5.1", "DDP", "DTS-HD", "DTS", "Atmos", "AAC", "AC3", "MP3"]
 EXT_LIST = ["mkv", "mp4", "avi", "webm", "mov"]
 
+# Tags that mark ESub/HSub/Sub presence
 ESUB_RE = re.compile(r'\bE\.?Subs?\b', re.I)
 HSUB_RE = re.compile(r'\bH\.?Subs?\b', re.I)
 SUB_RE  = re.compile(r'\b(?:M\.?Subs?|MSub|Subs?|Subtitles?)\b', re.I)
@@ -691,6 +686,7 @@ def _norm(text: str) -> str:
     return re.sub(r'\s+', ' ', text.lower()).strip()
 
 def _clean_raw(text: str) -> str:
+    """Normalise separators for easier parsing."""
     return re.sub(r'[._]', ' ', text)
 
 def imdb_enrich_title(title: str, year: str):
@@ -706,19 +702,38 @@ def imdb_enrich_title(title: str, year: str):
     return title, year
 
 def extract_title_year(raw: str):
+    """
+    Extract clean movie/show title and year.
+    Works for:
+      • "Lara Croft: Tomb Raider (2001) 480p …"
+      • "Himmatwar (Poojai) 2014 Dual Audio …"
+      • "Sangamarmar S01 (Ep.01-09) (2026) …"
+      • "The Lost Flowers of Alice Hart S01 E02 WebRip …"
+    """
     text = _clean_raw(raw)
+    # Find the first 4-digit year
     year_m = re.search(r'\b((?:19|20)\d{2})\b', text)
     year = year_m.group(1) if year_m else ""
     cut = year_m.start() if year_m else len(text)
     title_raw = text[:cut]
-    title_raw = re.sub(r'\s*\bS\d{1,3}\b.*$', '', title_raw, flags=re.I)
-    title_raw = re.sub(r'\s*\bEp?\.?\d{1,3}\b.*$', '', title_raw, flags=re.I)
+    # Remove season/episode markers from end of title
+    title_raw = re.sub(
+        r'\s*\bS\d{1,3}\b.*$', '', title_raw,
+        flags=re.I
+    )
+    title_raw = re.sub(
+        r'\s*\bEp?\.?\d{1,3}\b.*$', '', title_raw,
+        flags=re.I
+    )
+    # Remove quality/codec/source noise leftover
     title_raw = re.sub(
         r'\b(480p|720p|1080p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|av1|esub|hsub|sub|dual|multi|audio|hindi|english|tamil|telugu)\b',
         '', title_raw, flags=re.I
     )
+    # Remove parenthesised alt-title noise like "(Poojai)"
     title_raw = re.sub(r'\([^)]{1,30}\)', '', title_raw)
-    title_raw = re.sub(r'[\[\]()\\-:,]+\s*$', '', title_raw.strip())
+    # Strip trailing punctuation / junk
+    title_raw = re.sub(r'[\[\]()\-:,]+\s*$', '', title_raw.strip())
     title = re.sub(r'\s{2,}', ' ', title_raw).strip().title()
     return title, year
 
@@ -734,26 +749,48 @@ def detect_media_type(text: str) -> str:
     return "movie"
 
 def extract_season_episode(text: str):
+    """
+    Handles:
+      S01 (Ep.01-09)  →  S01, Ep.01-09
+      S01 E02         →  S01, E02
+      S01E07          →  S01, E07
+    Returns (season_str, episode_str) both as display strings.
+    """
     text = re.sub(r'[._]', ' ', text)
     season = ""
     episode = ""
+
     s_m = re.search(r'\bS(?:eason)?\s*0*(\d+)\b', text, re.I)
     if s_m:
         season = f"S{int(s_m.group(1)):02d}"
+
+    # Episode range like (Ep.01-09) or Ep.01-09
     r_m = re.search(r'\bEp?\.?\s*0*(\d+)\s*[-–to]+\s*0*(\d+)\b', text, re.I)
     if r_m:
         episode = f"Ep.{int(r_m.group(1)):02d}-{int(r_m.group(2)):02d}"
         return season, episode
+
+    # Single episode: E07 / EP07 / Ep.07
     e_m = re.search(r'\bEp?\.?\s*0*(\d+)\b', text, re.I)
     if e_m:
         episode = f"E{int(e_m.group(1)):02d}"
+
     return season, episode
 
 def extract_audio_languages(text: str) -> list:
+    """
+    Extracts languages from patterns like:
+      Dual Audio (Hindi + Tamil)
+      Hindi + English
+      [Hindi or English]
+      Hin Eng  (3-letter codes)
+    """
     found = []
+    # Long names first
     for lang in LANG_LIST:
         if re.search(rf'\b{re.escape(lang)}\b', text, re.I):
             found.append(lang)
+    # 3-letter codes (only if no long names found yet)
     if not found:
         for code, lang in LANG_CODE_MAP.items():
             if re.search(rf'\b{code}\b', text, re.I) and lang not in found:
@@ -761,6 +798,10 @@ def extract_audio_languages(text: str) -> list:
     return list(dict.fromkeys(found))
 
 def extract_subtitle_tag(text: str) -> str:
+    """
+    Returns ESub / HSub / MSub / Sub based on filename/caption tags.
+    Priority: ESub > HSub > Sub
+    """
     if ESUB_RE.search(text):
         return "ESub"
     if HSUB_RE.search(text):
@@ -788,6 +829,8 @@ def extract_video_codec(text: str) -> str:
     return ""
 
 def extract_audio_codec(text: str) -> str:
+    """Extracts audio codec, including patterns like DD5.1-224Kbps."""
+    # Full patterns with bitrate first
     m = re.search(r'\b(DD5\.1|DD\+|DDP5\.1|DDP|DTS-HD|DTS|Atmos|AAC|AC3|MP3)(?:[- ]\d+Kbps)?\b', text, re.I)
     if m:
         return m.group(1).upper()
@@ -797,15 +840,21 @@ def extract_extension(text: str) -> str:
     m = re.search(r'\.(mkv|mp4|avi|webm|mov)\b', text, re.I)
     if m:
         return m.group(1).lower()
+    # Fallback: bare word
     for e in EXT_LIST:
         if re.search(rf'\b{e}\b', text, re.I):
             return e.lower()
     return ""
 
 def extract_resolution(text: str) -> str:
+    """Same as quality but returns the value for {resolution} placeholder."""
     return extract_quality(text)
 
 def parse_file_info(filename: str, caption: str) -> dict:
+    """
+    Parse ALL metadata from filename + caption combined.
+    Returns a dict with all individual fields for placeholders.
+    """
     raw = f"{filename} {caption}"
     title, year = extract_title_year(raw)
     title, year = imdb_enrich_title(title, year)
@@ -817,6 +866,7 @@ def parse_file_info(filename: str, caption: str) -> dict:
     vcodec = extract_video_codec(raw)
     acodec = extract_audio_codec(raw)
     ext = extract_extension(raw)
+
     return {
         "title": title,
         "year": year,
@@ -825,7 +875,7 @@ def parse_file_info(filename: str, caption: str) -> dict:
         "audio": " + ".join(audio_langs) if audio_langs else "",
         "subtitle": subtitle,
         "quality": quality,
-        "resolution": quality,
+        "resolution": quality,   # alias
         "source": source,
         "vcodec": vcodec,
         "acodec": acodec,
@@ -833,6 +883,14 @@ def parse_file_info(filename: str, caption: str) -> dict:
     }
 
 def build_smart_filename(filename: str, caption: str) -> str:
+    """
+    Build a clean, well-structured display name from filename + caption.
+    Format: Title [Season Episode] (Year) Audio Subtitle Quality Source Codec.ext
+    Examples:
+      Lara Croft Tomb Raider (2001) Hindi+English ESub 480p BluRay x264
+      Sangamarmar S01 Ep.01-09 (2026) Hindi ESub 1080p HEVC
+      The Lost Flowers Of Alice Hart S01 E02 Hindi+English ESub 480p WEBRip
+    """
     info = parse_file_info(filename, caption)
     parts = []
     if info["title"]:
@@ -857,6 +915,7 @@ def build_smart_filename(filename: str, caption: str) -> str:
     if info["extension"]:
         parts.append(info["extension"])
     return " ".join(parts).strip()
+
 
 # ---------------- Helper functions ----------------
 def _status_name(member_obj):
@@ -889,18 +948,17 @@ def get_size(size: int) -> str:
         size /= 1024.0
         i += 1
     return "%.2f %s" % (size, units[i])
-
+    
 def extract_year(default_caption: str) -> Optional[str]:
     match = re.search(r'\b(19\d{2}|20\d{2})\b', default_caption or "")
     return match.group(1) if match else None
-
 URL_RE = re.compile(
     r"(https?://[^\s]+|www\.[^\s]+|t\.me/[^\s/]+(?:/[^\s]+)?)",
     flags=re.IGNORECASE
 )
 MENTION_RE = re.compile(r'@\w+', flags=re.IGNORECASE)
 MD_LINK_RE = re.compile(r'\[([^\]]+)\]\((?:https?:\/\/[^\)]+|tg:\/\/[^\)]+)\)', flags=re.IGNORECASE)
-HTML_A_RE = re.compile(r'<a\s+[^>]*href=["\'"](?:https?:\/\/|tg:\/)[^"\']+["\'"][^>]*>(.*?)</a>', flags=re.IGNORECASE)
+HTML_A_RE = re.compile(r'<a\s+[^>]*href=["\'](?:https?:\/\/|tg:\/)[^"\']+["\'][^>]*>(.*?)</a>', flags=re.IGNORECASE)
 TG_USER_LINK_RE = re.compile(r'\[([^\]]+)\]\(tg:\/\/user\?id=\d+\)', flags=re.IGNORECASE)
 
 EMOJI_LIST = [
@@ -956,7 +1014,7 @@ def strip_links_and_mentions_keep_text(text: str) -> str:
     text = TG_USER_LINK_RE.sub(r'\1', text)
     text = URL_RE.sub("", text)
     text = MENTION_RE.sub("", text)
-    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'[ 	]+', ' ', text) 
     return text
 
 def strip_links_only(text: str) -> str:
@@ -967,9 +1025,9 @@ def strip_links_only(text: str) -> str:
     text = HTML_A_RE.sub(r'\1', text)
     text = URL_RE.sub("", text)
     text = MENTION_RE.sub("", text)
-    text = re.sub(r'\(\s*\)', '', text)
-    text = re.sub(r'\[\s*\]', '', text)
-    text = re.sub(r'\{\s*\}', '', text)
+    text = re.sub(r'\(\s*\)', '', text)   # ()
+    text = re.sub(r'\[\s*\]', '', text)   # []
+    text = re.sub(r'\{\s*\}', '', text)   # {}
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
@@ -992,6 +1050,7 @@ def apply_block_words(caption_html: str, raw_blocked: str) -> str:
 def parse_replace_pairs(raw):
     if not raw:
         return []
+    # Convert list -> string (joined by commas)
     if isinstance(raw, list):
         raw = ','.join(map(str, raw))
     elif not isinstance(raw, str):
@@ -1019,31 +1078,23 @@ def apply_replacements(text: str, pairs: List[Tuple[str, str]]) -> str:
                 new_text = re.sub(re.escape(old), new, new_text, flags=re.IGNORECASE)
         except re.error:
             new_text = new_text.replace(old, new)
-    new_text = re.sub(r'[ \t]+', ' ', new_text).strip()
+    new_text = re.sub(r'[ 	]+', ' ', new_text).strip()
     return new_text
 
 # ---------------- Function Handler ----------------
 @Client.on_message(filters.private)
 async def capture_user_input(client, message):
-    """
-    Handles all user text input for caption/settings flows.
-    Optimised: checks each session dict directly instead of building a combined set.
-    """
     user_id = message.from_user.id
-
-    # Fast-path: if user is in none of the active session dicts, exit immediately
-    in_session = (
-        user_id in bot_data["caption_set"]
-        or user_id in bot_data["block_words_set"]
-        or user_id in bot_data["replace_words_set"]
-        or user_id in bot_data["prefix_set"]
-        or user_id in bot_data["suffix_set"]
-        or user_id in bot_data["url_set"]
-        or user_id in FF_SESSIONS
-    )
-    if not in_session:
+    active_users = set()
+    active_users.update(bot_data.get("caption_set", {}).keys())
+    active_users.update(bot_data.get("block_words_set", {}).keys())
+    active_users.update(bot_data.get("replace_words_set", {}).keys())
+    active_users.update(bot_data.get("prefix_set", {}).keys())
+    active_users.update(bot_data.get("suffix_set", {}).keys())
+    active_users.update(bot_data.get("url_set", {}).keys())
+    active_users.update(FF_SESSIONS.keys())  
+    if user_id not in active_users:
         return
-
     text = (
         message.text.html if message.text else
         message.caption.html if message.caption else
@@ -1120,8 +1171,7 @@ async def capture_user_input(client, message):
             chat_id=user_id,
             message_id=instr_msg_id,
             text="✅ Prefix updated!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=f"back_to_suffixprefix_{channel_id}")]])
-        )
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=f"back_to_suffixprefix_{channel_id}")]]))
         return
 
     # ---------- SUFFIX ----------
@@ -1156,7 +1206,10 @@ async def capture_user_input(client, message):
             for part in parts:
                 match = re.findall(r'"([^"]+)"', part)
                 if len(match) == 2:
-                    row.append({"text": match[0], "url": match[1]})
+                    row.append({
+                        "text": match[0],
+                        "url": match[1]
+                    })
             if row:
                 rows.append(row)
         if not rows:
@@ -1167,9 +1220,9 @@ async def capture_user_input(client, message):
             chat_id=user_id,
             message_id=instr_msg_id,
             text="✅ URL buttons updated successfully!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=f"seturl_{channel_id}")]])
-        )
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data=f"seturl_{channel_id}")]]))
         return
+
 
     # ================= FILE FORWARD SKIP HANDLER =================
     if user_id in FF_SESSIONS:
@@ -1191,6 +1244,7 @@ async def capture_user_input(client, message):
             src_hint = parsed["src_hint"]
             src_channel = session["source"]
 
+            # ---- Validate: if link contained a channel id, it must match source ----
             if src_hint is not None and src_hint != src_channel:
                 await message.reply_text(
                     "❌ <b>Wrong channel!</b>\n\n"
@@ -1199,6 +1253,7 @@ async def capture_user_input(client, message):
                 )
                 return
 
+            # ---- Validate: check that skip/start msg actually exists in source ----
             if skip_id > 0:
                 valid = await validate_msg_in_channel(client, src_channel, skip_id)
                 if not valid:
@@ -1209,6 +1264,7 @@ async def capture_user_input(client, message):
                     )
                     return
 
+            # ---- Validate end message if range was given ----
             if end_id is not None:
                 valid_end = await validate_msg_in_channel(client, src_channel, end_id)
                 if not valid_end:
@@ -1227,7 +1283,10 @@ async def capture_user_input(client, message):
             except:
                 pass
             try:
-                await client.delete_messages(session["chat_id"], session["msg_id"])
+                await client.delete_messages(
+                    session["chat_id"],
+                    session["msg_id"]
+                )
             except:
                 pass
             progress_msg = await client.send_message(
