@@ -6,12 +6,11 @@ from pyrogram import Client, errors
 from pyrogram.errors import FloodWait
 from info import *
 from body.database import *
-from body.Caption import global_caption_worker
+from body.Caption import caption_worker
 from body.file_forward import on_bot_start
 
-# Global fallback caption workers (catch unowned/orphan jobs)
-# Per-user workers are spawned dynamically in Caption.py
-GLOBAL_CAPTION_WORKERS = 8
+# Exactly 30 caption workers like the original working bot
+EXECUTORS = 30
 
 PLUGIN_ROOT = "body"
 
@@ -41,9 +40,9 @@ class Bot(Client):
         await ensure_forward_indexes()
         await recover_stuck_jobs()
 
-        # Start global fallback caption workers
-        for _ in range(GLOBAL_CAPTION_WORKERS):
-            asyncio.create_task(global_caption_worker(self))
+        # Start 30 caption workers — exactly like the original working bot
+        for _ in range(EXECUTORS):
+            asyncio.create_task(caption_worker(self))
 
         me = await self.get_me()
         self.force_channel = FORCE_SUB
@@ -61,8 +60,7 @@ class Bot(Client):
         print(f"{me.first_name} is started ✨")
 
         try:
-            admin_id = ADMIN[0] if isinstance(ADMIN, (list, tuple)) else ADMIN
-            await self.send_message(admin_id, f"**{me.first_name} started ✨**")
+            await self.send_message(ADMIN, f"**{me.first_name} started ✨**")
         except Exception:
             pass
 
