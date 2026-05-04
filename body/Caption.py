@@ -72,8 +72,25 @@ async def _maintenance_block(client, message_or_query) -> bool:
 
 
 # ─────────────────────────────────────────────
-#  Per-user caption worker management
+#  Caption workers  (IDENTICAL to original working bot)
+#  caption_worker: 30 concurrent workers, each picks any pending job.
+#  Per-user worker: bonus fast-lane for known channel owners.
 # ─────────────────────────────────────────────
+async def caption_worker(client: Client):
+    """
+    Primary worker — EXACTLY as in the original working bot.
+    30 of these are started at startup. Each loops forever,
+    picking any pending caption job and editing the message.
+    """
+    while True:
+        job = await fetch_channel_job()
+        if not job:
+            await asyncio.sleep(0.5)
+            continue
+        await _process_caption_job(client, job)
+
+
+# Per-user fast-lane (bonus — started dynamically when a channel post arrives)
 def _ensure_user_caption_worker(client: Client, user_id: int):
     task = _USER_CAPTION_TASKS.get(user_id)
     if task is None or task.done():
@@ -82,7 +99,7 @@ def _ensure_user_caption_worker(client: Client, user_id: int):
 
 
 async def _user_caption_worker(client: Client, user_id: int):
-    """Dedicated worker draining ONE user's caption queue then exits."""
+    """Bonus per-user worker — drains one user's queue fast then exits."""
     idle = 0
     while True:
         job = await fetch_caption_job_for_user(user_id)
@@ -97,14 +114,8 @@ async def _user_caption_worker(client: Client, user_id: int):
         await _process_caption_job(client, job)
 
 
-async def global_caption_worker(client: Client):
-    """Global fallback workers — catch orphan / unowned jobs. Runs forever."""
-    while True:
-        job = await fetch_channel_job()
-        if not job:
-            await asyncio.sleep(0.5)
-            continue
-        await _process_caption_job(client, job)
+# Alias so bot.py can import either name
+global_caption_worker = caption_worker
 
 
 # ─────────────────────────────────────────────
@@ -768,21 +779,27 @@ async def reCap(client, msg):
     if "<" in new_caption and ">" in new_caption:
         new_caption = sanitize_caption_html(new_caption)
 
-    # ── Find owner of this channel for per-user worker ──────────────────
-    user_doc  = await users.find_one({"channels.channel_id": chnl_id})
-    owner_uid = user_doc["_id"] if user_doc else None
+    # Build reply_markup from url_buttons (same as original bot)
+    reply_markup = None
+    if url_buttons:
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row]
+            for row in url_buttons
+        ])
 
     await enqueue_caption({
         "chat_id":    chnl_id,
         "message_id": msg.id,
         "caption":    new_caption,
-        "url_buttons":url_buttons or [],
-        "user_id":    owner_uid,
+        "url_buttons": url_buttons or [],
+        "user_id":    msg.from_user.id if msg.from_user else None,
     })
 
-    # Spin up per-user worker if owner is known; global workers handle rest
-    if owner_uid:
-        _ensure_user_caption_worker(client, owner_uid)
+    # Bonus: spin up per-user fast-lane worker if owner known from message
+    # Primary processing is handled by the 30 global caption_workers
+    user_id = msg.from_user.id if msg.from_user else None
+    if user_id:
+        _ensure_user_caption_worker(client, user_id)
 
 
 # ─────────────────────────────────────────────
