@@ -61,6 +61,9 @@ ANIM_FRAMES = [
 # Rate-limit progress edits: update UI every N completions
 _PROGRESS_EVERY = 3
 _session_done_count: dict[str, int] = defaultdict(int)
+# Tracks sessions whose completion message has already been sent.
+# Prevents multiple workers all racing to send "✅ Forwarding completed".
+_session_completed: set = set()
 
 
 # ── startup hook ──────────────────────────────────────────────────────────────
@@ -489,9 +492,29 @@ async def forward_worker(client: Client):
 
 # ── rate-limited progress update ──────────────────────────────────────────────
 async def _maybe_update_progress(client: Client, job: dict):
-    """Only edit the progress message every _PROGRESS_EVERY completions."""
+    """
+    Update the progress message after each forwarded file.
+
+    Race-condition fix:
+    Before this fix, when multiple workers finished the last few jobs
+    simultaneously, they all saw remaining==0 and all tried to send the
+    completion message, causing:
+      (a) duplicate "✅ Forwarding completed" messages, or
+      (b) a worker that finished just BEFORE the last one sending the
+          completion message early, then the final worker overwriting it
+          with a stale "in-progress" edit.
+
+    Fix: _session_completed is a set that is checked+updated atomically
+    (Python's GIL makes single-dict/set operations thread-safe in asyncio).
+    Only the first worker to see remaining==0 sends the completion message.
+    All subsequent workers for the same session bail out immediately.
+    """
     session = job.get("session_id")
     if not session or session in CANCELLED_SESSIONS:
+        return
+
+    # Already completed by another worker for this session
+    if session in _session_completed:
         return
 
     _session_done_count[session] += 1
@@ -500,9 +523,16 @@ async def _maybe_update_progress(client: Client, job: dict):
     remaining = await forward_queue.count_documents({"session_id": session})
 
     if remaining == 0:
-        # Always send the final completion message
-        _session_done_count.pop(session, None)
+        # Guard: only the first worker to reach this point sends the final msg.
+        # Check-then-set is safe here because asyncio is single-threaded and
+        # there is no await between the check and the add.
+        if session in _session_completed:
+            return
+        _session_completed.add(session)
+
+        final_done = _session_done_count.pop(session, done)
         CANCELLED_SESSIONS.discard(session)
+
         try:
             await client.edit_message_text(
                 job["chat_id"],
@@ -511,15 +541,24 @@ async def _maybe_update_progress(client: Client, job: dict):
                     "✅ <b>Forwarding completed</b>\n\n"
                     f"📤 <b>Source:</b> {job['source_title']}\n"
                     f"📥 <b>Destination:</b> {job['destination_title']}\n\n"
-                    f"📦 <b>Files forwarded:</b> <code>{done}</code>"
+                    f"📦 <b>Files forwarded:</b> <code>{final_done}</code>"
                 ),
             )
         except Exception:
             pass
+        # Delayed cleanup so any late-arriving workers still see it and bail
+        async def _cleanup_session():
+            await asyncio.sleep(30)
+            _session_completed.discard(session)
+        asyncio.create_task(_cleanup_session())
         return
 
     # Rate-limit intermediate updates to avoid FloodWait on edit_message_text
     if done % _PROGRESS_EVERY != 0:
+        return
+
+    # Don't overwrite a completion message that was just sent
+    if session in _session_completed:
         return
 
     frame = ANIM_FRAMES[int(time.time()) % len(ANIM_FRAMES)]
@@ -562,6 +601,7 @@ async def ff_cancel(client, query):
         sent      = max(total - remaining, 0)
         await forward_queue.delete_many({"session_id": session_id})
         _session_done_count.pop(session_id, None)
+        _session_completed.discard(session_id)
         await query.message.edit_text(
             "🛑 <b>Forwarding cancelled</b>\n\n"
             f"📦 <b>Files sent:</b> <code>{sent}</code>\n"
