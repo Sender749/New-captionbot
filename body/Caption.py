@@ -589,18 +589,27 @@ async def reCap(client, msg):
     prefix = cap_doc.get("prefix", "") or ""
     replace_raw = cap_doc.get("replace_words", None)
     url_buttons = cap_doc.get("url_buttons", [])
-    # Extract info from caption + filename
-    audio_lang_list = extract_audio_languages(f"{file_name} {default_caption}")
+    # Keep original filename (with extension/dots) for smart metadata extraction
+    original_file_name = ""
+    for file_type in ("video", "audio", "document", "voice"):
+        obj = getattr(msg, file_type, None)
+        if obj:
+            original_file_name = getattr(obj, "file_name", None) or ""
+            break
+
+    # Extract info from caption + filename (use original for better metadata extraction)
+    combined_raw = f"{original_file_name} {default_caption}"
+    audio_lang_list = extract_audio_languages(combined_raw)
     language = " + ".join(audio_lang_list) if audio_lang_list else ""
-    year = extract_year(default_caption) or extract_year(file_name) or ""
+    year = extract_year(default_caption) or extract_year(original_file_name) or ""
     # Build caption
     try:
         raw_file_name = normalize_series_name(file_name)
-        # Parse all metadata once
-        file_info = parse_file_info(raw_file_name, default_caption)
+        # Parse all metadata once – use original filename to preserve extension dots
+        file_info = parse_file_info(original_file_name or raw_file_name, default_caption)
         smart_file_name = ""
         if "{smart_file_name}" in cap_template:
-            smart_file_name = build_smart_filename(raw_file_name, default_caption)
+            smart_file_name = build_smart_filename(original_file_name or raw_file_name, default_caption)
         new_caption = cap_template.format(
             file_name=raw_file_name,
             smart_file_name=smart_file_name,
@@ -655,42 +664,85 @@ async def reCap(client, msg):
         "user_id": msg.from_user.id if msg.from_user else None
     })
 
-# ---------------- Smart File Name Helper ----------------
+# ═══════════════════════════════════════════════════════════════════
+#  Smart File Name Helper  –  complete rewrite for movie/series/anime
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Language tables ──────────────────────────────────────────────
 LANG_LIST = [
     "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada",
     "Marathi", "Gujarati", "Bengali", "Punjabi", "Urdu",
     "Japanese", "Korean", "Chinese", "Spanish", "French", "German",
-    "Italian", "Russian"
+    "Italian", "Russian", "Arabic", "Dutch", "Portuguese", "Turkish",
 ]
-# Short lang codes found in filenames like "Hin Eng"
+
 LANG_CODE_MAP = {
     "hin": "Hindi", "eng": "English", "tam": "Tamil", "tel": "Telugu",
     "mal": "Malayalam", "kan": "Kannada", "mar": "Marathi", "guj": "Gujarati",
     "ben": "Bengali", "pan": "Punjabi", "urd": "Urdu",
     "jpn": "Japanese", "kor": "Korean", "chi": "Chinese",
     "spa": "Spanish", "fre": "French", "ger": "German",
-    "ita": "Italian", "rus": "Russian"
+    "ita": "Italian", "rus": "Russian", "ara": "Arabic",
+    "dut": "Dutch",   "por": "Portuguese", "tur": "Turkish",
 }
-QUALITY_LIST = ["2160p", "4K", "1080p", "720p", "480p", "360p"]
-SOURCE_LIST = ["WEB-DL", "WEBRip", "BluRay", "Blu-Ray", "HDRip", "DVDRip", "HDTV", "AMZN", "NF", "DSNP"]
-VIDEO_CODEC_LIST = ["HEVC", "x265", "x264", "AV1", "H.264", "H.265"]
-AUDIO_CODEC_LIST = ["DD5.1", "DD+", "DDP5.1", "DDP", "DTS-HD", "DTS", "Atmos", "AAC", "AC3", "MP3"]
-EXT_LIST = ["mkv", "mp4", "avi", "webm", "mov"]
 
-# Tags that mark ESub/HSub/Sub presence
+# Map lowercase full-word language → canonical name (for full-word matching in filenames)
+_LANG_LOWER_MAP = {lang.lower(): lang for lang in LANG_LIST}
+
+# ── Codec / Quality / Source tables ──────────────────────────────
+QUALITY_LIST = ["2160p", "4K", "UHD", "1080p", "720p", "480p", "360p", "240p"]
+SOURCE_LIST  = [
+    "WEB-DL", "WEBRip", "BluRay", "Blu-Ray", "BDRip",
+    "HDRip", "DVDRip", "HDTV", "AMZN", "NF", "DSNP",
+    "HMAX", "ATVP", "PCOK", "SonyLIV", "ZEE5", "Hotstar", "JioCinema",
+]
+VIDEO_CODEC_LIST = ["HEVC", "x265", "x264", "AVC", "AV1", "H.264", "H.265", "VP9"]
+AUDIO_CODEC_LIST = [
+    "DD5.1", "DD+5.1", "DD+", "DDP5.1", "DDP", "Atmos",
+    "DTS-HD", "DTS-X", "DTS", "TrueHD",
+    "AAC5.1", "AAC", "AC3", "MP3", "FLAC", "OPUS",
+]
+EXT_LIST = ["mkv", "mp4", "avi", "webm", "mov", "m4v", "ts"]
+
+# ── Sub / ESub patterns ──────────────────────────────────────────
 ESUB_RE = re.compile(r'\bE\.?Subs?\b', re.I)
 HSUB_RE = re.compile(r'\bH\.?Subs?\b', re.I)
-SUB_RE  = re.compile(r'\b(?:M\.?Subs?|MSub|Subs?|Subtitles?)\b', re.I)
+MSUB_RE = re.compile(r'\bM\.?Subs?\b', re.I)
+SUB_RE  = re.compile(r'\b(?:Subs?|Subtitles?)\b', re.I)
 
+# ── "subtitle <lang>" full-word patterns ─────────────────────────
+# Matches: "subtitle english", "subtitles hindi", "sub english", etc.
+_SUB_LANG_RE = re.compile(
+    r'\bsubtitles?\s+(' + '|'.join(re.escape(l) for l in LANG_LIST) + r')\b',
+    re.I
+)
+# Also: "english subtitle/sub", "hindi sub" etc.
+_LANG_SUB_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(l) for l in LANG_LIST) + r')\s+subtitles?\b',
+    re.I
+)
+
+# ── Content-type keywords ─────────────────────────────────────────
+_SERIES_RE   = re.compile(r'\b(?:Web\s*Series|TV\s*Series|Mini\s*Series|OTT\s*Series)\b', re.I)
+_MOVIE_RE    = re.compile(r'\b(?:South\s*Movie|UnCut\s*Movie|Hindi\s*Movie|Movie)\b', re.I)
+_UNCUT_RE    = re.compile(r'\bUnCut\b', re.I)
+_SOUTH_RE    = re.compile(r'\bSouth\b', re.I)
+_DUAL_RE     = re.compile(r'\bDual\s*Audio\b', re.I)
+_MULTI_RE    = re.compile(r'\bMulti\s*(?:Audio|Lang(?:uage)?)?\b', re.I)
+_COMPLETED_RE= re.compile(r'\bCompleted\b', re.I)
+_HD_RE       = re.compile(r'\bHD\b', re.I)
+
+# ── Helpers ───────────────────────────────────────────────────────
 def _norm(text: str) -> str:
     return re.sub(r'\s+', ' ', text.lower()).strip()
 
 def _clean_raw(text: str) -> str:
-    """Normalise separators for easier parsing."""
+    """Replace dots/underscores with spaces for easier regex matching."""
     return re.sub(r'[._]', ' ', text)
 
+# ── IMDB enrichment (best-effort, never blocks) ───────────────────
 def imdb_enrich_title(title: str, year: str):
-    if not title or not year or len(title) < 6:
+    if not title or not year or len(title) < 4:
         return title, year
     try:
         results = ia.search_movie(title)
@@ -701,220 +753,405 @@ def imdb_enrich_title(title: str, year: str):
         pass
     return title, year
 
+# ── Title + Year ─────────────────────────────────────────────────
 def extract_title_year(raw: str):
     """
-    Extract clean movie/show title and year.
-    Works for:
-      • "Lara Croft: Tomb Raider (2001) 480p …"
-      • "Himmatwar (Poojai) 2014 Dual Audio …"
-      • "Sangamarmar S01 (Ep.01-09) (2026) …"
-      • "The Lost Flowers of Alice Hart S01 E02 WebRip …"
+    Extract clean title and year from filename/caption.
+    Handles movies, series (S01 E02), anime, etc.
     """
     text = _clean_raw(raw)
-    # Find the first 4-digit year
+
+    # Find first plausible year (1900-2099)
     year_m = re.search(r'\b((?:19|20)\d{2})\b', text)
-    year = year_m.group(1) if year_m else ""
-    cut = year_m.start() if year_m else len(text)
+    year   = year_m.group(1) if year_m else ""
+    cut    = year_m.start()  if year_m else len(text)
+
     title_raw = text[:cut]
-    # Remove season/episode markers from end of title
-    title_raw = re.sub(
-        r'\s*\bS\d{1,3}\b.*$', '', title_raw,
-        flags=re.I
+
+    # Remove season/episode markers from the title portion
+    title_raw = re.sub(r'\s*\bS(?:eason)?\s*\d{1,3}\b.*$', '', title_raw, flags=re.I)
+    title_raw = re.sub(r'\s*\bEp?(?:isode)?\.?\s*\d{1,3}\b.*$', '', title_raw, flags=re.I)
+
+    # Noise words that often bleed into the title area
+    _TITLE_NOISE = (
+        r'480p|720p|1080p|2160p|4k|uhd|web[\s\-]?dl|webrip|bluray|blu[\s\-]ray|bdrip|'
+        r'hdrip|dvdrip|hdtv|amzn|nf|dsnp|hmax|'
+        r'x264|x265|hevc|avc|av1|h\.264|h\.265|'
+        r'esub|hsub|msub|sub|subtitle|'
+        r'dual[\s]?audio|multi[\s]?audio|'
+        r'uncut|south|bollywood|hollywood|'
+        r'hindi|english|tamil|telugu|malayalam|kannada|punjabi|bengali|marathi|urdu|'
+        r'japanese|korean|chinese|spanish|french|german|italian|russian'
     )
-    title_raw = re.sub(
-        r'\s*\bEp?\.?\d{1,3}\b.*$', '', title_raw,
-        flags=re.I
-    )
-    # Remove quality/codec/source noise leftover
-    title_raw = re.sub(
-        r'\b(480p|720p|1080p|2160p|4k|web[- ]?dl|webrip|bluray|hdrip|x264|x265|hevc|av1|esub|hsub|sub|dual|multi|audio|hindi|english|tamil|telugu)\b',
-        '', title_raw, flags=re.I
-    )
-    # Remove parenthesised alt-title noise like "(Poojai)"
-    title_raw = re.sub(r'\([^)]{1,30}\)', '', title_raw)
-    # Strip trailing punctuation / junk
-    title_raw = re.sub(r'[\[\]()\-:,]+\s*$', '', title_raw.strip())
-    title = re.sub(r'\s{2,}', ' ', title_raw).strip().title()
+    title_raw = re.sub(rf'\b(?:{_TITLE_NOISE})\b', '', title_raw, flags=re.I)
+
+    # Remove bracketed alternate titles / release group noise like "(Poojai)" "(Clear)"
+    title_raw = re.sub(r'\([^)]{0,40}\)', '', title_raw)
+    title_raw = re.sub(r'\[[^\]]{0,40}\]', '', title_raw)
+
+    # Strip trailing punctuation / separators
+    title_raw = re.sub(r'[\[\]()\-–:,|{}\s]+$', '', title_raw.strip())
+    title_raw = re.sub(r'^[\[\]()\-–:,|{}\s]+', '', title_raw.strip())
+
+    title = re.sub(r'\s{2,}', ' ', title_raw).strip()
+    # Title-case but preserve short connectors
+    title = title.title() if title else ""
     return title, year
 
-def detect_media_type(text: str) -> str:
-    if re.search(r'\bS\d{1,3}\s*(?:E\d|Ep)', text, re.I):
-        return "series"
-    if re.search(r'\bS\d{1,3}\b', text, re.I) and re.search(r'\bE\d{1,3}\b', text, re.I):
-        return "series"
-    if re.search(r'\bEp?\.?\s*\d+', text, re.I):
-        return "series"
-    if re.search(r'\banime\b', text, re.I):
-        return "anime"
-    return "movie"
-
+# ── Season / Episode ─────────────────────────────────────────────
 def extract_season_episode(text: str):
     """
+    Returns (season_str, episode_str) as display strings.
     Handles:
-      S01 (Ep.01-09)  →  S01, Ep.01-09
-      S01 E02         →  S01, E02
-      S01E07          →  S01, E07
-    Returns (season_str, episode_str) both as display strings.
+      S01 E02 / S01E07 / Season 1 Episode 2
+      S01 (Ep.01-09) / Ep.01-05 (range)
+      Single Ep.07 / EP07 / E07
     """
-    text = re.sub(r'[._]', ' ', text)
-    season = ""
+    t = re.sub(r'[._]', ' ', text)
+    season  = ""
     episode = ""
 
-    s_m = re.search(r'\bS(?:eason)?\s*0*(\d+)\b', text, re.I)
+    # Season
+    s_m = re.search(r'\bS(?:eason)?\s*0*(\d{1,3})\b', t, re.I)
     if s_m:
         season = f"S{int(s_m.group(1)):02d}"
 
-    # Episode range like (Ep.01-09) or Ep.01-09
-    r_m = re.search(r'\bEp?\.?\s*0*(\d+)\s*[-–to]+\s*0*(\d+)\b', text, re.I)
+    # Episode range: Ep.01-09 / (Ep 1-9) / E01-E09
+    r_m = re.search(
+        r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\s*[-–to]+\s*(?:Ep?\.?\s*)?0*(\d{1,3})\b',
+        t, re.I
+    )
     if r_m:
         episode = f"Ep.{int(r_m.group(1)):02d}-{int(r_m.group(2)):02d}"
         return season, episode
 
-    # Single episode: E07 / EP07 / Ep.07
-    e_m = re.search(r'\bEp?\.?\s*0*(\d+)\b', text, re.I)
+    # Single episode
+    e_m = re.search(r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\b', t, re.I)
     if e_m:
         episode = f"E{int(e_m.group(1)):02d}"
 
     return season, episode
 
+# ── Language vs Subtitle separation ──────────────────────────────
+def _extract_subtitle_languages(text: str) -> set:
+    """
+    Return set of language names that appear explicitly as subtitle references.
+    Patterns detected:
+      • "subtitle english" / "subtitles hindi"
+      • "english subtitle" / "hindi subs"
+      • ESub / HSub / MSub (generic, no specific language)
+    """
+    sub_langs: set = set()
+    for m in _SUB_LANG_RE.finditer(text):
+        sub_langs.add(m.group(1).title())
+    for m in _LANG_SUB_RE.finditer(text):
+        sub_langs.add(m.group(1).title())
+    return sub_langs
+
 def extract_audio_languages(text: str) -> list:
     """
-    Extracts languages from patterns like:
-      Dual Audio (Hindi + Tamil)
-      Hindi + English
-      [Hindi or English]
-      Hin Eng  (3-letter codes)
+    Extract ALL languages present in the filename/caption.
+
+    Audio languages and subtitle languages are kept SEPARATE in the output —
+    subtitles get their own tag via extract_subtitle_tag(). This function
+    always returns every language it finds regardless of whether any of them
+    also appear in a subtitle reference, because a file can have both audio
+    AND subtitles in the same language (e.g. English audio + English ESub).
+
+    Handles:
+      • Full words:  Hindi, English, Tamil …
+      • 3-letter codes: Hin, Eng, Tam …
+      • Dual-audio blocks: (Hindi + Telugu), {Hindi (Clear) + Telugu}
+      • Standalone: "Hindi 480p", "ironman 2003 English hindi 480p subtitle english"
     """
-    found = []
-    # Long names first
+    found: list = []
+
+    # Match full language names (case-insensitive, whole-word)
     for lang in LANG_LIST:
         if re.search(rf'\b{re.escape(lang)}\b', text, re.I):
             found.append(lang)
-    # 3-letter codes (only if no long names found yet)
+
+    # Match 3-letter codes only if no full names found yet
     if not found:
         for code, lang in LANG_CODE_MAP.items():
             if re.search(rf'\b{code}\b', text, re.I) and lang not in found:
                 found.append(lang)
-    return list(dict.fromkeys(found))
+
+    return list(dict.fromkeys(found))  # preserve order, dedupe
 
 def extract_subtitle_tag(text: str) -> str:
     """
-    Returns ESub / HSub / MSub / Sub based on filename/caption tags.
-    Priority: ESub > HSub > Sub
+    Returns a subtitle tag from the filename/caption.
+    Priority: ESub > HSub > MSub > Sub
+
+    Also handles full-word patterns like "subtitle english" → ESub,
+    and language-prefixed: "english sub" → ESub.
     """
+    # Check explicit ESub/HSub/MSub/Sub tags first
     if ESUB_RE.search(text):
         return "ESub"
     if HSUB_RE.search(text):
         return "HSub"
+    if MSUB_RE.search(text):
+        return "MSub"
+
+    # Check if any language is explicitly marked as a subtitle
+    sub_langs = _extract_subtitle_languages(text)
+    if sub_langs:
+        # Determine tag type from explicit sub language context
+        # "subtitle english" → ESub (English sub = External sub convention)
+        # We just return "ESub" as the generic external subtitle marker
+        return "ESub"
+
     if SUB_RE.search(text):
         return "MSub"
     return ""
 
+# ── Individual field extractors ───────────────────────────────────
 def extract_quality(text: str) -> str:
+    """Returns resolution/quality tag like 1080p, 720p, 4K …"""
     for q in QUALITY_LIST:
         if re.search(rf'\b{re.escape(q)}\b', text, re.I):
             return q
     return ""
 
+def extract_resolution(text: str) -> str:
+    """Alias for extract_quality – for {resolution} placeholder."""
+    return extract_quality(text)
+
 def extract_source(text: str) -> str:
+    """Returns source tag like WEB-DL, BluRay, HDRip …"""
     for s in SOURCE_LIST:
         if re.search(rf'\b{re.escape(s)}\b', text, re.I):
             return s
     return ""
 
 def extract_video_codec(text: str) -> str:
+    """Returns video codec like HEVC, x264, AV1 …"""
     for c in VIDEO_CODEC_LIST:
         if re.search(rf'\b{re.escape(c)}\b', text, re.I):
             return c
     return ""
 
 def extract_audio_codec(text: str) -> str:
-    """Extracts audio codec, including patterns like DD5.1-224Kbps."""
-    # Full patterns with bitrate first
-    m = re.search(r'\b(DD5\.1|DD\+|DDP5\.1|DDP|DTS-HD|DTS|Atmos|AAC|AC3|MP3)(?:[- ]\d+Kbps)?\b', text, re.I)
+    """
+    Extracts audio codec, including bitrate-suffixed patterns.
+    Examples: DD5.1-224Kbps → DD5.1,  DDP5.1 → DDP5.1
+    """
+    m = re.search(
+        r'\b(DD\+?5\.1|DDP5\.1|DD\+|DDP|DTS-HD|DTS-X|DTS|TrueHD|Atmos|'
+        r'AAC5\.1|AAC|AC3|MP3|FLAC|OPUS)(?:[- ]\d+[Kk]bps)?\b',
+        text, re.I
+    )
     if m:
         return m.group(1).upper()
     return ""
 
 def extract_extension(text: str) -> str:
-    m = re.search(r'\.(mkv|mp4|avi|webm|mov)\b', text, re.I)
+    """Returns file extension like mkv, mp4, avi …"""
+    m = re.search(r'\.(mkv|mp4|avi|webm|mov|m4v|ts)\b', text, re.I)
     if m:
         return m.group(1).lower()
-    # Fallback: bare word
     for e in EXT_LIST:
         if re.search(rf'\b{e}\b', text, re.I):
             return e.lower()
     return ""
 
-def extract_resolution(text: str) -> str:
-    """Same as quality but returns the value for {resolution} placeholder."""
-    return extract_quality(text)
+# ── Dual-audio / multi label helper ──────────────────────────────
+def _format_audio_label(langs: list, text: str) -> str:
+    """
+    Build the audio language string, preserving DD5.1-style annotations.
+    Examples:
+      ["Hindi", "Telugu"]  + has DD5.1  → "Hindi DD5.1-224Kbps + Telugu"
+      ["Hindi", "Tamil"]   + no codec   → "Hindi + Tamil"
+    """
+    if not langs:
+        return ""
 
+    # Check if there is a bitrate-annotated codec in the raw text
+    # e.g. "DD5.1-224Kbps"
+    bitrate_m = re.search(
+        r'\b(DD\+?5\.1|DDP5\.1|DD\+|DDP|DTS-HD|DTS-X|DTS|TrueHD|Atmos|AAC5\.1|AAC|AC3)'
+        r'(?:[- ](\d+[Kk]bps))?\b',
+        text, re.I
+    )
+    acodec_str = ""
+    if bitrate_m:
+        codec_part  = bitrate_m.group(1).upper()
+        bitrate_part = bitrate_m.group(2)
+        acodec_str  = f" {codec_part}-{bitrate_part}" if bitrate_part else f" {codec_part}"
+
+    if len(langs) == 1:
+        return f"{langs[0]}{acodec_str}"
+
+    # First language gets the codec annotation (convention from examples)
+    parts = [f"{langs[0]}{acodec_str}"] + langs[1:]
+    return " + ".join(parts)
+
+# ── Media-type detection ──────────────────────────────────────────
+def detect_media_type(text: str) -> str:
+    """Detect whether content is a movie, series, or anime."""
+    if re.search(r'\bS\d{1,3}\s*(?:E\d|Ep)', text, re.I):
+        return "series"
+    if re.search(r'\bS\d{1,3}\b', text, re.I) and re.search(r'\bE\d{1,3}\b', text, re.I):
+        return "series"
+    if re.search(r'\bEp?\.?\s*\d{1,3}', text, re.I):
+        return "series"
+    if re.search(r'\bAnime\b', text, re.I):
+        return "anime"
+    return "movie"
+
+# ── Master parser ─────────────────────────────────────────────────
 def parse_file_info(filename: str, caption: str) -> dict:
     """
     Parse ALL metadata from filename + caption combined.
-    Returns a dict with all individual fields for placeholders.
+    Returns a dict with all individual fields for template placeholders.
     """
     raw = f"{filename} {caption}"
-    title, year = extract_title_year(raw)
-    title, year = imdb_enrich_title(title, year)
+
+    title, year    = extract_title_year(raw)
+    title, year    = imdb_enrich_title(title, year)
     season, episode = extract_season_episode(raw)
-    audio_langs = extract_audio_languages(raw)
-    subtitle = extract_subtitle_tag(raw)
-    quality = extract_quality(raw)
-    source = extract_source(raw)
-    vcodec = extract_video_codec(raw)
-    acodec = extract_audio_codec(raw)
-    ext = extract_extension(raw)
+    audio_langs    = extract_audio_languages(raw)
+    subtitle       = extract_subtitle_tag(raw)
+    quality        = extract_quality(raw)
+    source         = extract_source(raw)
+    vcodec         = extract_video_codec(raw)
+    acodec         = extract_audio_codec(raw)
+    ext            = extract_extension(raw)
+
+    audio_str = _format_audio_label(audio_langs, raw) if audio_langs else ""
 
     return {
-        "title": title,
-        "year": year,
-        "season": season,
-        "episode": episode,
-        "audio": " + ".join(audio_langs) if audio_langs else "",
-        "subtitle": subtitle,
-        "quality": quality,
+        "title":      title,
+        "year":       year,
+        "season":     season,
+        "episode":    episode,
+        "audio":      audio_str,
+        "subtitle":   subtitle,
+        "quality":    quality,
         "resolution": quality,   # alias
-        "source": source,
-        "vcodec": vcodec,
-        "acodec": acodec,
-        "extension": ext,
+        "source":     source,
+        "vcodec":     vcodec,
+        "acodec":     acodec,
+        "extension":  ext,
     }
 
+# ── Smart filename builder ────────────────────────────────────────
 def build_smart_filename(filename: str, caption: str) -> str:
     """
-    Build a clean, well-structured display name from filename + caption.
-    Format: Title [Season Episode] (Year) Audio Subtitle Quality Source Codec.ext
+    Build a clean, perfectly structured display caption from filename + caption.
+
+    Output format (mirrors the given examples):
+      Title (Year) (Audio) Dual Audio [UnCut] [South] [Media-Type Label] [HD] Resolution [ESub].ext
+
     Examples:
-      Lara Croft Tomb Raider (2001) Hindi+English ESub 480p BluRay x264
-      Sangamarmar S01 Ep.01-09 (2026) Hindi ESub 1080p HEVC
-      The Lost Flowers Of Alice Hart S01 E02 Hindi+English ESub 480p WEBRip
+      Court - State Vs A Nobody (2025) (Hindi DD5.1-224Kbps + Telugu) Dual Audio UnCut South Movie HD 1080p ESub.mkv
+      Sapne Vs Everyone S01 (Ep.01-05) (2023) Hindi Completed Web Series HEVC 480p ESub.mkv
+      Campus Beats S06 E07 (2026) Hindi Web Series HEVC 480p ESub.mkv
+      Loki S01 E02 Hindi Web Series HEVC 480p ESub.mkv
     """
+    raw  = f"{filename} {caption}"
     info = parse_file_info(filename, caption)
-    parts = []
+
+    media_type = detect_media_type(raw)
+
+    parts: list = []
+
+    # 1. Title
     if info["title"]:
         parts.append(info["title"])
+
+    # 2. Season + Episode  (for series/anime)
     if info["season"] or info["episode"]:
         se = f"{info['season']} {info['episode']}".strip()
         parts.append(se)
+
+    # 3. Year in parentheses
     if info["year"]:
         parts.append(f"({info['year']})")
-    if info["audio"]:
-        parts.append(info["audio"])
-    if info["subtitle"]:
-        parts.append(info["subtitle"])
-    if info["quality"]:
-        parts.append(info["quality"])
-    if info["source"]:
-        parts.append(info["source"])
+
+    # 4. Audio/language block
+    #    If multiple languages → wrap in parentheses like the examples
+    audio_langs = extract_audio_languages(raw)
+    if audio_langs:
+        audio_label = _format_audio_label(audio_langs, raw)
+        if len(audio_langs) > 1:
+            parts.append(f"({audio_label})")
+        else:
+            parts.append(audio_label)
+
+    # 5. Dual Audio / Multi Audio label
+    if _DUAL_RE.search(raw) and len(audio_langs) > 1:
+        parts.append("Dual Audio")
+    elif _MULTI_RE.search(raw) and len(audio_langs) > 2:
+        parts.append("Multi Audio")
+
+    # 6. UnCut flag
+    if _UNCUT_RE.search(raw):
+        parts.append("UnCut")
+
+    # 7. South flag (South Movie)
+    if _SOUTH_RE.search(raw) and media_type == "movie":
+        parts.append("South")
+
+    # 8. Completed flag (for web series)
+    completed = bool(_COMPLETED_RE.search(raw))
+
+    # 9. Media-type label
+    if media_type == "series":
+        if _SERIES_RE.search(raw):
+            # Keep the exact label used in source (Web Series / TV Series …)
+            m = _SERIES_RE.search(raw)
+            lbl = re.sub(r'\s+', ' ', m.group(0).strip().title())
+            if completed:
+                parts.append(f"Completed {lbl}")
+            else:
+                parts.append(lbl)
+        else:
+            if completed:
+                parts.append("Completed Web Series")
+            else:
+                parts.append("Web Series")
+    elif media_type == "anime":
+        parts.append("Anime")
+    else:  # movie
+        if _SOUTH_RE.search(raw):
+            parts.append("Movie")   # "South Movie" already built as "South … Movie"
+        elif _MOVIE_RE.search(raw):
+            m = _MOVIE_RE.search(raw)
+            parts.append(re.sub(r'\s+', ' ', m.group(0).strip().title()))
+        # else: bare movie – no label needed
+
+    # 10. HD flag
+    if _HD_RE.search(raw):
+        parts.append("HD")
+
+    # 11. Video codec (HEVC, x264 …)
     if info["vcodec"]:
         parts.append(info["vcodec"])
-    if info["acodec"]:
-        parts.append(info["acodec"])
+
+    # 12. Resolution / Quality
+    if info["quality"]:
+        parts.append(info["quality"])
+
+    # 13. Subtitle tag
+    if info["subtitle"]:
+        parts.append(info["subtitle"])
+
+    # 14. Extension
     if info["extension"]:
-        parts.append(info["extension"])
-    return " ".join(parts).strip()
+        parts.append(f".{info['extension']}")
+
+    # Join: extension is glued without space, everything else space-separated
+    result = ""
+    for p in parts:
+        if p.startswith("."):
+            result = result.rstrip() + p
+        else:
+            result = f"{result} {p}" if result else p
+
+    return result.strip()
 
 
 # ---------------- Helper functions ----------------
