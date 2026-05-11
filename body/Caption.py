@@ -269,25 +269,127 @@ async def ff_start(client, message):
         
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("admin"))
 async def admin_help(client, message):
-    text = "⚙️ Scheduler: Per-channel & per-session isolated\nFloodWait-safe"
-    await message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True
+    bot = await client.get_me()
+    text = (
+        f"👑 <b>Admin Panel — @{bot.username}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "📊 <b>INFO &amp; MONITORING</b>\n"
+        "┌ /admin — Show this admin command list\n"
+        "├ /stats — Full bot statistics &amp; DB info\n"
+        "└ /queue — Live caption &amp; forward queue status\n\n"
+
+        "📢 <b>BROADCAST</b>\n"
+        "┌ /broadcast — Broadcast a message to all users\n"
+        "└   <i>(reply to any message to broadcast it)</i>\n\n"
+
+        "🗃 <b>DUMP CHANNEL CONTROL</b>\n"
+        "┌ /dump_skip <code>-100xxx</code> — Skip dump for a channel\n"
+        "└ /remove_dump <code>-100xxx</code> — Remove dump skip for a channel\n\n"
+
+        "🗄 <b>DATABASE</b>\n"
+        "└ /reset — ⚠️ Wipe ALL users, channels &amp; settings from DB\n\n"
+
+        "🔄 <b>BOT CONTROL</b>\n"
+        "└ /restart — Restart the bot process\n\n"
+
+        "📤 <b>FILE FORWARDING</b>\n"
+        "└ /file_forward — Start a file forward session\n"
+        "    <i>→ Pick source → destination → range (or 0 for all)</i>\n\n"
+
+        "⚙️ <b>CHANNEL SETTINGS</b>\n"
+        "└ /settings — Manage your added channels\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔐 All commands above are admin-only."
     )
+    await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("stats"))
 async def bot_stats(client, message):
-    pending = await queue_col.count_documents({"status": "pending"})
-    processing = await queue_col.count_documents({"status": "processing"})
-    users_count = await total_user()
-    text = (
-        "📊 <b>BOT STATS</b>\n\n"
-        f"• Users: <code>{users_count}</code>\n"
-        f"• Pending Jobs: <code>{pending}</code>\n"
-        f"• Processing Jobs: <code>{processing}</code>\n"
-    )
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
+    loading = await message.reply_text("📊 Fetching stats…")
+    try:
+        # ── Queue counts ─────────────────────────────────────────
+        cap_pending    = await queue_col.count_documents({"status": "pending"})
+        cap_processing = await queue_col.count_documents({"status": "processing"})
+        cap_done_today = await queue_col.count_documents({})   # total in queue (incl done)
+        fwd_pending    = await forward_queue.count_documents({"status": "pending"})
+        fwd_processing = await forward_queue.count_documents({"status": "processing"})
+
+        # ── User / Channel DB counts ──────────────────────────────
+        users_count    = await total_user()
+        channels_count = await chnl_ids.count_documents({})
+        dump_skip_count = await chnl_ids.count_documents({"dump_skip": True})
+
+        # ── Channels where bot is admin ───────────────────────────
+        all_channel_docs = await users.aggregate([
+            {"$unwind": "$channels"},
+            {"$group": {"_id": "$channels.channel_id",
+                        "title": {"$first": "$channels.channel_title"}}}
+        ]).to_list(length=None)
+
+        admin_channels = []
+        for doc in all_channel_docs[:30]:   # cap at 30 to avoid flood
+            ch_id = doc["_id"]
+            title = doc.get("title", str(ch_id))
+            try:
+                m = await client.get_chat_member(ch_id, "me")
+                if _is_admin_member(m):
+                    try:
+                        chat = await client.get_chat(ch_id)
+                        title = chat.title or title
+                        link  = f"https://t.me/{chat.username}" if getattr(chat, "username", None) else None
+                        admin_channels.append((title, ch_id, link))
+                    except Exception:
+                        admin_channels.append((title, ch_id, None))
+            except Exception:
+                pass
+
+        # ── Bot info ──────────────────────────────────────────────
+        bot     = await client.get_me()
+        bot_name = bot.first_name
+        bot_user = bot.username
+
+        # ── Build text ────────────────────────────────────────────
+        text = (
+            f"📊 <b>BOT STATISTICS</b>\n"
+            f"🤖 <b>{bot_name}</b>  (@{bot_user})\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            "👥 <b>USERS &amp; CHANNELS</b>\n"
+            f"  • Total users     : <code>{users_count}</code>\n"
+            f"  • DB channel docs : <code>{channels_count}</code>\n"
+            f"  • Dump-skip chans : <code>{dump_skip_count}</code>\n"
+            f"  • Bot is admin in : <code>{len(admin_channels)}</code> channel(s)\n\n"
+
+            "📝 <b>CAPTION QUEUE</b>\n"
+            f"  • Pending   : <code>{cap_pending}</code>\n"
+            f"  • Processing: <code>{cap_processing}</code>\n\n"
+
+            "📦 <b>FORWARD QUEUE</b>\n"
+            f"  • Pending   : <code>{fwd_pending}</code>\n"
+            f"  • Processing: <code>{fwd_processing}</code>\n\n"
+        )
+
+        if admin_channels:
+            text += "📡 <b>CHANNELS WHERE BOT IS ADMIN</b>\n"
+            for i, (title, ch_id, link) in enumerate(admin_channels[:20], 1):
+                if link:
+                    text += f"  {i}. <a href='{link}'>{title}</a> <code>({ch_id})</code>\n"
+                else:
+                    text += f"  {i}. {title} <code>({ch_id})</code>\n"
+            if len(admin_channels) > 20:
+                text += f"  … and {len(admin_channels) - 20} more\n"
+        else:
+            text += "📡 <b>CHANNELS WHERE BOT IS ADMIN:</b> None found\n"
+
+        text += "\n━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        await loading.edit_text(text, parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+    except Exception as e:
+        await loading.edit_text(f"❌ Error fetching stats:\n<code>{e}</code>",
+                                 parse_mode=ParseMode.HTML)
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command(["broadcast"]))
 async def broadcast(client, message):
@@ -411,85 +513,161 @@ async def reset_db(client, message):
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("queue"))
 async def queue_status(client, message):
-    cap_pending = await queue_col.count_documents({"status": "pending"})
-    cap_processing = await queue_col.count_documents({"status": "processing"})
-    cap_pipeline = [
-        {"$match": {"status": "pending"}},
-        {"$group": {"_id": "$chat_id", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 10}
-    ]
-    cap_lines = []
-    async for row in queue_col.aggregate(cap_pipeline):
-        ch_id = row["_id"]
-        count = row["count"]
-        try:
-            chat = await client.get_chat(ch_id)
-            name = chat.title
-        except:
-            name = "Unknown"
-        eta = int((count / DEFAULT_MAX_WORKERS) * DEFAULT_EDIT_DELAY)
-        cap_lines.append(
-            f"• <b>{name}</b>\n"
-            f"  ├ ID: <code>{ch_id}</code>\n"
-            f"  ├ Jobs: <code>{count}</code>\n"
-            f"  └ ETA (channel): ~{eta//60}m {eta%60}s"
+    loading = await message.reply_text("🔄 Fetching queue…")
+    try:
+        # ── Caption queue totals ──────────────────────────────────
+        cap_pending    = await queue_col.count_documents({"status": "pending"})
+        cap_processing = await queue_col.count_documents({"status": "processing"})
+
+        # ── Per-channel caption breakdown ─────────────────────────
+        cap_pipeline = [
+            {"$match": {"status": {"$in": ["pending", "processing"]}}},
+            {"$group": {
+                "_id":        "$chat_id",
+                "pending":    {"$sum": {"$cond": [{"$eq": ["$status", "pending"]},    1, 0]}},
+                "processing": {"$sum": {"$cond": [{"$eq": ["$status", "processing"]}, 1, 0]}},
+                "user_id":    {"$first": "$user_id"},
+            }},
+            {"$sort": {"pending": -1}},
+            {"$limit": 15},
+        ]
+        cap_lines = []
+        async for row in queue_col.aggregate(cap_pipeline):
+            ch_id      = row["_id"]
+            pending    = row["pending"]
+            processing = row["processing"]
+            total      = pending + processing
+            uid        = row.get("user_id")
+
+            # Channel name
+            try:
+                chat   = await client.get_chat(ch_id)
+                ch_name = chat.title or str(ch_id)
+            except Exception:
+                ch_name = str(ch_id)
+
+            # User info
+            user_str = ""
+            if uid:
+                try:
+                    u = await client.get_users(uid)
+                    uname = u.first_name or "Unknown"
+                    utag  = f"@{u.username}" if u.username else f"ID:{uid}"
+                    user_str = f"\n  ├ 👤 <a href='tg://user?id={uid}'>{uname}</a> ({utag})"
+                except Exception:
+                    user_str = f"\n  ├ 👤 ID: <code>{uid}</code>"
+
+            eta = int((pending / max(DEFAULT_MAX_WORKERS, 1)) * DEFAULT_EDIT_DELAY)
+            cap_lines.append(
+                f"• <b>{ch_name}</b> <code>({ch_id})</code>"
+                f"{user_str}\n"
+                f"  ├ 📥 Total: <code>{total}</code>  "
+                f"⏳ Pending: <code>{pending}</code>  "
+                f"⚙️ Processing: <code>{processing}</code>\n"
+                f"  └ ⏱ ETA: ~{eta // 60}m {eta % 60}s"
+            )
+
+        # ── Forward queue totals ──────────────────────────────────
+        f_pending    = await forward_queue.count_documents({"status": "pending"})
+        f_processing = await forward_queue.count_documents({"status": "processing"})
+
+        # ── Per-session forward breakdown ─────────────────────────
+        f_pipeline = [
+            {"$match": {"status": {"$in": ["pending", "processing"]}}},
+            {"$group": {
+                "_id": "$session_id",
+                "src":               {"$first": "$src"},
+                "dst":               {"$first": "$dst"},
+                "source_title":      {"$first": "$source_title"},
+                "destination_title": {"$first": "$destination_title"},
+                "user_id":           {"$first": "$user_id"},
+                "total":             {"$first": "$total"},
+                "pending":    {"$sum": {"$cond": [{"$eq": ["$status", "pending"]},    1, 0]}},
+                "processing": {"$sum": {"$cond": [{"$eq": ["$status", "processing"]}, 1, 0]}},
+            }},
+            {"$sort": {"pending": -1}},
+            {"$limit": 10},
+        ]
+        forward_lines = []
+        async for row in forward_queue.aggregate(f_pipeline):
+            src        = row["src"]
+            dst        = row["dst"]
+            pending    = row["pending"]
+            processing = row["processing"]
+            total_jobs = row.get("total", pending + processing)
+            done_jobs  = max(0, total_jobs - pending - processing)
+            uid        = row.get("user_id")
+            src_name   = row.get("source_title") or str(src)
+            dst_name   = row.get("destination_title") or str(dst)
+
+            # Fallback: try live chat title
+            if not row.get("source_title"):
+                try:
+                    src_name = (await client.get_chat(src)).title or src_name
+                except Exception:
+                    pass
+            if not row.get("destination_title"):
+                try:
+                    dst_name = (await client.get_chat(dst)).title or dst_name
+                except Exception:
+                    pass
+
+            # User info
+            user_str = ""
+            if uid:
+                try:
+                    u = await client.get_users(uid)
+                    uname = u.first_name or "Unknown"
+                    utag  = f"@{u.username}" if u.username else f"ID:{uid}"
+                    user_str = f"\n  ├ 👤 <a href='tg://user?id={uid}'>{uname}</a> ({utag})"
+                except Exception:
+                    user_str = f"\n  ├ 👤 ID: <code>{uid}</code>"
+
+            pct = int((done_jobs / total_jobs * 100)) if total_jobs > 0 else 0
+            eta = int((pending + processing) * FORWARD_DELAY)
+            forward_lines.append(
+                f"• <b>{src_name}</b> ➜ <b>{dst_name}</b>"
+                f"{user_str}\n"
+                f"  ├ 📦 Total: <code>{total_jobs}</code>  "
+                f"✅ Done: <code>{done_jobs}</code>  "
+                f"⏳ Left: <code>{pending + processing}</code>  "
+                f"[{pct}%]\n"
+                f"  └ ⏱ ETA: ~{eta // 60}m {eta % 60}s"
+            )
+
+        # ── Compose reply ─────────────────────────────────────────
+        text = (
+            "📋 <b>QUEUE STATUS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            "📝 <b>CAPTION QUEUE</b>\n"
+            f"  • Pending   : <code>{cap_pending}</code>\n"
+            f"  • Processing: <code>{cap_processing}</code>\n\n"
         )
-    f_pending = await forward_queue.count_documents({"status": "pending"})
-    f_processing = await forward_queue.count_documents({"status": "processing"})
-    f_pipeline = [
-        {"$match": {"status": "pending"}},
-        {"$group": {
-            "_id": {
-                "src": "$src",
-                "dst": "$dst"
-            },
-            "count": {"$sum": 1}
-        }},
-        {"$sort": {"count": -1}},
-        {"$limit": 10}
-    ]
-    forward_lines = []
-    async for row in forward_queue.aggregate(f_pipeline):
-        src = row["_id"]["src"]
-        dst = row["_id"]["dst"]
-        count = row["count"]
-        try:
-            s_chat = await client.get_chat(src)
-            s_name = s_chat.title
-        except:
-            s_name = "Unknown"
-        try:
-            d_chat = await client.get_chat(dst)
-            d_name = d_chat.title
-        except:
-            d_name = "Unknown"
-        eta = int(count * FORWARD_DELAY)
-        forward_lines.append(
-            f"• <b>{s_name}</b> ➜ <b>{d_name}</b>\n"
-            f"  ├ Jobs: <code>{count}</code>\n"
-            f"  └ ETA (pair): ~{eta//60}m {eta%60}s"
+
+        if cap_lines:
+            text += "🔥 <b>Active Caption Tasks</b>\n" + "\n\n".join(cap_lines) + "\n\n"
+        else:
+            text += "✅ Caption queue is empty\n\n"
+
+        text += (
+            "📦 <b>FILE FORWARD QUEUE</b>\n"
+            f"  • Pending   : <code>{f_pending}</code>\n"
+            f"  • Processing: <code>{f_processing}</code>\n\n"
         )
-    text = (
-        "📊 <b>QUEUE STATUS</b>\n\n"
-        "📝 <b>Caption Queue</b>\n"
-        f"• Pending: <code>{cap_pending}</code>\n"
-        f"• Processing: <code>{cap_processing}</code>\n"
-    )
-    if cap_lines:
-        text += "🔥 <b>Top Busy Caption Channels</b>\n" + "\n".join(cap_lines) + "\n\n"
-    else:
-        text += "✅ No caption tasks\n\n"
-    text += (
-        "📦 <b>File Forward Queue</b>\n"
-        f"• Pending: <code>{f_pending}</code>\n"
-        f"• Processing: <code>{f_processing}</code>\n"
-    )
-    if forward_lines:
-        text += "🚚 <b>Top Forward Sessions</b>\n" + "\n".join(forward_lines)
-    else:
-        text += "✅ No forward tasks"
-    await message.reply_text(text, parse_mode=enums.ParseMode.HTML)
+
+        if forward_lines:
+            text += "🚚 <b>Active Forward Sessions</b>\n" + "\n\n".join(forward_lines)
+        else:
+            text += "✅ Forward queue is empty"
+
+        text += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        await loading.edit_text(text, parse_mode=ParseMode.HTML,
+                                  disable_web_page_preview=True)
+    except Exception as e:
+        await loading.edit_text(f"❌ Error fetching queue:\n<code>{e}</code>",
+                                  parse_mode=ParseMode.HTML)
 
 # ---------------- Auto Caption core ----------------
 def sanitize_caption_html(text: str) -> str:
@@ -665,181 +843,264 @@ async def reCap(client, msg):
     })
 
 # ═══════════════════════════════════════════════════════════════════
-#  Smart File Name Helper  –  complete rewrite for movie/series/anime
+#  Smart File Name Engine  –  professional media caption builder
+#  Supports: Movies · Web Series · TV Shows · Anime · OTT originals
 # ═══════════════════════════════════════════════════════════════════
 
 # ── Language tables ──────────────────────────────────────────────
+# Full canonical language names (order matters: longer/rarer first
+# to avoid partial matches on shorter names)
 LANG_LIST = [
-    "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada",
-    "Marathi", "Gujarati", "Bengali", "Punjabi", "Urdu",
-    "Japanese", "Korean", "Chinese", "Spanish", "French", "German",
-    "Italian", "Russian", "Arabic", "Dutch", "Portuguese", "Turkish",
+    "Malayalam", "Kannada", "Marathi", "Gujarati", "Bengali",
+    "Punjabi", "Bhojpuri", "Rajasthani", "Haryanvi", "Odia",
+    "Assamese", "Maithili", "Santali", "Kashmiri", "Sindhi",
+    "Telugu", "Tamil", "Hindi", "English", "Urdu",
+    "Japanese", "Korean", "Mandarin", "Chinese", "Cantonese",
+    "Spanish", "French", "German", "Italian", "Russian",
+    "Arabic", "Dutch", "Portuguese", "Turkish", "Thai",
+    "Vietnamese", "Indonesian", "Malay", "Tagalog", "Sinhala",
+    "Nepali", "Burmese",
 ]
 
+# 3-letter ISO-ish codes found in filenames
 LANG_CODE_MAP = {
-    "hin": "Hindi", "eng": "English", "tam": "Tamil", "tel": "Telugu",
-    "mal": "Malayalam", "kan": "Kannada", "mar": "Marathi", "guj": "Gujarati",
-    "ben": "Bengali", "pan": "Punjabi", "urd": "Urdu",
-    "jpn": "Japanese", "kor": "Korean", "chi": "Chinese",
-    "spa": "Spanish", "fre": "French", "ger": "German",
-    "ita": "Italian", "rus": "Russian", "ara": "Arabic",
-    "dut": "Dutch",   "por": "Portuguese", "tur": "Turkish",
+    "hin": "Hindi",     "eng": "English",    "tam": "Tamil",
+    "tel": "Telugu",    "mal": "Malayalam",   "kan": "Kannada",
+    "mar": "Marathi",   "guj": "Gujarati",    "ben": "Bengali",
+    "pan": "Punjabi",   "urd": "Urdu",        "bho": "Bhojpuri",
+    "jpn": "Japanese",  "kor": "Korean",      "chi": "Chinese",
+    "zho": "Mandarin",  "cmn": "Mandarin",
+    "spa": "Spanish",   "fre": "French",      "ger": "German",
+    "ita": "Italian",   "rus": "Russian",     "ara": "Arabic",
+    "dut": "Dutch",     "por": "Portuguese",  "tur": "Turkish",
+    "tha": "Thai",      "vie": "Vietnamese",  "ind": "Indonesian",
+    "may": "Malay",     "sin": "Sinhala",     "nep": "Nepali",
+    "bur": "Burmese",
 }
 
-# Map lowercase full-word language → canonical name (for full-word matching in filenames)
-_LANG_LOWER_MAP = {lang.lower(): lang for lang in LANG_LIST}
-
-# ── Codec / Quality / Source tables ──────────────────────────────
-QUALITY_LIST = ["2160p", "4K", "UHD", "1080p", "720p", "480p", "360p", "240p"]
-SOURCE_LIST  = [
-    "WEB-DL", "WEBRip", "BluRay", "Blu-Ray", "BDRip",
-    "HDRip", "DVDRip", "HDTV", "AMZN", "NF", "DSNP",
-    "HMAX", "ATVP", "PCOK", "SonyLIV", "ZEE5", "Hotstar", "JioCinema",
+# ── Quality / Resolution ─────────────────────────────────────────
+# Listed longest-first so "2160p" is matched before "1080p" etc.
+QUALITY_LIST = [
+    "2160p", "4K UHD", "4K", "UHD",
+    "1080p", "720p", "480p", "360p", "240p",
 ]
-VIDEO_CODEC_LIST = ["HEVC", "x265", "x264", "AVC", "AV1", "H.264", "H.265", "VP9"]
+
+# ── Source / Rip type ────────────────────────────────────────────
+# Ordered: more specific first
+SOURCE_LIST = [
+    "WEB-DL", "WEBRip",
+    "BluRay", "Blu-Ray", "BDRip", "BDRemux",
+    "HDRip", "DVDRip", "DVD", "HDTV", "HDCAM", "DVDSCR", "CAM",
+    "AMZN", "DSNP", "NF", "HMAX", "ATVP", "PCOK",
+    "SonyLIV", "ZEE5", "Hotstar", "JioCinema", "Voot", "ALTBalaji",
+    "MXPlayer", "ErosNow",
+]
+
+# ── Video codecs ─────────────────────────────────────────────────
+VIDEO_CODEC_LIST = [
+    "HEVC", "x265", "H.265",
+    "x264", "H.264", "AVC",
+    "AV1", "VP9", "MPEG-2",
+]
+
+# ── Audio codecs ─────────────────────────────────────────────────
+# Listed longest/most specific first to avoid partial matches
 AUDIO_CODEC_LIST = [
-    "DD5.1", "DD+5.1", "DD+", "DDP5.1", "DDP", "Atmos",
-    "DTS-HD", "DTS-X", "DTS", "TrueHD",
-    "AAC5.1", "AAC", "AC3", "MP3", "FLAC", "OPUS",
+    "TrueHD Atmos", "DTS-HD MA", "DTS-HD", "DTS-X", "DTS",
+    "DD+5.1", "DDP5.1", "DD5.1", "DD+", "DDP",
+    "Atmos", "TrueHD",
+    "AAC5.1", "AAC", "AC3", "EAC3",
+    "MP3", "FLAC", "OPUS", "PCM",
 ]
-EXT_LIST = ["mkv", "mp4", "avi", "webm", "mov", "m4v", "ts"]
 
-# ── Sub / ESub patterns ──────────────────────────────────────────
+# ── File extensions ──────────────────────────────────────────────
+EXT_LIST = ["mkv", "mp4", "avi", "webm", "mov", "m4v", "ts", "wmv", "flv"]
+
+# ── Sub / ESub compiled patterns ─────────────────────────────────
 ESUB_RE = re.compile(r'\bE\.?Subs?\b', re.I)
 HSUB_RE = re.compile(r'\bH\.?Subs?\b', re.I)
 MSUB_RE = re.compile(r'\bM\.?Subs?\b', re.I)
-SUB_RE  = re.compile(r'\b(?:Subs?|Subtitles?)\b', re.I)
+# Generic "Sub / Subs / Subtitle / Subtitles" (not already E/H/M prefixed)
+SUB_RE  = re.compile(r'\b(?<!E\.)(?<!H\.)(?<!M\.)Subs?(?:titles?)?\b', re.I)
 
-# ── "subtitle <lang>" full-word patterns ─────────────────────────
-# Matches: "subtitle english", "subtitles hindi", "sub english", etc.
+# ── Subtitle-language relationship patterns ───────────────────────
+# "subtitle english", "subtitles hindi"
 _SUB_LANG_RE = re.compile(
     r'\bsubtitles?\s+(' + '|'.join(re.escape(l) for l in LANG_LIST) + r')\b',
     re.I
 )
-# Also: "english subtitle/sub", "hindi sub" etc.
+# "english subtitle", "hindi sub"
 _LANG_SUB_RE = re.compile(
     r'\b(' + '|'.join(re.escape(l) for l in LANG_LIST) + r')\s+subtitles?\b',
     re.I
 )
 
-# ── Content-type keywords ─────────────────────────────────────────
-_SERIES_RE   = re.compile(r'\b(?:Web\s*Series|TV\s*Series|Mini\s*Series|OTT\s*Series)\b', re.I)
-_MOVIE_RE    = re.compile(r'\b(?:South\s*Movie|UnCut\s*Movie|Hindi\s*Movie|Movie)\b', re.I)
-_UNCUT_RE    = re.compile(r'\bUnCut\b', re.I)
-_SOUTH_RE    = re.compile(r'\bSouth\b', re.I)
-_DUAL_RE     = re.compile(r'\bDual\s*Audio\b', re.I)
-_MULTI_RE    = re.compile(r'\bMulti\s*(?:Audio|Lang(?:uage)?)?\b', re.I)
-_COMPLETED_RE= re.compile(r'\bCompleted\b', re.I)
-_HD_RE       = re.compile(r'\bHD\b', re.I)
+# ── Content-type / label patterns ────────────────────────────────
+_SERIES_RE    = re.compile(
+    r'\b(?:Web\s*Series|TV\s*Series|Mini\s*Series|OTT\s*Series|'
+    r'Limited\s*Series|Drama\s*Series|Short\s*Series)\b', re.I
+)
+_ANIME_RE     = re.compile(r'\bAnime\b', re.I)
+_UNCUT_RE     = re.compile(r'\bUnCut\b', re.I)
+_SOUTH_RE     = re.compile(r'\bSouth\b', re.I)
+_BOLLYWOOD_RE = re.compile(r'\bBollywood\b', re.I)
+_HOLLYWOOD_RE = re.compile(r'\bHollywood\b', re.I)
+_DUAL_RE      = re.compile(r'\bDual\s*Audio\b', re.I)
+_MULTI_RE     = re.compile(r'\bMulti\s*(?:Audio|Lang(?:uage)?)?\b', re.I)
+_COMPLETED_RE = re.compile(r'\bCompleted\b', re.I)
+_HD_RE        = re.compile(r'\b(?:HD|FHD|Full\s*HD)\b', re.I)
+_HDR_RE       = re.compile(r'\b(?:HDR10\+|HDR10|HDR|Dolby\s*Vision|DV)\b', re.I)
 
-# ── Helpers ───────────────────────────────────────────────────────
+# ── Internal helpers ──────────────────────────────────────────────
 def _norm(text: str) -> str:
     return re.sub(r'\s+', ' ', text.lower()).strip()
 
 def _clean_raw(text: str) -> str:
-    """Replace dots/underscores with spaces for easier regex matching."""
+    """Replace dots/underscores with spaces for easier token-level parsing."""
     return re.sub(r'[._]', ' ', text)
 
-# ── IMDB enrichment (best-effort, never blocks) ───────────────────
+# ── IMDB enrichment (best-effort, silent on any error) ───────────
 def imdb_enrich_title(title: str, year: str):
-    if not title or not year or len(title) < 4:
+    if not title or not year or len(title) < 3:
         return title, year
     try:
         results = ia.search_movie(title)
         for r in results[:5]:
-            if str(r.get("year")) == year:
-                return r.get("title", title), year
+            if str(r.get("year", "")) == year:
+                clean = r.get("title", title)
+                if clean:
+                    return clean, year
     except Exception:
         pass
     return title, year
 
-# ── Title + Year ─────────────────────────────────────────────────
+# ── Title + Year extractor ────────────────────────────────────────
 def extract_title_year(raw: str):
     """
-    Extract clean title and year from filename/caption.
-    Handles movies, series (S01 E02), anime, etc.
+    Robustly extracts the show/movie title and release year.
+
+    Strategy:
+      1. Normalise separators (dots, underscores → spaces).
+      2. Find the first 4-digit year (1900–2099) — everything before it
+         is a candidate title.
+      3. Strip season/episode markers, codec/quality noise, language names
+         and bracketed alt-title junk from the candidate.
+      4. Title-case the result.
+
+    Handles all common naming conventions:
+      • Movie.Name.2024.1080p.BluRay.mkv
+      • Show Name S03 E07 (2023) Hindi WEB-DL
+      • Title (2020) (Hindi + Tamil) Dual Audio UnCut 720p
+      • Anime.Name.S01.EP05.720p.HEVC
     """
     text = _clean_raw(raw)
 
-    # Find first plausible year (1900-2099)
+    # Step 1: locate year
     year_m = re.search(r'\b((?:19|20)\d{2})\b', text)
     year   = year_m.group(1) if year_m else ""
     cut    = year_m.start()  if year_m else len(text)
 
     title_raw = text[:cut]
 
-    # Remove season/episode markers from the title portion
+    # Step 2: strip season / episode markers from title zone
+    title_raw = re.sub(r'\s*\bS(?:eason)?\s*\d{1,3}(?:E\d{1,3})+\b.*$', '', title_raw, flags=re.I)  # S01E07 / S01E07E08
     title_raw = re.sub(r'\s*\bS(?:eason)?\s*\d{1,3}\b.*$', '', title_raw, flags=re.I)
     title_raw = re.sub(r'\s*\bEp?(?:isode)?\.?\s*\d{1,3}\b.*$', '', title_raw, flags=re.I)
 
-    # Noise words that often bleed into the title area
-    _TITLE_NOISE = (
-        r'480p|720p|1080p|2160p|4k|uhd|web[\s\-]?dl|webrip|bluray|blu[\s\-]ray|bdrip|'
-        r'hdrip|dvdrip|hdtv|amzn|nf|dsnp|hmax|'
-        r'x264|x265|hevc|avc|av1|h\.264|h\.265|'
-        r'esub|hsub|msub|sub|subtitle|'
-        r'dual[\s]?audio|multi[\s]?audio|'
+    # Step 3: strip known noise tokens
+    _NOISE = (
+        # Quality / resolution
+        r'2160p|4k\s*uhd|4k|uhd|1080p|720p|480p|360p|240p|'
+        # Source / rip
+        r'web[\s\-]?dl|webrip|web|bluray|blu[\s\-]ray|bdrip|bdremux|'
+        r'hdrip|dvdrip|dvd|hdtv|hdcam|dvdscr|cam|'
+        r'amzn|dsnp|nf|hmax|atvp|pcok|sonyliv|zee5|hotstar|jiocinemma|'
+        # Video codecs
+        r'hevc|x265|h\.265|x264|h\.264|avc|av1|vp9|'
+        # Audio codecs
+        r'truehd|dts[\s\-]hd|dts[\s\-]x|dts|dd\+?5\.1|ddp5\.1|dd\+|ddp|'
+        r'atmos|aac5\.1|aac|ac3|eac3|mp3|flac|opus|'
+        # Subtitle markers
+        r'e\.?subs?|h\.?subs?|m\.?subs?|subs?|subtitles?|'
+        # Audio descriptors
+        r'dual[\s]?audio|multi[\s]?audio|multi|'
+        # Content flags
         r'uncut|south|bollywood|hollywood|'
-        r'hindi|english|tamil|telugu|malayalam|kannada|punjabi|bengali|marathi|urdu|'
-        r'japanese|korean|chinese|spanish|french|german|italian|russian'
+        # HDR
+        r'hdr10\+|hdr10|hdr|dolby[\s]?vision|'
+        # Languages – every name in LANG_LIST lowercased
+        r'|'.join(re.escape(l.lower()) for l in LANG_LIST)
     )
-    title_raw = re.sub(rf'\b(?:{_TITLE_NOISE})\b', '', title_raw, flags=re.I)
+    title_raw = re.sub(rf'\b(?:{_NOISE})\b', '', title_raw, flags=re.I)
 
-    # Remove bracketed alternate titles / release group noise like "(Poojai)" "(Clear)"
-    title_raw = re.sub(r'\([^)]{0,40}\)', '', title_raw)
-    title_raw = re.sub(r'\[[^\]]{0,40}\]', '', title_raw)
+    # Step 4: remove bracketed junk – "(Poojai)", "[Clear]", "{hin}"
+    title_raw = re.sub(r'\([^)]{0,50}\)', '', title_raw)
+    title_raw = re.sub(r'\[[^\]]{0,50}\]', '', title_raw)
+    title_raw = re.sub(r'\{[^}]{0,50}\}', '', title_raw)
 
-    # Strip trailing punctuation / separators
-    title_raw = re.sub(r'[\[\]()\-–:,|{}\s]+$', '', title_raw.strip())
-    title_raw = re.sub(r'^[\[\]()\-–:,|{}\s]+', '', title_raw.strip())
+    # Step 5: strip leading/trailing punctuation
+    title_raw = re.sub(r'[\[\]()\-–—:,|{}\s]+$', '', title_raw.strip())
+    title_raw = re.sub(r'^[\[\]()\-–—:,|{}\s]+', '', title_raw.strip())
 
     title = re.sub(r'\s{2,}', ' ', title_raw).strip()
-    # Title-case but preserve short connectors
     title = title.title() if title else ""
     return title, year
 
-# ── Season / Episode ─────────────────────────────────────────────
+# ── Season / Episode extractor ───────────────────────────────────
 def extract_season_episode(text: str):
     """
-    Returns (season_str, episode_str) as display strings.
-    Handles:
-      S01 E02 / S01E07 / Season 1 Episode 2
-      S01 (Ep.01-09) / Ep.01-05 (range)
-      Single Ep.07 / EP07 / E07
+    Returns (season_str, episode_str) as clean display strings.
+
+    Patterns handled (all case-insensitive):
+      S01E07          →  S01, E07
+      S01 E07         →  S01, E07
+      S01E07E08       →  S01, E07-E08   (multi-episode file)
+      Season 2 Ep 5   →  S02, E05
+      S01 (Ep.01-09)  →  S01, Ep.01-09  (batch)
+      Ep.01-05        →  "",  Ep.01-05   (no season)
+      EP05 / Ep 5     →  "",  E05
     """
     t = re.sub(r'[._]', ' ', text)
     season  = ""
     episode = ""
 
-    # Season
+    # ── Season ───────────────────────────────────────────────────
     s_m = re.search(r'\bS(?:eason)?\s*0*(\d{1,3})\b', t, re.I)
     if s_m:
         season = f"S{int(s_m.group(1)):02d}"
 
-    # Episode range: Ep.01-09 / (Ep 1-9) / E01-E09
+    # ── Episode range (batch files) ──────────────────────────────
+    # Matches: Ep.01-09 / (Ep 1-9) / E01-09 / E01-E09
     r_m = re.search(
-        r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\s*[-–to]+\s*(?:Ep?\.?\s*)?0*(\d{1,3})\b',
+        r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\s*[-–to]+\s*(?:Ep?(?:isode)?\.?\s*)?0*(\d{1,3})\b',
         t, re.I
     )
     if r_m:
         episode = f"Ep.{int(r_m.group(1)):02d}-{int(r_m.group(2)):02d}"
         return season, episode
 
-    # Single episode
+    # ── Multi-episode in one file: S01E07E08 ─────────────────────
+    me_m = re.search(r'\bS\d{1,3}(E\d{1,3})(E\d{1,3})\b', t, re.I)
+    if me_m:
+        ep1 = int(me_m.group(1)[1:])
+        ep2 = int(me_m.group(2)[1:])
+        episode = f"E{ep1:02d}-E{ep2:02d}"
+        return season, episode
+
+    # ── Single episode ────────────────────────────────────────────
     e_m = re.search(r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\b', t, re.I)
     if e_m:
         episode = f"E{int(e_m.group(1)):02d}"
 
     return season, episode
 
-# ── Language vs Subtitle separation ──────────────────────────────
-def _extract_subtitle_languages(text: str) -> set:
+# ── Subtitle-language context ─────────────────────────────────────
+def _get_subtitle_languages(text: str) -> set:
     """
-    Return set of language names that appear explicitly as subtitle references.
-    Patterns detected:
-      • "subtitle english" / "subtitles hindi"
-      • "english subtitle" / "hindi subs"
-      • ESub / HSub / MSub (generic, no specific language)
+    Returns set of language names that are explicitly paired with
+    subtitle references (e.g. "subtitle english", "hindi sub").
+    Used only by extract_subtitle_tag to decide tag type – languages
+    are NOT excluded from the audio list.
     """
     sub_langs: set = set()
     for m in _SUB_LANG_RE.finditer(text):
@@ -848,86 +1109,89 @@ def _extract_subtitle_languages(text: str) -> set:
         sub_langs.add(m.group(1).title())
     return sub_langs
 
+# ── Language extractor ────────────────────────────────────────────
 def extract_audio_languages(text: str) -> list:
     """
-    Extract ALL languages present in the filename/caption.
+    Extract ALL languages present in the filename + caption.
 
-    Audio languages and subtitle languages are kept SEPARATE in the output —
-    subtitles get their own tag via extract_subtitle_tag(). This function
-    always returns every language it finds regardless of whether any of them
-    also appear in a subtitle reference, because a file can have both audio
-    AND subtitles in the same language (e.g. English audio + English ESub).
-
-    Handles:
-      • Full words:  Hindi, English, Tamil …
-      • 3-letter codes: Hin, Eng, Tam …
-      • Dual-audio blocks: (Hindi + Telugu), {Hindi (Clear) + Telugu}
-      • Standalone: "Hindi 480p", "ironman 2003 English hindi 480p subtitle english"
+    • Returns every language found, regardless of whether it also
+      appears in a subtitle context (subtitle info is handled
+      separately by extract_subtitle_tag).
+    • Languages are returned IN THE ORDER THEY APPEAR in the text,
+      so "Hindi + Telugu" always stays "Hindi + Telugu".
+    • Full names are tried first; 3-letter ISO codes only as fallback.
     """
-    found: list = []
+    found_with_pos: list = []
 
-    # Match full language names (case-insensitive, whole-word)
     for lang in LANG_LIST:
-        if re.search(rf'\b{re.escape(lang)}\b', text, re.I):
-            found.append(lang)
+        m = re.search(rf'\b{re.escape(lang)}\b', text, re.I)
+        if m:
+            found_with_pos.append((m.start(), lang))
 
-    # Match 3-letter codes only if no full names found yet
-    if not found:
+    # Fallback: 3-letter codes (only if zero full names found)
+    if not found_with_pos:
         for code, lang in LANG_CODE_MAP.items():
-            if re.search(rf'\b{code}\b', text, re.I) and lang not in found:
-                found.append(lang)
+            m = re.search(rf'\b{re.escape(code)}\b', text, re.I)
+            if m and lang not in [l for _, l in found_with_pos]:
+                found_with_pos.append((m.start(), lang))
 
-    return list(dict.fromkeys(found))  # preserve order, dedupe
+    # Sort by position of first appearance → preserves source order
+    found_with_pos.sort(key=lambda x: x[0])
 
+    # Deduplicate while keeping order (same lang matched at two positions)
+    seen: set = set()
+    result: list = []
+    for _, lang in found_with_pos:
+        if lang not in seen:
+            seen.add(lang)
+            result.append(lang)
+    return result
+
+# ── Subtitle tag extractor ────────────────────────────────────────
 def extract_subtitle_tag(text: str) -> str:
     """
-    Returns a subtitle tag from the filename/caption.
+    Returns the subtitle presence tag.
     Priority: ESub > HSub > MSub > Sub
 
-    Also handles full-word patterns like "subtitle english" → ESub,
-    and language-prefixed: "english sub" → ESub.
+    Also promotes generic "sub/subtitle english" → ESub.
     """
-    # Check explicit ESub/HSub/MSub/Sub tags first
     if ESUB_RE.search(text):
         return "ESub"
     if HSUB_RE.search(text):
         return "HSub"
     if MSUB_RE.search(text):
         return "MSub"
-
-    # Check if any language is explicitly marked as a subtitle
-    sub_langs = _extract_subtitle_languages(text)
-    if sub_langs:
-        # Determine tag type from explicit sub language context
-        # "subtitle english" → ESub (English sub = External sub convention)
-        # We just return "ESub" as the generic external subtitle marker
+    # Explicit language+subtitle pairing counts as ESub
+    if _get_subtitle_languages(text):
         return "ESub"
-
     if SUB_RE.search(text):
         return "MSub"
     return ""
 
-# ── Individual field extractors ───────────────────────────────────
+# ── Individual placeholder extractors ────────────────────────────
 def extract_quality(text: str) -> str:
-    """Returns resolution/quality tag like 1080p, 720p, 4K …"""
+    """Returns resolution tag: 2160p, 1080p, 720p, 480p, 4K …"""
     for q in QUALITY_LIST:
         if re.search(rf'\b{re.escape(q)}\b', text, re.I):
             return q
     return ""
 
 def extract_resolution(text: str) -> str:
-    """Alias for extract_quality – for {resolution} placeholder."""
+    """Alias of extract_quality (for {resolution} placeholder)."""
     return extract_quality(text)
 
 def extract_source(text: str) -> str:
-    """Returns source tag like WEB-DL, BluRay, HDRip …"""
+    """
+    Returns the rip/source tag.
+    Examples: WEB-DL, BluRay, HDRip, AMZN, NF, SonyLIV …
+    """
     for s in SOURCE_LIST:
         if re.search(rf'\b{re.escape(s)}\b', text, re.I):
             return s
     return ""
 
 def extract_video_codec(text: str) -> str:
-    """Returns video codec like HEVC, x264, AV1 …"""
+    """Returns video codec: HEVC, x264, AV1 …"""
     for c in VIDEO_CODEC_LIST:
         if re.search(rf'\b{re.escape(c)}\b', text, re.I):
             return c
@@ -935,92 +1199,114 @@ def extract_video_codec(text: str) -> str:
 
 def extract_audio_codec(text: str) -> str:
     """
-    Extracts audio codec, including bitrate-suffixed patterns.
-    Examples: DD5.1-224Kbps → DD5.1,  DDP5.1 → DDP5.1
+    Extracts audio codec including optional bitrate suffix.
+    Examples:  DD5.1-224Kbps → DD5.1   |   DDP5.1 → DDP5.1
+               TrueHD Atmos  → TrueHD Atmos
     """
-    m = re.search(
-        r'\b(DD\+?5\.1|DDP5\.1|DD\+|DDP|DTS-HD|DTS-X|DTS|TrueHD|Atmos|'
-        r'AAC5\.1|AAC|AC3|MP3|FLAC|OPUS)(?:[- ]\d+[Kk]bps)?\b',
-        text, re.I
-    )
-    if m:
-        return m.group(1).upper()
+    # Try full codec list first (most specific first)
+    for codec in AUDIO_CODEC_LIST:
+        pattern = re.escape(codec)
+        m = re.search(
+            rf'\b{pattern}(?:[- ]\d+[Kk]bps)?\b',
+            text, re.I
+        )
+        if m:
+            return codec  # return canonical casing from list
     return ""
 
 def extract_extension(text: str) -> str:
-    """Returns file extension like mkv, mp4, avi …"""
-    m = re.search(r'\.(mkv|mp4|avi|webm|mov|m4v|ts)\b', text, re.I)
+    """Returns lowercase file extension: mkv, mp4, avi …"""
+    # Prefer dot-prefixed match (most reliable)
+    m = re.search(r'\.(' + '|'.join(EXT_LIST) + r')\b', text, re.I)
     if m:
         return m.group(1).lower()
+    # Fallback: bare word at end or surrounded by spaces
     for e in EXT_LIST:
-        if re.search(rf'\b{e}\b', text, re.I):
+        if re.search(rf'(?<![.\w]){re.escape(e)}(?![.\w])', text, re.I):
             return e.lower()
     return ""
 
-# ── Dual-audio / multi label helper ──────────────────────────────
+# ── Audio label formatter ─────────────────────────────────────────
 def _format_audio_label(langs: list, text: str) -> str:
     """
-    Build the audio language string, preserving DD5.1-style annotations.
+    Formats the audio language block, preserving codec+bitrate annotation
+    on the first (primary) language.
+
     Examples:
-      ["Hindi", "Telugu"]  + has DD5.1  → "Hindi DD5.1-224Kbps + Telugu"
-      ["Hindi", "Tamil"]   + no codec   → "Hindi + Tamil"
+      ["Hindi", "Telugu"]  + "DD5.1-224Kbps" → "Hindi DD5.1-224Kbps + Telugu"
+      ["Hindi", "Tamil"]   + no codec         → "Hindi + Tamil"
+      ["Hindi"]            + "DDP5.1"         → "Hindi DDP5.1"
     """
     if not langs:
         return ""
 
-    # Check if there is a bitrate-annotated codec in the raw text
-    # e.g. "DD5.1-224Kbps"
-    bitrate_m = re.search(
-        r'\b(DD\+?5\.1|DDP5\.1|DD\+|DDP|DTS-HD|DTS-X|DTS|TrueHD|Atmos|AAC5\.1|AAC|AC3)'
+    # Look for bitrate-annotated audio codec in raw text
+    m = re.search(
+        r'\b(TrueHD\s+Atmos|DTS[\s\-]HD(?:\s+MA)?|DTS[\s\-]X|DTS|'
+        r'DD\+?5\.1|DDP5\.1|DD\+|DDP|Atmos|TrueHD|'
+        r'AAC5\.1|AAC|AC3|EAC3|MP3|FLAC|OPUS)'
         r'(?:[- ](\d+[Kk]bps))?\b',
         text, re.I
     )
     acodec_str = ""
-    if bitrate_m:
-        codec_part  = bitrate_m.group(1).upper()
-        bitrate_part = bitrate_m.group(2)
-        acodec_str  = f" {codec_part}-{bitrate_part}" if bitrate_part else f" {codec_part}"
+    if m:
+        codec_part   = m.group(1)
+        bitrate_part = m.group(2)
+        acodec_str   = f" {codec_part}-{bitrate_part}" if bitrate_part else f" {codec_part}"
 
     if len(langs) == 1:
         return f"{langs[0]}{acodec_str}"
 
-    # First language gets the codec annotation (convention from examples)
+    # Primary language gets codec annotation; rest are plain
     parts = [f"{langs[0]}{acodec_str}"] + langs[1:]
     return " + ".join(parts)
 
-# ── Media-type detection ──────────────────────────────────────────
+# ── Media-type detector ───────────────────────────────────────────
 def detect_media_type(text: str) -> str:
-    """Detect whether content is a movie, series, or anime."""
-    if re.search(r'\bS\d{1,3}\s*(?:E\d|Ep)', text, re.I):
+    """
+    Detects content type: 'series', 'anime', or 'movie'.
+
+    Series signals: S01E02, S01 E02, Season 1 Episode 2,
+                    Ep.01-09 (batch), EP07, Web Series label
+    Anime signals:  'Anime' keyword
+    """
+    # Explicit series label wins immediately
+    if _SERIES_RE.search(text):
+        return "series"
+    # Standard SxxExx or S01 E02 patterns
+    if re.search(r'\bS\d{1,3}\s*E\d{1,3}\b', text, re.I):
         return "series"
     if re.search(r'\bS\d{1,3}\b', text, re.I) and re.search(r'\bE\d{1,3}\b', text, re.I):
         return "series"
-    if re.search(r'\bEp?\.?\s*\d{1,3}', text, re.I):
+    # Ep-only (no season number) – batch or standalone episode
+    if re.search(r'\bEp?(?:isode)?\.?\s*\d{1,3}\b', text, re.I):
         return "series"
-    if re.search(r'\bAnime\b', text, re.I):
+    # Season keyword without S-prefix
+    if re.search(r'\bSeason\s*\d{1,3}\b', text, re.I):
+        return "series"
+    if _ANIME_RE.search(text):
         return "anime"
     return "movie"
 
-# ── Master parser ─────────────────────────────────────────────────
+# ── Master metadata parser ────────────────────────────────────────
 def parse_file_info(filename: str, caption: str) -> dict:
     """
-    Parse ALL metadata from filename + caption combined.
-    Returns a dict with all individual fields for template placeholders.
+    Parse all metadata from filename + caption combined.
+    Returns a flat dict used directly by the {placeholder} template engine.
     """
     raw = f"{filename} {caption}"
 
-    title, year    = extract_title_year(raw)
-    title, year    = imdb_enrich_title(title, year)
+    title, year     = extract_title_year(raw)
+    title, year     = imdb_enrich_title(title, year)
     season, episode = extract_season_episode(raw)
-    audio_langs    = extract_audio_languages(raw)
-    subtitle       = extract_subtitle_tag(raw)
-    quality        = extract_quality(raw)
-    source         = extract_source(raw)
-    vcodec         = extract_video_codec(raw)
-    acodec         = extract_audio_codec(raw)
-    ext            = extract_extension(raw)
-
-    audio_str = _format_audio_label(audio_langs, raw) if audio_langs else ""
+    audio_langs     = extract_audio_languages(raw)
+    subtitle        = extract_subtitle_tag(raw)
+    quality         = extract_quality(raw)
+    source          = extract_source(raw)
+    vcodec          = extract_video_codec(raw)
+    acodec          = extract_audio_codec(raw)
+    ext             = extract_extension(raw)
+    audio_str       = _format_audio_label(audio_langs, raw) if audio_langs else ""
 
     return {
         "title":      title,
@@ -1037,113 +1323,126 @@ def parse_file_info(filename: str, caption: str) -> dict:
         "extension":  ext,
     }
 
-# ── Smart filename builder ────────────────────────────────────────
+# ── Smart caption builder ─────────────────────────────────────────
 def build_smart_filename(filename: str, caption: str) -> str:
     """
-    Build a clean, perfectly structured display caption from filename + caption.
+    Build a professional, fully structured media caption from filename + caption.
 
-    Output format (mirrors the given examples):
-      Title (Year) (Audio) Dual Audio [UnCut] [South] [Media-Type Label] [HD] Resolution [ESub].ext
+    Output order:
+      Title  [S## E##/Ep.##-##]  (Year)
+      (Lang1 [Codec-Bitrate] + Lang2)  [Dual/Multi Audio]
+      [UnCut]  [South / Bollywood / Hollywood]  [MediaLabel]
+      [HD/FHD]  [HDR]  [Source]  [VCodec]  Quality
+      [ESub/HSub/MSub]  [.ext]
 
     Examples:
       Court - State Vs A Nobody (2025) (Hindi DD5.1-224Kbps + Telugu) Dual Audio UnCut South Movie HD 1080p ESub.mkv
       Sapne Vs Everyone S01 (Ep.01-05) (2023) Hindi Completed Web Series HEVC 480p ESub.mkv
-      Campus Beats S06 E07 (2026) Hindi Web Series HEVC 480p ESub.mkv
       Loki S01 E02 Hindi Web Series HEVC 480p ESub.mkv
+      Salaar Part 1 Ceasefire (2024) (Hindi + Telugu) Dual Audio UnCut South Movie HEVC 720p ESub.mkv
+      My Hero Academia S06 E07 (2023) Japanese + English Anime HEVC 1080p ESub.mkv
     """
-    raw  = f"{filename} {caption}"
-    info = parse_file_info(filename, caption)
-
+    raw        = f"{filename} {caption}"
+    info       = parse_file_info(filename, caption)
     media_type = detect_media_type(raw)
-
+    audio_langs = extract_audio_languages(raw)
     parts: list = []
 
-    # 1. Title
+    # ── 1. Title ─────────────────────────────────────────────────
     if info["title"]:
         parts.append(info["title"])
 
-    # 2. Season + Episode  (for series/anime)
+    # ── 2. Season + Episode ──────────────────────────────────────
     if info["season"] or info["episode"]:
         se = f"{info['season']} {info['episode']}".strip()
         parts.append(se)
 
-    # 3. Year in parentheses
+    # ── 3. Year ──────────────────────────────────────────────────
     if info["year"]:
         parts.append(f"({info['year']})")
 
-    # 4. Audio/language block
-    #    If multiple languages → wrap in parentheses like the examples
-    audio_langs = extract_audio_languages(raw)
+    # ── 4. Audio / Language block ────────────────────────────────
     if audio_langs:
         audio_label = _format_audio_label(audio_langs, raw)
+        # Wrap multi-language in parentheses (matches real-world conventions)
         if len(audio_langs) > 1:
             parts.append(f"({audio_label})")
         else:
             parts.append(audio_label)
 
-    # 5. Dual Audio / Multi Audio label
-    if _DUAL_RE.search(raw) and len(audio_langs) > 1:
+    # ── 5. Dual / Multi Audio label ──────────────────────────────
+    if _DUAL_RE.search(raw) and len(audio_langs) >= 2:
         parts.append("Dual Audio")
-    elif _MULTI_RE.search(raw) and len(audio_langs) > 2:
+    elif _MULTI_RE.search(raw) and len(audio_langs) >= 3:
         parts.append("Multi Audio")
 
-    # 6. UnCut flag
+    # ── 6. UnCut ─────────────────────────────────────────────────
     if _UNCUT_RE.search(raw):
         parts.append("UnCut")
 
-    # 7. South flag (South Movie)
-    if _SOUTH_RE.search(raw) and media_type == "movie":
-        parts.append("South")
+    # ── 7. Regional / industry label ─────────────────────────────
+    if media_type == "movie":
+        if _SOUTH_RE.search(raw):
+            parts.append("South")
+        elif _BOLLYWOOD_RE.search(raw):
+            parts.append("Bollywood")
+        elif _HOLLYWOOD_RE.search(raw):
+            parts.append("Hollywood")
 
-    # 8. Completed flag (for web series)
+    # ── 8. Completed (for finished series) ───────────────────────
     completed = bool(_COMPLETED_RE.search(raw))
 
-    # 9. Media-type label
+    # ── 9. Media-type label ──────────────────────────────────────
     if media_type == "series":
-        if _SERIES_RE.search(raw):
-            # Keep the exact label used in source (Web Series / TV Series …)
-            m = _SERIES_RE.search(raw)
-            lbl = re.sub(r'\s+', ' ', m.group(0).strip().title())
-            if completed:
-                parts.append(f"Completed {lbl}")
-            else:
-                parts.append(lbl)
+        series_label = "Web Series"
+        s_m = _SERIES_RE.search(raw)
+        if s_m:
+            # Preserve the exact label from the source text
+            series_label = re.sub(r'\s+', ' ', s_m.group(0).strip().title())
+        if completed:
+            parts.append(f"Completed {series_label}")
         else:
-            if completed:
-                parts.append("Completed Web Series")
-            else:
-                parts.append("Web Series")
+            parts.append(series_label)
     elif media_type == "anime":
         parts.append("Anime")
-    else:  # movie
-        if _SOUTH_RE.search(raw):
-            parts.append("Movie")   # "South Movie" already built as "South … Movie"
-        elif _MOVIE_RE.search(raw):
-            m = _MOVIE_RE.search(raw)
-            parts.append(re.sub(r'\s+', ' ', m.group(0).strip().title()))
-        # else: bare movie – no label needed
+    else:
+        # Movie – add "Movie" label when regional or explicit flag is present
+        if _SOUTH_RE.search(raw) or _BOLLYWOOD_RE.search(raw) or _HOLLYWOOD_RE.search(raw):
+            parts.append("Movie")
+        elif re.search(r'\bMovie\b', raw, re.I):
+            parts.append("Movie")
 
-    # 10. HD flag
+    # ── 10. HD / FHD flag ────────────────────────────────────────
     if _HD_RE.search(raw):
-        parts.append("HD")
+        m = _HD_RE.search(raw)
+        parts.append(re.sub(r'\s+', ' ', m.group(0).strip()))
 
-    # 11. Video codec (HEVC, x264 …)
+    # ── 11. HDR flag ─────────────────────────────────────────────
+    if _HDR_RE.search(raw):
+        hdr_m = _HDR_RE.search(raw)
+        parts.append(re.sub(r'\s+', ' ', hdr_m.group(0).strip()))
+
+    # ── 12. Source / Rip type ────────────────────────────────────
+    if info["source"]:
+        parts.append(info["source"])
+
+    # ── 13. Video codec ──────────────────────────────────────────
     if info["vcodec"]:
         parts.append(info["vcodec"])
 
-    # 12. Resolution / Quality
+    # ── 14. Resolution / Quality ─────────────────────────────────
     if info["quality"]:
         parts.append(info["quality"])
 
-    # 13. Subtitle tag
+    # ── 15. Subtitle tag ─────────────────────────────────────────
     if info["subtitle"]:
         parts.append(info["subtitle"])
 
-    # 14. Extension
+    # ── 16. Extension (glued with dot, no space) ─────────────────
     if info["extension"]:
         parts.append(f".{info['extension']}")
 
-    # Join: extension is glued without space, everything else space-separated
+    # Join: extension is attached without a space; everything else space-joined
     result = ""
     for p in parts:
         if p.startswith("."):
