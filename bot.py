@@ -10,6 +10,7 @@ from body.database import (
     CAPTION_WORKERS,
     ensure_queue_indexes,
     ensure_forward_indexes,
+    ensure_global_ff_indexes,   # ← NEW
     recover_stuck_jobs,
 )
 from body.Caption import caption_worker
@@ -43,9 +44,11 @@ class Bot(Client):
         # One-time DB setup
         await ensure_queue_indexes()
         await ensure_forward_indexes()
+        await ensure_global_ff_indexes()   # ← NEW: indexes for admin forwarding
         await recover_stuck_jobs()
 
-        # Run per-plugin startup hooks (e.g. file_forward.on_bot_start)
+        # Run per-plugin startup hooks (e.g. file_forward.on_bot_start,
+        # admin_channels.on_bot_start)
         await self._run_plugin_startup_hooks()
 
         # Launch caption worker pool  (CAPTION_WORKERS = 6)
@@ -64,8 +67,10 @@ class Bot(Client):
 
         print(f"{me.first_name} is started ✨")
         try:
-            await self.send_message(ADMIN[0] if isinstance(ADMIN, list) else ADMIN,
-                                    f"**{me.first_name} started ✨**")
+            await self.send_message(
+                ADMIN[0] if isinstance(ADMIN, list) else ADMIN,
+                f"**{me.first_name} started ✨**",
+            )
         except Exception:
             pass
 
