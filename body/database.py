@@ -56,6 +56,11 @@ user_channels   = db.user_channels
 queue_col       = db.caption_queue
 forward_queue   = db.forward_queue
 
+# ── NEW: global admin forwarding progress ────────────────────────────────────
+# Stores per-channel forwarding resume state:
+#   { channel_id: int, last_msg_id: int, total_forwarded: int, updated_at: float }
+global_ff_progress = db.global_ff_progress
+
 
 # ════════════════════════════════════════════════════════
 #  Index setup  (called once at startup)
@@ -79,6 +84,15 @@ async def ensure_forward_indexes():
     await forward_queue.create_index(
         [("src", 1), ("dst", 1), ("ts", 1)],
         partialFilterExpression={"status": "pending"},
+        background=True,
+    )
+
+
+async def ensure_global_ff_indexes():
+    """Create indexes for the global (admin) forwarding progress collection."""
+    await global_ff_progress.create_index(
+        [("channel_id", 1)],
+        unique=True,
         background=True,
     )
 
@@ -175,6 +189,37 @@ async def forward_retry(job_id, delay: float):
             "$inc": {"retries": 1},
         },
     )
+
+
+# ════════════════════════════════════════════════════════
+#  Global (admin) forward progress helpers  ── NEW
+# ════════════════════════════════════════════════════════
+async def get_global_ff_progress(channel_id: int) -> dict:
+    """Return saved forwarding progress for a channel, or empty dict."""
+    doc = await global_ff_progress.find_one({"channel_id": channel_id})
+    return doc or {}
+
+
+async def save_global_ff_progress(
+    channel_id: int, last_msg_id: int, total_forwarded: int
+):
+    """Upsert the last forwarded message id and cumulative count for a channel."""
+    await global_ff_progress.update_one(
+        {"channel_id": channel_id},
+        {
+            "$set": {
+                "last_msg_id":     last_msg_id,
+                "total_forwarded": total_forwarded,
+                "updated_at":      time.time(),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def reset_global_ff_progress(channel_id: int):
+    """Delete saved progress for a channel (use before a fresh full-forward)."""
+    await global_ff_progress.delete_one({"channel_id": channel_id})
 
 
 # ════════════════════════════════════════════════════════
