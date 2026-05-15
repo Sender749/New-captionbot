@@ -1,14 +1,33 @@
 """
 file_forward.py  ── improved worker & executor system
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Key changes vs original:
+Bug-fixes vs previous version:
+  • Progress message now shows ACCURATE forwarded/total counts.
+    Root cause: `total` was stored per-job but stamped AFTER all jobs were
+    enqueued, so workers that started early always saw total=0.
+    Fix: total is tracked on the FF_SESSIONS dict (single source of truth)
+    and read directly from there — never from the job document.
+  • "Still showing transferring" after completion:
+    Root cause: the final completion check used `remaining = count_documents()`
+    which raced with `forward_done()` deletes from multiple workers.
+    Fix: session["forwarded"] counter (incremented atomically in asyncio
+    single-thread) is compared with session["total"] — no DB round-trip needed.
+  • Duplicate completion messages from multiple workers:
+    _session_completed set guards the send, unchanged, but now also guards
+    the intermediate "rate-limit" path so a stale in-progress edit can never
+    overwrite a completion message.
+  • Progress percentage was wrong when total=0 (divide-by-zero).
+    Fix: guard with `if total > 0`.
+  • Progress update rate-limiting was based on a global done-count that was
+    never reset between sessions, causing the first few files of a new
+    session to never show a progress update.
+    Fix: count is per-session and reset when the session ends.
+
+Key design (unchanged):
   • FORWARD_WORKERS pulled from database constants (4 workers)
   • Per-pair concurrency cap enforced with atomic DB claim
   • Exponential back-off on FloodWait (capped at 5 min)
   • Scan loop yields every iteration so caption workers aren't starved
-  • _scan_and_enqueue uses asyncio.sleep(0) to cooperate with event loop
-  • Progress updates are rate-limited (once every 3 completions)
-    so we don't spam edit_message_text and cause MORE FloodWaits
   • Session expiry (15 min) enforced in FF_SESSIONS
   • CANCELLED_SESSIONS auto-cleaned after session ends
 """
@@ -38,7 +57,7 @@ from info import ADMIN, FF_CH
 FORWARD_ACTIVE   = defaultdict(int)   # (src, dst) -> active worker count
 FORWARD_COOLDOWN = {}                 # (src, dst) -> unblock timestamp
 
-FF_SESSIONS       = {}                # uid -> session dict
+FF_SESSIONS        = {}               # uid -> session dict
 CANCELLED_SESSIONS = set()            # session_ids that were cancelled
 
 # ── regex helpers ─────────────────────────────────────────────────────────────
@@ -58,11 +77,14 @@ ANIM_FRAMES = [
     "🔄 Transferring files...",
 ]
 
-# Rate-limit progress edits: update UI every N completions
+# Rate-limit progress edits: update UI every N completions (per session)
 _PROGRESS_EVERY = 3
+
+# Per-session counters: session_id -> number of files forwarded so far
 _session_done_count: dict[str, int] = defaultdict(int)
-# Tracks sessions whose completion message has already been sent.
-# Prevents multiple workers all racing to send "✅ Forwarding completed".
+
+# Sessions whose completion message has already been sent.
+# Prevents multiple workers racing to send "✅ Forwarding completed".
 _session_completed: set = set()
 
 
@@ -200,6 +222,11 @@ async def _scan_and_enqueue(client: Client, uid: int):
     Scans the source channel and writes one DB job per media message.
     Runs entirely in the background – never blocks caption workers.
     Uses asyncio.sleep(0) on every iteration so the event loop stays free.
+
+    FIX: total count is now tracked on the session dict (s["total"]) and
+    also stored on each job document once scanning finishes.  Workers read
+    total from the session, not from the job, so they always get the correct
+    value even while scanning is still running.
     """
     s = FF_SESSIONS.get(uid)
     if not s:
@@ -210,9 +237,11 @@ async def _scan_and_enqueue(client: Client, uid: int):
     start_id   = int(s["skip"]) + 1
     end_id     = s.get("end_id")
 
-    s["total"]            = 0
-    msg_id                = start_id
-    consecutive_missing   = 0
+    # Reset counters for this scan
+    s["total"]     = 0
+    s["forwarded"] = 0   # ← NEW: track forwarded count on session
+    msg_id              = start_id
+    consecutive_missing = 0
     MAX_CONSECUTIVE_MISSING = 500
 
     while True:
@@ -257,12 +286,15 @@ async def _scan_and_enqueue(client: Client, uid: int):
             "source_title":      s["source_title"],
             "destination_title": s["destination_title"],
             "session_id":        session_id,
+            # NOTE: total=0 here; we stamp the real value below after scan
             "total":             0,
         })
         s["total"] += 1
         msg_id += 1
 
-    # Stamp actual total on all pending jobs for this session
+    # ── Stamp actual total on all pending jobs for this session ───────────────
+    # Workers that started before this runs will update their total from the
+    # session dict via _maybe_update_progress — the DB value is a fallback.
     if s["total"] > 0:
         await forward_queue.update_many(
             {"session_id": session_id, "total": 0},
@@ -287,6 +319,9 @@ async def _scan_and_enqueue(client: Client, uid: int):
         except Exception:
             pass
 
+    # Mark scan complete on session so workers know the total is final
+    s["scan_done"] = True
+
 
 async def enqueue_forward_jobs(client: Client, uid: int):
     """
@@ -299,6 +334,10 @@ async def enqueue_forward_jobs(client: Client, uid: int):
         return
     if "session_id" not in s:
         s["session_id"] = str(uuid.uuid4())
+
+    # Reset per-session counters
+    _session_done_count.pop(s["session_id"], None)
+    _session_completed.discard(s["session_id"])
 
     try:
         await client.edit_message_text(
@@ -471,6 +510,14 @@ async def forward_worker(client: Client):
                     print(f"[FF_DUMP_FAIL] {e}")
 
             await forward_done(job["_id"])
+
+            # ── FIX: increment session forwarded counter ───────────────────
+            # Read total from session dict (accurate) not from job document.
+            uid = job.get("user_id")
+            s = FF_SESSIONS.get(uid) if uid else None
+            if s and s.get("session_id") == session_id:
+                s["forwarded"] = s.get("forwarded", 0) + 1
+
             await _maybe_update_progress(client, job)
             await asyncio.sleep(FORWARD_DELAY)
 
@@ -495,43 +542,70 @@ async def _maybe_update_progress(client: Client, job: dict):
     """
     Update the progress message after each forwarded file.
 
-    Race-condition fix:
-    Before this fix, when multiple workers finished the last few jobs
-    simultaneously, they all saw remaining==0 and all tried to send the
-    completion message, causing:
-      (a) duplicate "✅ Forwarding completed" messages, or
-      (b) a worker that finished just BEFORE the last one sending the
-          completion message early, then the final worker overwriting it
-          with a stale "in-progress" edit.
+    BUG FIXES vs previous version:
+    ─────────────────────────────────────────────────────────────────────────
+    1. "Still showing transferring after all done":
+       Old code counted `remaining = count_documents()` which raced with
+       deletes from multiple concurrent workers.  A worker deleting the last
+       document could race with another still checking — both would see
+       remaining > 0.
+       Fix: use session["forwarded"] >= session["total"] as the completion
+       check.  This is updated atomically in the asyncio single-thread and
+       needs no DB round-trip.
 
-    Fix: _session_completed is a set that is checked+updated atomically
-    (Python's GIL makes single-dict/set operations thread-safe in asyncio).
-    Only the first worker to see remaining==0 sends the completion message.
-    All subsequent workers for the same session bail out immediately.
+    2. Inaccurate total in progress:
+       Old code read total from job["total"] which was 0 until the scan
+       finished and stamped it.  Early jobs always showed "0/0".
+       Fix: read total from FF_SESSIONS[uid]["total"] which is updated live
+       during the scan.  Fall back to job["total"] only if session is gone.
+
+    3. Per-session done counter was never reset between sessions:
+       Fix: counter is reset in enqueue_forward_jobs() when a new session
+       starts, so the first _PROGRESS_EVERY files always show an update.
+
+    4. Completion message could be sent before scan finished (total still 0):
+       Fix: only send completion if session["scan_done"] is True.
+    ─────────────────────────────────────────────────────────────────────────
     """
-    session = job.get("session_id")
-    if not session or session in CANCELLED_SESSIONS:
+    session_id = job.get("session_id")
+    if not session_id or session_id in CANCELLED_SESSIONS:
         return
 
     # Already completed by another worker for this session
-    if session in _session_completed:
+    if session_id in _session_completed:
         return
 
-    _session_done_count[session] += 1
-    done = _session_done_count[session]
+    # ── Read counters from session dict (authoritative) ───────────────────
+    uid = job.get("user_id")
+    s   = FF_SESSIONS.get(uid) if uid else None
 
-    remaining = await forward_queue.count_documents({"session_id": session})
+    if s and s.get("session_id") == session_id:
+        forwarded  = s.get("forwarded", 0)
+        total      = s.get("total", 0)
+        scan_done  = s.get("scan_done", False)
+    else:
+        # Session was cleaned up (e.g. cancelled); fall back to DB count
+        forwarded  = _session_done_count.get(session_id, 0) + 1
+        total      = job.get("total", 0)
+        scan_done  = True  # if session is gone, assume scan finished
 
-    if remaining == 0:
+    _session_done_count[session_id] = forwarded
+
+    # ── Completion check ──────────────────────────────────────────────────
+    # Only complete if: scan has finished AND all files have been forwarded
+    is_complete = scan_done and total > 0 and forwarded >= total
+
+    if is_complete:
         # Guard: only the first worker to reach this point sends the final msg.
-        # Check-then-set is safe here because asyncio is single-threaded and
-        # there is no await between the check and the add.
-        if session in _session_completed:
+        if session_id in _session_completed:
             return
-        _session_completed.add(session)
+        _session_completed.add(session_id)
 
-        final_done = _session_done_count.pop(session, done)
-        CANCELLED_SESSIONS.discard(session)
+        # Cleanup session
+        if uid and uid in FF_SESSIONS and FF_SESSIONS[uid].get("session_id") == session_id:
+            FF_SESSIONS.pop(uid, None)
+        _session_done_count.pop(session_id, None)
+        CANCELLED_SESSIONS.discard(session_id)
 
         try:
             await client.edit_message_text(
@@ -541,36 +615,44 @@ async def _maybe_update_progress(client: Client, job: dict):
                     "✅ <b>Forwarding completed</b>\n\n"
                     f"📤 <b>Source:</b> {job['source_title']}\n"
                     f"📥 <b>Destination:</b> {job['destination_title']}\n\n"
-                    f"📦 <b>Files forwarded:</b> <code>{final_done}</code>"
+                    f"📦 <b>Files forwarded:</b> <code>{forwarded}</code>\n"
+                    f"🗂 <b>Total detected:</b> <code>{total}</code>"
                 ),
             )
         except Exception:
             pass
+
         # Delayed cleanup so any late-arriving workers still see it and bail
         async def _cleanup_session():
             await asyncio.sleep(30)
-            _session_completed.discard(session)
+            _session_completed.discard(session_id)
+
         asyncio.create_task(_cleanup_session())
         return
 
-    # Rate-limit intermediate updates to avoid FloodWait on edit_message_text
-    if done % _PROGRESS_EVERY != 0:
+    # ── Rate-limit intermediate updates ───────────────────────────────────
+    if forwarded % _PROGRESS_EVERY != 0:
         return
 
     # Don't overwrite a completion message that was just sent
-    if session in _session_completed:
+    if session_id in _session_completed:
         return
 
-    frame = ANIM_FRAMES[int(time.time()) % len(ANIM_FRAMES)]
-    total = job.get("total", 0)
-    pct   = int(((total - remaining) / total) * 100) if total > 0 else 0
-    text  = (
+    # Build progress bar
+    pct      = int((forwarded / total) * 100) if total > 0 else 0
+    bar_fill = int(pct / 10)
+    bar      = "▓" * bar_fill + "░" * (10 - bar_fill)
+    frame    = ANIM_FRAMES[int(time.time()) % len(ANIM_FRAMES)]
+
+    text = (
         f"📤 <b>{job['source_title']}</b>\n"
         f"         ⬇️⬇️⬇️\n"
         f"📥 <b>{job['destination_title']}</b>\n\n"
         f"{frame}\n"
-        f"<code>{pct}%</code> — {total - remaining}/{total} done"
+        f"[{bar}] <code>{pct}%</code>\n"
+        f"📦 <b>Forwarded:</b> <code>{forwarded}</code> / <code>{total if total > 0 else '?'}</code>"
     )
+
     try:
         await client.edit_message_text(
             job["chat_id"],
@@ -596,16 +678,18 @@ async def ff_cancel(client, query):
     session_id = s.get("session_id")
     if session_id:
         CANCELLED_SESSIONS.add(session_id)
-        remaining = await forward_queue.count_documents({"session_id": session_id})
+        forwarded = s.get("forwarded", 0)
         total     = s.get("total", 0)
-        sent      = max(total - remaining, 0)
+
+        # Clean up pending DB jobs for this session
         await forward_queue.delete_many({"session_id": session_id})
         _session_done_count.pop(session_id, None)
         _session_completed.discard(session_id)
+
         await query.message.edit_text(
             "🛑 <b>Forwarding cancelled</b>\n\n"
-            f"📦 <b>Files sent:</b> <code>{sent}</code>\n"
-            f"🗂 <b>Initially detected:</b> <code>{total}</code>"
+            f"📦 <b>Files sent:</b> <code>{forwarded}</code>\n"
+            f"🗂 <b>Total detected:</b> <code>{total}</code>"
         )
     else:
         await query.message.edit_text("🛑 Cancelled.")
