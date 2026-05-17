@@ -294,14 +294,18 @@ async def admin_help(client, message):
         "└ /restart — Restart the bot process\n\n"
 
         "📤 <b>FILE FORWARDING</b>\n"
-        "└ /file_forward — Start a file forward session\n"
-        "    <i>→ Pick source → destination → range (or 0 for all)</i>\n\n"
+        "├ /file_forward — Start a user file forward session\n"
+        "│   <i>→ Pick source → destination → range (or 0 for all)</i>\n"
+        "└ /channels — View all user-added channels &amp; bulk-forward files\n"
+        "    <i>→ Shows channel info, who added it, file count,</i>\n"
+        "    <i>   forwarding progress, start/continue/stop controls</i>\n\n"
 
         "⚙️ <b>CHANNEL SETTINGS</b>\n"
         "└ /settings — Manage your added channels\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔐 All commands above are admin-only."
+        "🔐 All commands above are admin-only.\n"
+        "📋 /queue is available to all users (shows their own tasks)."
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -511,17 +515,34 @@ async def reset_db(client, message):
 
     await message.reply_text("✅ All database records have been deleted successfully!")
 
-@Client.on_message(filters.private & filters.user(ADMIN) & filters.command("queue"))
+@Client.on_message(filters.private & filters.command("queue"))
 async def queue_status(client, message):
+    """
+    /queue — available to ALL users (not admin-only).
+
+    • Regular users  → see only their own caption tasks and file-forward sessions.
+    • Admins         → see ALL tasks across all users, plus the global-forward
+                       (admin /channels) queue from admin_channels.py.
+    """
+    uid      = message.from_user.id
+    is_admin = uid in (ADMIN if isinstance(ADMIN, (list, tuple, set)) else [ADMIN])
+
     loading = await message.reply_text("🔄 Fetching queue…")
     try:
-        # ── Caption queue totals ──────────────────────────────────
-        cap_pending    = await queue_col.count_documents({"status": "pending"})
-        cap_processing = await queue_col.count_documents({"status": "processing"})
+        # ════════════════════════════════════════════════════
+        #  CAPTION QUEUE
+        # ════════════════════════════════════════════════════
+        if is_admin:
+            cap_pending    = await queue_col.count_documents({"status": "pending"})
+            cap_processing = await queue_col.count_documents({"status": "processing"})
+            cap_match      = {"status": {"$in": ["pending", "processing"]}}
+        else:
+            cap_pending    = await queue_col.count_documents({"status": "pending",    "user_id": uid})
+            cap_processing = await queue_col.count_documents({"status": "processing", "user_id": uid})
+            cap_match      = {"status": {"$in": ["pending", "processing"]}, "user_id": uid}
 
-        # ── Per-channel caption breakdown ─────────────────────────
         cap_pipeline = [
-            {"$match": {"status": {"$in": ["pending", "processing"]}}},
+            {"$match": cap_match},
             {"$group": {
                 "_id":        "$chat_id",
                 "pending":    {"$sum": {"$cond": [{"$eq": ["$status", "pending"]},    1, 0]}},
@@ -529,33 +550,33 @@ async def queue_status(client, message):
                 "user_id":    {"$first": "$user_id"},
             }},
             {"$sort": {"pending": -1}},
-            {"$limit": 15},
+            {"$limit": 15 if is_admin else 10},
         ]
+
         cap_lines = []
         async for row in queue_col.aggregate(cap_pipeline):
             ch_id      = row["_id"]
             pending    = row["pending"]
             processing = row["processing"]
             total      = pending + processing
-            uid        = row.get("user_id")
+            row_uid    = row.get("user_id")
 
-            # Channel name
             try:
-                chat   = await client.get_chat(ch_id)
+                chat    = await client.get_chat(ch_id)
                 ch_name = chat.title or str(ch_id)
             except Exception:
                 ch_name = str(ch_id)
 
-            # User info
             user_str = ""
-            if uid:
+            # Only show user info to admins (privacy) or when it's their own task
+            if is_admin and row_uid:
                 try:
-                    u = await client.get_users(uid)
+                    u     = await client.get_users(row_uid)
                     uname = u.first_name or "Unknown"
-                    utag  = f"@{u.username}" if u.username else f"ID:{uid}"
-                    user_str = f"\n  ├ 👤 <a href='tg://user?id={uid}'>{uname}</a> ({utag})"
+                    utag  = f"@{u.username}" if u.username else f"ID:{row_uid}"
+                    user_str = f"\n  ├ 👤 <a href='tg://user?id={row_uid}'>{uname}</a> ({utag})"
                 except Exception:
-                    user_str = f"\n  ├ 👤 ID: <code>{uid}</code>"
+                    user_str = f"\n  ├ 👤 ID: <code>{row_uid}</code>"
 
             eta = int((pending / max(DEFAULT_MAX_WORKERS, 1)) * DEFAULT_EDIT_DELAY)
             cap_lines.append(
@@ -563,19 +584,26 @@ async def queue_status(client, message):
                 f"{user_str}\n"
                 f"  ├ 📥 Total: <code>{total}</code>  "
                 f"⏳ Pending: <code>{pending}</code>  "
-                f"⚙️ Processing: <code>{processing}</code>\n"
+                f"⚙️ Active: <code>{processing}</code>\n"
                 f"  └ ⏱ ETA: ~{eta // 60}m {eta % 60}s"
             )
 
-        # ── Forward queue totals ──────────────────────────────────
-        f_pending    = await forward_queue.count_documents({"status": "pending"})
-        f_processing = await forward_queue.count_documents({"status": "processing"})
+        # ════════════════════════════════════════════════════
+        #  FILE FORWARD QUEUE  (user /file_forward sessions)
+        # ════════════════════════════════════════════════════
+        if is_admin:
+            f_pending    = await forward_queue.count_documents({"status": "pending"})
+            f_processing = await forward_queue.count_documents({"status": "processing"})
+            fwd_match    = {"status": {"$in": ["pending", "processing"]}}
+        else:
+            f_pending    = await forward_queue.count_documents({"status": "pending",    "user_id": uid})
+            f_processing = await forward_queue.count_documents({"status": "processing", "user_id": uid})
+            fwd_match    = {"status": {"$in": ["pending", "processing"]}, "user_id": uid}
 
-        # ── Per-session forward breakdown ─────────────────────────
         f_pipeline = [
-            {"$match": {"status": {"$in": ["pending", "processing"]}}},
+            {"$match": fwd_match},
             {"$group": {
-                "_id": "$session_id",
+                "_id":               "$session_id",
                 "src":               {"$first": "$src"},
                 "dst":               {"$first": "$dst"},
                 "source_title":      {"$first": "$source_title"},
@@ -588,6 +616,7 @@ async def queue_status(client, message):
             {"$sort": {"pending": -1}},
             {"$limit": 10},
         ]
+
         forward_lines = []
         async for row in forward_queue.aggregate(f_pipeline):
             src        = row["src"]
@@ -596,11 +625,10 @@ async def queue_status(client, message):
             processing = row["processing"]
             total_jobs = row.get("total", pending + processing)
             done_jobs  = max(0, total_jobs - pending - processing)
-            uid        = row.get("user_id")
+            row_uid    = row.get("user_id")
             src_name   = row.get("source_title") or str(src)
             dst_name   = row.get("destination_title") or str(dst)
 
-            # Fallback: try live chat title
             if not row.get("source_title"):
                 try:
                     src_name = (await client.get_chat(src)).title or src_name
@@ -612,16 +640,15 @@ async def queue_status(client, message):
                 except Exception:
                     pass
 
-            # User info
             user_str = ""
-            if uid:
+            if is_admin and row_uid:
                 try:
-                    u = await client.get_users(uid)
+                    u     = await client.get_users(row_uid)
                     uname = u.first_name or "Unknown"
-                    utag  = f"@{u.username}" if u.username else f"ID:{uid}"
-                    user_str = f"\n  ├ 👤 <a href='tg://user?id={uid}'>{uname}</a> ({utag})"
+                    utag  = f"@{u.username}" if u.username else f"ID:{row_uid}"
+                    user_str = f"\n  ├ 👤 <a href='tg://user?id={row_uid}'>{uname}</a> ({utag})"
                 except Exception:
-                    user_str = f"\n  ├ 👤 ID: <code>{uid}</code>"
+                    user_str = f"\n  ├ 👤 ID: <code>{row_uid}</code>"
 
             pct = int((done_jobs / total_jobs * 100)) if total_jobs > 0 else 0
             eta = int((pending + processing) * FORWARD_DELAY)
@@ -635,9 +662,40 @@ async def queue_status(client, message):
                 f"  └ ⏱ ETA: ~{eta // 60}m {eta % 60}s"
             )
 
-        # ── Compose reply ─────────────────────────────────────────
+        # ════════════════════════════════════════════════════
+        #  GLOBAL (ADMIN) FORWARD — /channels forwarding
+        #  Only shown to admins
+        # ════════════════════════════════════════════════════
+        gff_lines = []
+        if is_admin:
+            try:
+                from body.admin_channels import ADMIN_FF_SESSIONS, _gff_job_queue
+                for sid, sess in list(ADMIN_FF_SESSIONS.items()):
+                    forwarded  = sess.get("forwarded", 0)
+                    total      = sess.get("total", 0)
+                    src_title  = sess.get("channel_title", str(sess.get("channel_id", "?")))
+                    dest_title = sess.get("dest_title", "Destination")
+                    pct        = int((forwarded / total) * 100) if total > 0 else 0
+                    q_size     = _gff_job_queue.qsize()
+                    bar_filled = int(pct / 10)
+                    bar        = "▓" * bar_filled + "░" * (10 - bar_filled)
+                    gff_lines.append(
+                        f"• <b>{src_title}</b> ➜ <b>{dest_title}</b>\n"
+                        f"  ├ [{bar}] <code>{pct}%</code>\n"
+                        f"  ├ 📦 Forwarded: <code>{forwarded}</code> / <code>{total}</code>  "
+                        f"⏳ Queue: <code>{q_size}</code>\n"
+                        f"  └ 🔑 Session: <code>{sid[:8]}…</code>"
+                    )
+            except Exception:
+                pass
+
+        # ════════════════════════════════════════════════════
+        #  COMPOSE REPLY
+        # ════════════════════════════════════════════════════
+        scope_label = "📋 <b>QUEUE STATUS</b>" if is_admin else "📋 <b>YOUR QUEUE STATUS</b>"
+
         text = (
-            "📋 <b>QUEUE STATUS</b>\n"
+            f"{scope_label}\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
             "📝 <b>CAPTION QUEUE</b>\n"
@@ -657,17 +715,26 @@ async def queue_status(client, message):
         )
 
         if forward_lines:
-            text += "🚚 <b>Active Forward Sessions</b>\n" + "\n\n".join(forward_lines)
+            text += "🚚 <b>Active Forward Sessions</b>\n" + "\n\n".join(forward_lines) + "\n\n"
         else:
-            text += "✅ Forward queue is empty"
+            text += "✅ Forward queue is empty\n\n"
+
+        if is_admin:
+            text += "🌐 <b>GLOBAL FORWARD (/channels)</b>\n"
+            if gff_lines:
+                text += "\n\n".join(gff_lines)
+            else:
+                text += "✅ No active global-forward sessions"
 
         text += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━"
+        if not is_admin:
+            text += "\n<i>💡 Use /file_forward to start a new forwarding session.</i>"
 
         await loading.edit_text(text, parse_mode=ParseMode.HTML,
-                                  disable_web_page_preview=True)
+                                 disable_web_page_preview=True)
     except Exception as e:
         await loading.edit_text(f"❌ Error fetching queue:\n<code>{e}</code>",
-                                  parse_mode=ParseMode.HTML)
+                                 parse_mode=ParseMode.HTML)
 
 # ---------------- Auto Caption core ----------------
 def sanitize_caption_html(text: str) -> str:
