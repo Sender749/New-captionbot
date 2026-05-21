@@ -1,29 +1,21 @@
 """
 admin_channels.py  ── /channels admin command
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FIXES vs previous version:
-  • Uses MANUAL_FF (not CP_CH) as the forwarding destination.
-  • filters.user(ADMIN) now correctly handles ADMIN as a list — Pyrogram
-    accepts both int and list[int] for filters.user().
-  • Removed CP_CH import entirely.
-  • Added /channels to the /admin command panel (done in Caption.py).
-  • on_bot_start() no longer re-calls ensure_global_ff_indexes() (already
-    called from bot.py at startup) — avoids a coroutine-in-non-async context.
-  • get_global_ff_progress / save_global_ff_progress are imported from
-    database.py (single source of truth) instead of being redefined here.
+• /channels  (admin-only): lists all user-added channels as buttons
+• Forwarding destination = MANUAL_FF (never CP_CH)
+• All progress helpers imported from database.py (no local redefinitions)
+• on_bot_start() only launches worker tasks (no DB calls — those run in bot.py)
 """
 
 import asyncio
 import time
 import uuid
-from collections import defaultdict
 
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from body.database import (
-    db,
     users,
     get_channel_cached,
     set_channel_title_cache,
@@ -32,34 +24,62 @@ from body.database import (
 )
 from info import ADMIN, MANUAL_FF
 
-# ── In-memory state ───────────────────────────────────────────────────────────
-ADMIN_FF_SESSIONS: dict[str, dict] = {}   # session_id → session dict
-ADMIN_FF_CANCELLED: set             = set()
-
-GLOBAL_FF_WORKERS       = 2     # dedicated workers – never starves caption workers
-_GFF_PROGRESS_EVERY     = 5     # update UI every N files
-_MAX_CONSECUTIVE_MISSING = 500   # stop scan after this many consecutive empty msg IDs
-_GFF_FORWARD_DELAY      = 1.2   # seconds between forwards (flood protection)
-
-_gff_job_queue: asyncio.Queue   = asyncio.Queue()
-_gff_completed_sessions: set    = set()
-
-
-# ── Admin filter helper ───────────────────────────────────────────────────────
-# Pyrogram filters.user() accepts int or list[int], so passing ADMIN (list) is fine.
+# ── Pyrogram filter (evaluated once at import — works with list or int) ───────
 _ADMIN_FILTER = filters.user(ADMIN)
 
+# ── In-memory state ───────────────────────────────────────────────────────────
+ADMIN_FF_SESSIONS: dict  = {}   # session_id → session dict
+ADMIN_FF_CANCELLED: set  = set()
 
-# ── Startup hook (called from bot.py) ────────────────────────────────────────
+GLOBAL_FF_WORKERS        = 2
+_GFF_PROGRESS_EVERY      = 5
+_MAX_CONSECUTIVE_MISSING = 500
+_GFF_FORWARD_DELAY       = 1.2
+
+_gff_job_queue           = asyncio.Queue()
+_gff_completed_sessions: set = set()
+
+
+# ── Startup hook ──────────────────────────────────────────────────────────────
 
 def on_bot_start(client: Client):
-    """Launch the global-forward worker pool once at bot start."""
+    """Called by bot.py after the event loop is running."""
     for i in range(GLOBAL_FF_WORKERS):
         asyncio.create_task(
             _global_ff_worker(client),
             name=f"gff_worker_{i}",
         )
-    print(f"[GFF] {GLOBAL_FF_WORKERS} global-forward workers started, dest={MANUAL_FF}")
+    print(f"[GFF] {GLOBAL_FF_WORKERS} global-forward workers started | dest={MANUAL_FF}")
+
+
+# ── Helper: collect all non-admin user channels ───────────────────────────────
+
+async def _get_all_user_channels() -> list:
+    """
+    Scan the users collection and return every channel added by a non-admin.
+    Returns list of dicts: {channel_id, channel_title, user_id}
+    Channels added by ADMIN ids are excluded.
+    Duplicate channel_ids (added by multiple users) appear only once.
+    """
+    admin_ids     = set(ADMIN) if isinstance(ADMIN, (list, tuple, set)) else {ADMIN}
+    seen          = set()
+    result        = []
+
+    async for doc in users.find({}, {"_id": 1, "channels": 1}):
+        uid = doc["_id"]
+        if uid in admin_ids:
+            continue
+        for ch in doc.get("channels", []):
+            cid = ch.get("channel_id")
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            result.append({
+                "channel_id":    cid,
+                "channel_title": ch.get("channel_title") or str(cid),
+                "user_id":       uid,
+            })
+    return result
 
 
 # ── /channels command ─────────────────────────────────────────────────────────
@@ -69,41 +89,14 @@ async def channels_cmd(client: Client, message):
     await _show_channel_list(client, message)
 
 
-# ── Shared list renderer (works for Message AND CallbackQuery) ─────────────────
-
-async def _get_user_channels_for_admin() -> list[dict]:
-    """
-    Returns all channels added by non-admin users.
-    Deduplicates by channel_id. Excludes any channel added by an ADMIN id.
-    """
-    admin_ids    = set(ADMIN) if isinstance(ADMIN, (list, tuple, set)) else {ADMIN}
-    result       = []
-    seen_channels: set = set()
-
-    async for user_doc in users.find({}):
-        uid = user_doc["_id"]
-        if uid in admin_ids:
-            continue
-        for ch in user_doc.get("channels", []):
-            cid = ch.get("channel_id")
-            if not cid or cid in seen_channels:
-                continue
-            seen_channels.add(cid)
-            result.append({
-                "channel_id":    cid,
-                "channel_title": ch.get("channel_title", str(cid)),
-                "user_id":       uid,
-            })
-    return result
-
+# ── Channel list renderer ─────────────────────────────────────────────────────
 
 async def _show_channel_list(client: Client, target):
     """
-    Render the channel list.
-    `target` is either a Message (from /channels) or a CallbackQuery (from Back button).
+    Works for both Message (initial /channels) and CallbackQuery (Back button).
     """
-    channels  = await _get_user_channels_for_admin()
-    is_query  = hasattr(target, "data")   # True → CallbackQuery
+    channels = await _get_all_user_channels()
+    is_query = hasattr(target, "data")   # True → CallbackQuery
 
     if not channels:
         text = (
@@ -140,15 +133,15 @@ async def _show_channel_list(client: Client, target):
 
 @Client.on_callback_query(filters.regex(r"^adm_ch_(-?\d+)$") & _ADMIN_FILTER)
 async def adm_channel_detail(client: Client, query):
-    channel_id = int(query.matches[0].group(1))
     await query.answer()
+    channel_id = int(query.matches[0].group(1))
     await _show_channel_detail(client, query, channel_id)
 
 
 async def _show_channel_detail(client: Client, query, channel_id: int):
     admin_ids = set(ADMIN) if isinstance(ADMIN, (list, tuple, set)) else {ADMIN}
 
-    # ── Channel title ──────────────────────────────────────────────────────
+    # Channel title
     cap_doc = await get_channel_cached(channel_id)
     title   = cap_doc.get("_title")
     if not title:
@@ -159,15 +152,14 @@ async def _show_channel_detail(client: Client, query, channel_id: int):
         except Exception:
             title = str(channel_id)
 
-    # ── Who added the bot ─────────────────────────────────────────────────
+    # Who added the bot
     added_by_id   = None
     added_by_name = "Unknown"
-
-    async for user_doc in users.find({}):
-        uid = user_doc["_id"]
+    async for doc in users.find({}, {"_id": 1, "channels": 1}):
+        uid = doc["_id"]
         if uid in admin_ids:
             continue
-        for ch in user_doc.get("channels", []):
+        for ch in doc.get("channels", []):
             if ch.get("channel_id") == channel_id:
                 added_by_id = uid
                 try:
@@ -184,18 +176,18 @@ async def _show_channel_detail(client: Client, query, channel_id: int):
         if added_by_id:
             break
 
-    # ── File count ─────────────────────────────────────────────────────────
-    file_count_text = "Unknown"
+    # File count
+    file_count = "N/A"
     try:
         count = 0
         async for msg in client.get_chat_history(channel_id, limit=10000):
             if msg.media:
                 count += 1
-        file_count_text = f"{count}+" if count == 10000 else str(count)
+        file_count = f"{count}+" if count == 10000 else str(count)
     except Exception:
-        file_count_text = "N/A"
+        pass
 
-    # ── Previous forwarding progress ──────────────────────────────────────
+    # Forwarding progress
     progress  = await get_global_ff_progress(channel_id)
     last_fwd  = progress.get("last_msg_id", 0)
     total_fwd = progress.get("total_forwarded", 0)
@@ -210,11 +202,11 @@ async def _show_channel_detail(client: Client, query, channel_id: int):
         progress_text = "📌 <b>No previous forwarding history.</b>"
         has_progress  = False
 
-    # ── Destination info ──────────────────────────────────────────────────
-    dest_title = str(MANUAL_FF)
+    # Destination name
+    dest_name = str(MANUAL_FF)
     try:
-        dest_chat  = await client.get_chat(MANUAL_FF)
-        dest_title = getattr(dest_chat, "title", dest_title)
+        dc = await client.get_chat(MANUAL_FF)
+        dest_name = getattr(dc, "title", dest_name)
     except Exception:
         pass
 
@@ -223,8 +215,8 @@ async def _show_channel_detail(client: Client, query, channel_id: int):
         f"🆔 <b>Channel ID:</b> <code>{channel_id}</code>\n\n"
         f"👤 <b>Added by:</b> {added_by_name}\n"
         f"🆔 <b>User ID:</b> <code>{added_by_id or 'Unknown'}</code>\n\n"
-        f"🗂 <b>Files in channel:</b> <code>{file_count_text}</code>\n"
-        f"📥 <b>Forward dest:</b> {dest_title}\n\n"
+        f"🗂 <b>Files in channel:</b> <code>{file_count}</code>\n"
+        f"📥 <b>Forward dest:</b> {dest_name}\n\n"
         f"{progress_text}"
     )
 
@@ -248,7 +240,7 @@ async def adm_ch_back(client: Client, query):
     await _show_channel_list(client, query)
 
 
-# ── Start forwarding from scratch ─────────────────────────────────────────────
+# ── Start forwarding from message 1 ──────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^gff_start_(-?\d+)$") & _ADMIN_FILTER)
 async def gff_start(client: Client, query):
@@ -256,13 +248,13 @@ async def gff_start(client: Client, query):
     channel_id = int(query.matches[0].group(1))
     session_id = str(uuid.uuid4())
 
-    cap_doc    = await get_channel_cached(channel_id)
-    src_title  = cap_doc.get("_title", str(channel_id))
+    cap_doc   = await get_channel_cached(channel_id)
+    src_title = cap_doc.get("_title", str(channel_id))
 
     dest_title = str(MANUAL_FF)
     try:
-        dest_chat  = await client.get_chat(MANUAL_FF)
-        dest_title = getattr(dest_chat, "title", dest_title)
+        dc         = await client.get_chat(MANUAL_FF)
+        dest_title = getattr(dc, "title", dest_title)
     except Exception:
         pass
 
@@ -277,8 +269,8 @@ async def gff_start(client: Client, query):
         "ui_msg_id":     query.message.id,
         "total":         0,
         "forwarded":     0,
-        "is_continue":   False,
         "scan_done":     False,
+        "is_continue":   False,
     }
     ADMIN_FF_SESSIONS[session_id] = session
 
@@ -298,7 +290,7 @@ async def gff_start(client: Client, query):
     )
 
 
-# ── Continue from previous forwarding ────────────────────────────────────────
+# ── Continue from previous progress ──────────────────────────────────────────
 
 @Client.on_callback_query(filters.regex(r"^gff_continue_(-?\d+)$") & _ADMIN_FILTER)
 async def gff_continue(client: Client, query):
@@ -314,8 +306,8 @@ async def gff_continue(client: Client, query):
 
     dest_title = str(MANUAL_FF)
     try:
-        dest_chat  = await client.get_chat(MANUAL_FF)
-        dest_title = getattr(dest_chat, "title", dest_title)
+        dc         = await client.get_chat(MANUAL_FF)
+        dest_title = getattr(dc, "title", dest_title)
     except Exception:
         pass
 
@@ -330,9 +322,9 @@ async def gff_continue(client: Client, query):
         "ui_msg_id":     query.message.id,
         "total":         0,
         "forwarded":     prev_total,
+        "scan_done":     False,
         "is_continue":   True,
         "prev_total":    prev_total,
-        "scan_done":     False,
     }
     ADMIN_FF_SESSIONS[session_id] = session
 
@@ -363,9 +355,9 @@ async def gff_stop(client: Client, query):
     ADMIN_FF_CANCELLED.add(session_id)
     session    = ADMIN_FF_SESSIONS.pop(session_id, None)
 
-    forwarded  = session.get("forwarded", 0) if session else 0
-    total      = session.get("total", 0)     if session else 0
-    title      = session.get("channel_title", "Channel") if session else "Channel"
+    forwarded = session.get("forwarded", 0) if session else 0
+    total     = session.get("total", 0)     if session else 0
+    title     = session.get("channel_title", "Channel") if session else "Channel"
 
     await query.message.edit_text(
         f"🛑 <b>Forwarding stopped.</b>\n\n"
@@ -383,8 +375,8 @@ async def gff_stop(client: Client, query):
 
 async def _gff_scan_and_enqueue(client: Client, session_id: str):
     """
-    Scans the source channel for media messages and enqueues them.
-    Yields control on every iteration — never blocks caption/other workers.
+    Scans the source channel message by message and enqueues media messages.
+    Yields control on every iteration — never blocks caption/forward workers.
     """
     session = ADMIN_FF_SESSIONS.get(session_id)
     if not session:
@@ -392,8 +384,8 @@ async def _gff_scan_and_enqueue(client: Client, session_id: str):
 
     channel_id          = session["channel_id"]
     start_from          = session["start_from"]
-    consecutive_missing = 0
     msg_id              = start_from
+    consecutive_missing = 0
     total_found         = 0
 
     while True:
@@ -411,7 +403,8 @@ async def _gff_scan_and_enqueue(client: Client, session_id: str):
             continue
         except Exception as e:
             print(f"[GFF_SCAN] error msg_id={msg_id}: {e}")
-            msg = None
+            msg_id += 1
+            continue
 
         if not msg or getattr(msg, "empty", True):
             consecutive_missing += 1
@@ -440,7 +433,7 @@ async def _gff_scan_and_enqueue(client: Client, session_id: str):
         session["total"]   = total_found
         msg_id            += 1
 
-    # Scan finished
+    # Scan complete
     if session_id not in ADMIN_FF_CANCELLED:
         session["scan_done"] = True
         if total_found == 0:
@@ -464,9 +457,8 @@ async def _gff_scan_and_enqueue(client: Client, session_id: str):
 
 async def _global_ff_worker(client: Client):
     """
-    Long-running worker — pulls jobs from _gff_job_queue, copies each media
-    message to MANUAL_FF, saves progress, updates UI.
-    Completely isolated from caption and user file_forward workers.
+    Dedicated worker — pulls from _gff_job_queue, copies to MANUAL_FF.
+    Isolated from caption and user file_forward workers.
     """
     while True:
         try:
@@ -486,7 +478,6 @@ async def _global_ff_worker(client: Client):
             continue
 
         channel_id = job["channel_id"]
-        dest_id    = job["dest_id"]
         msg_id     = job["msg_id"]
 
         try:
@@ -496,7 +487,7 @@ async def _global_ff_worker(client: Client):
                 continue
 
             await client.copy_message(
-                chat_id=dest_id,
+                chat_id=job["dest_id"],
                 from_chat_id=channel_id,
                 message_id=msg_id,
             )
@@ -504,10 +495,9 @@ async def _global_ff_worker(client: Client):
             session["forwarded"] = session.get("forwarded", 0) + 1
             forwarded = session["forwarded"]
 
-            # Persist progress
             await save_global_ff_progress(channel_id, msg_id, forwarded)
 
-            # Update UI every N files or when queue is empty
+            # Update progress UI every N files or when queue is momentarily empty
             if forwarded % _GFF_PROGRESS_EVERY == 0 or _gff_job_queue.empty():
                 if session_id not in ADMIN_FF_CANCELLED and session_id not in _gff_completed_sessions:
                     total = session.get("total", 0)
@@ -538,14 +528,11 @@ async def _global_ff_worker(client: Client):
             print(f"[GFF_WORKER_ERR] msg_id={msg_id} ch={channel_id}: {e}")
 
         _gff_job_queue.task_done()
-
         await _gff_maybe_complete(client, job, session)
 
 
 async def _gff_maybe_complete(client: Client, job: dict, session: dict):
-    """Send the completion message when the session is fully done."""
     session_id = job["session_id"]
-
     if session_id in ADMIN_FF_CANCELLED:
         return
     if session_id in _gff_completed_sessions:
@@ -560,7 +547,6 @@ async def _gff_maybe_complete(client: Client, job: dict, session: dict):
     if total > 0 and forwarded < total:
         return
 
-    # Guard — only one worker fires the completion
     if session_id in _gff_completed_sessions:
         return
     _gff_completed_sessions.add(session_id)
