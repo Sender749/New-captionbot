@@ -48,10 +48,11 @@ class Bot(Client):
         # Run per-plugin startup hooks (e.g. file_forward.on_bot_start)
         await self._run_plugin_startup_hooks()
 
-        # Launch caption worker pool  (CAPTION_WORKERS = 6)
-        for i in range(CAPTION_WORKERS):
-            asyncio.create_task(caption_worker(self), name=f"cap_worker_{i}")
-        print(f"[BOT] {CAPTION_WORKERS} caption workers started")
+        # Start per-channel queue system.
+        # caption_worker now recovers pending jobs from MongoDB and
+        # spawns dedicated per-channel workers automatically.
+        asyncio.create_task(caption_worker(self), name="cap_recovery")
+        print("[BOT] Per-channel caption queue system started")
 
         me = await self.get_me()
         self.force_channel = FORCE_SUB
