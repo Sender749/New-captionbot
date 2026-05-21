@@ -10,7 +10,16 @@ from body.database import *
 from body.file_forward import *
 from collections import deque, defaultdict
 from imdb import IMDb
-from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
+from body.database import (
+    _CHANNEL_CACHE as CHANNEL_CACHE,
+    CHANNEL_ACTIVE,
+    CHANNEL_COOLDOWN,
+    DEFAULT_MAX_WORKERS,
+    CHANNEL_QUEUES,
+    CHANNEL_PROGRESS,
+    get_channel_queue,
+    reset_channel_progress,
+)
 
 ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
@@ -708,6 +717,39 @@ async def queue_status(client, message):
         else:
             text += "✅ Caption queue is empty\n\n"
 
+        # ── Per-channel live progress (new queue system) ──────────────────
+        from body.database import CHANNEL_QUEUES, CHANNEL_PROGRESS
+        live_ch_lines = []
+        for ch_id, q in list(CHANNEL_QUEUES.items()):
+            qsize = q.qsize()
+            prog  = CHANNEL_PROGRESS.get(ch_id, {})
+            enqueued  = prog.get("enqueued", 0)
+            edited    = prog.get("edited", 0)
+            failed    = prog.get("failed", 0)
+            remaining = max(0, enqueued - edited - failed)
+            if enqueued == 0 and qsize == 0:
+                continue
+            try:
+                chat    = await client.get_chat(ch_id)
+                ch_name = chat.title or str(ch_id)
+            except Exception:
+                ch_name = str(ch_id)
+            pct = int((edited / enqueued) * 100) if enqueued > 0 else 0
+            bar_filled = int(pct / 10)
+            bar = "▓" * bar_filled + "░" * (10 - bar_filled)
+            eta_secs = int(remaining * DEFAULT_EDIT_DELAY)
+            live_ch_lines.append(
+                f"• <b>{ch_name}</b> <code>({ch_id})</code>\n"
+                f"  ├ [{bar}] <code>{pct}%</code>\n"
+                f"  ├ ✅ Edited: <code>{edited}</code>  "
+                f"⏳ Remaining: <code>{remaining}</code>  "
+                f"❌ Failed: <code>{failed}</code>\n"
+                f"  └ ⏱ ETA: ~{eta_secs // 60}m {eta_secs % 60}s"
+            )
+
+        if live_ch_lines:
+            text += "📡 <b>Live Channel Progress</b>\n" + "\n\n".join(live_ch_lines) + "\n\n"
+
         text += (
             "📦 <b>FILE FORWARD QUEUE</b>\n"
             f"  • Pending   : <code>{f_pending}</code>\n"
@@ -747,59 +789,153 @@ def sanitize_caption_html(text: str) -> str:
     return re.sub(r"</?\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>", repl, text)
 
 async def caption_worker(client: Client):
+    """
+    Legacy global worker — kept for backward-compat with bot.py startup.
+    In the new system each channel has its own dedicated worker
+    (channel_caption_worker).  This function just idles so bot.py
+    loop still has the expected number of tasks without doing anything.
+    """
     while True:
-        job = await fetch_channel_job()
-        if not job:
-            await asyncio.sleep(0.5)
-            continue
-        ch = job["chat_id"]
-        released = False
+        await asyncio.sleep(60)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Per-channel isolated worker  (NEW)
+#
+#  One coroutine per active channel.  Reads from the channel's own
+#  asyncio.Queue (unlimited capacity).  A FloodWait only pauses THIS
+#  channel; every other channel keeps processing normally.
+#
+#  Progress counters (enqueued / edited / failed) are tracked in
+#  CHANNEL_PROGRESS[channel_id] so /queue can report them accurately.
+# ══════════════════════════════════════════════════════════════════════
+async def channel_caption_worker(channel_id: int):
+    """
+    Dedicated worker for a single channel.
+
+    • Processes all jobs in the channel's queue, one at a time.
+    • Handles FloodWait by sleeping only for this channel's worker.
+    • Retries failed jobs up to MAX_RETRIES times before giving up.
+    • Exits cleanly when the queue is empty, so the task is GC'd and
+      a fresh one will be spawned next time a new job arrives.
+    """
+    from bot import Bot  # lazy import to get the running client instance
+
+    MAX_RETRIES = 5
+    q = get_channel_queue(channel_id)
+
+    # _client is injected when this coroutine is first awaited via
+    # _ensure_channel_worker → create_task.  We retrieve the running
+    # Bot instance via the module-level singleton.
+    client = Bot._running_instance  # set in bot.py after super().start()
+
+    print(f"[QUEUE] Worker started for channel {channel_id}")
+
+    while True:
         try:
-            await client.edit_message_caption(
-                chat_id=ch,
-                message_id=job["message_id"],
-                caption=job["caption"],
-                parse_mode=ParseMode.HTML,
-                reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row] for row in job.get("url_buttons", [])]) 
-                              if job.get("url_buttons") else None
-                             )
-            )
-            if not await is_dump_skip(ch):
-                try:
-                    original = await client.get_messages(ch, job["message_id"])
-                    fname = None
-                    for t in ("document", "video", "audio", "voice"):
-                        obj = getattr(original, t, None)
-                        if obj:
-                            fname = getattr(obj, "file_name", None)
-                            break
-                    fname = clean_text(fname or "File")
-                    fname = remove_emojis(fname)
-                    await client.copy_message(
-                        chat_id=CP_CH,
-                        from_chat_id=ch,
-                        message_id=job["message_id"],
-                        caption=fname
-                    )
-                except:
-                    pass
-            await mark_done(job["_id"])
-            await asyncio.sleep(DEFAULT_EDIT_DELAY)
-        except FloodWait as e:
-            wait = e.value + 2
-            CHANNEL_COOLDOWN[ch] = time.time() + wait
-            await reschedule(job["_id"], delay=wait)
-        except errors.MessageNotModified:
-            await mark_done(job["_id"])
-        except Exception:
-            if job.get("retries", 0) >= 5:
+            # Wait up to 30 s for a new job; exit if queue stays empty
+            try:
+                job = await asyncio.wait_for(q.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Queue has been empty for 30 s — worker can exit.
+                # A new one will be spawned on the next enqueue.
+                print(f"[QUEUE] Channel {channel_id} idle — worker exiting")
+                # Reset progress counters once the queue drains
+                reset_channel_progress(channel_id)
+                return
+
+            ch = job["chat_id"]  # == channel_id
+
+            # ── Edit the caption ──────────────────────────────────────
+            try:
+                await client.edit_message_caption(
+                    chat_id=ch,
+                    message_id=job["message_id"],
+                    caption=job["caption"],
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=(
+                        InlineKeyboardMarkup([
+                            [InlineKeyboardButton(btn["text"], url=btn["url"])
+                             for btn in row]
+                            for row in job.get("url_buttons", [])
+                        ])
+                        if job.get("url_buttons") else None
+                    ),
+                )
+
+                # ── Dump-copy if enabled ──────────────────────────────
+                if not await is_dump_skip(ch):
+                    try:
+                        original = await client.get_messages(ch, job["message_id"])
+                        fname = None
+                        for t in ("document", "video", "audio", "voice"):
+                            obj = getattr(original, t, None)
+                            if obj:
+                                fname = getattr(obj, "file_name", None)
+                                break
+                        fname = clean_text(fname or "File")
+                        fname = remove_emojis(fname)
+                        await client.copy_message(
+                            chat_id=CP_CH,
+                            from_chat_id=ch,
+                            message_id=job["message_id"],
+                            caption=fname,
+                        )
+                    except Exception:
+                        pass
+
+                # ── Mark done ─────────────────────────────────────────
                 await mark_done(job["_id"])
-            else:
-                await reschedule(job["_id"], delay=10)
-        finally:
-            if not released:
-                CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
-                released = True
+                CHANNEL_PROGRESS[ch]["edited"] += 1
+
+                edited  = CHANNEL_PROGRESS[ch]["edited"]
+                enqueued = CHANNEL_PROGRESS[ch]["enqueued"]
+                remaining = max(0, enqueued - edited - CHANNEL_PROGRESS[ch]["failed"])
+                print(
+                    f"[QUEUE] ch={ch} | edited={edited} | "
+                    f"remaining≈{remaining} | queue_size={q.qsize()}"
+                )
+
+                # Normal inter-edit delay
+                await asyncio.sleep(DEFAULT_EDIT_DELAY)
+
+            except FloodWait as e:
+                # FloodWait: sleep only this channel's worker; re-queue job
+                wait = e.value + 2
+                print(
+                    f"[FLOODWAIT] ch={ch} — sleeping {wait}s "
+                    f"(queue has {q.qsize()} more jobs)"
+                )
+                # Re-insert job at front by putting it back then waiting
+                # We can't prepend, so we sleep first then re-put
+                await reschedule(job["_id"], delay=wait)
+                # Re-add to in-memory queue so it will be processed after sleep
+                await asyncio.sleep(wait)
+                await q.put(job)
+
+            except errors.MessageNotModified:
+                await mark_done(job["_id"])
+                CHANNEL_PROGRESS[ch]["edited"] += 1
+
+            except Exception as e:
+                retries = job.get("retries", 0)
+                if retries >= MAX_RETRIES:
+                    print(f"[QUEUE] Job {job.get('_id')} failed after {MAX_RETRIES} retries: {e}")
+                    await mark_done(job["_id"])
+                    CHANNEL_PROGRESS[ch]["failed"] += 1
+                else:
+                    job["retries"] = retries + 1
+                    await reschedule(job["_id"], delay=10)
+                    await asyncio.sleep(10)
+                    await q.put(job)
+
+            finally:
+                q.task_done()
+
+        except Exception as outer_err:
+            # Safety net: never let the worker die from an unexpected error
+            print(f"[QUEUE] Unexpected error in worker for ch={channel_id}: {outer_err}")
+            await asyncio.sleep(2)
 
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
