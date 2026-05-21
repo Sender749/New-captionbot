@@ -11,6 +11,7 @@ from body.database import (
     ensure_queue_indexes,
     ensure_forward_indexes,
     recover_stuck_jobs,
+    recover_pending_caption_jobs,
 )
 from body.Caption import caption_worker
 
@@ -18,6 +19,8 @@ PLUGIN_ROOT = "body"
 
 
 class Bot(Client):
+    _running_instance = None  # set after start() so per-channel workers can reference client
+
     def __init__(self):
         super().__init__(
             name="Auto Cap",
@@ -40,6 +43,9 @@ class Bot(Client):
             await asyncio.sleep(e.value)
             await super().start()
 
+        # Store running instance so per-channel workers can reference the client
+        Bot._running_instance = self
+
         # One-time DB setup
         await ensure_queue_indexes()
         await ensure_forward_indexes()
@@ -48,10 +54,14 @@ class Bot(Client):
         # Run per-plugin startup hooks (e.g. file_forward.on_bot_start)
         await self._run_plugin_startup_hooks()
 
-        # Launch caption worker pool  (CAPTION_WORKERS = 6)
+        # Launch legacy caption worker slots (now idle; real work is per-channel)
         for i in range(CAPTION_WORKERS):
             asyncio.create_task(caption_worker(self), name=f"cap_worker_{i}")
-        print(f"[BOT] {CAPTION_WORKERS} caption workers started")
+        print(f"[BOT] {CAPTION_WORKERS} legacy caption worker slots reserved")
+
+        # Re-queue any jobs that were pending at last shutdown into per-channel queues
+        await recover_pending_caption_jobs()
+        print("[BOT] Per-channel caption queue system active")
 
         me = await self.get_me()
         self.force_channel = FORCE_SUB
