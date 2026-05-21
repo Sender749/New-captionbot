@@ -480,34 +480,6 @@ async def queue_status(client, message):
         text += "🔥 <b>Top Busy Caption Channels</b>\n" + "\n".join(cap_lines) + "\n\n"
     else:
         text += "✅ No caption tasks\n\n"
-
-    # ── Live per-channel progress (new queue system) ──────────────────────
-    from body.database import CHANNEL_QUEUES, CHANNEL_PROGRESS
-    live_lines = []
-    for ch_id, q in list(CHANNEL_QUEUES.items()):
-        prog = CHANNEL_PROGRESS.get(ch_id, {})
-        enqueued  = prog.get("enqueued", 0)
-        edited    = prog.get("edited", 0)
-        failed    = prog.get("failed", 0)
-        if enqueued == 0 and q.qsize() == 0:
-            continue
-        try:
-            chat    = await client.get_chat(ch_id)
-            ch_name = chat.title or str(ch_id)
-        except Exception:
-            ch_name = str(ch_id)
-        remaining = max(0, enqueued - edited - failed)
-        pct       = int((edited / enqueued) * 100) if enqueued > 0 else 0
-        bar       = "▓" * (pct // 10) + "░" * (10 - pct // 10)
-        eta_s     = int(remaining * DEFAULT_EDIT_DELAY)
-        live_lines.append(
-            f"• <b>{ch_name}</b>\n"
-            f"  ├ [{bar}] {pct}%\n"
-            f"  ├ ✅ {edited} edited  ⏳ {remaining} left  ❌ {failed} failed\n"
-            f"  └ ETA ~{eta_s // 60}m {eta_s % 60}s"
-        )
-    if live_lines:
-        text += "📡 <b>Live Queue Progress</b>\n" + "\n\n".join(live_lines) + "\n\n"
     text += (
         "📦 <b>File Forward Queue</b>\n"
         f"• Pending: <code>{f_pending}</code>\n"
@@ -529,64 +501,24 @@ def sanitize_caption_html(text: str) -> str:
         return match.group(0) if tag in allowed_tags else ""
     return re.sub(r"</?\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>", repl, text)
 
-
 async def caption_worker(client: Client):
-    """
-    Legacy entry point called by bot.py on startup.
-    The real work is done by per-channel workers (channel_caption_worker).
-    This function now just recovers pending jobs from MongoDB and returns.
-    """
-    from body.database import recover_pending_caption_jobs
-    await recover_pending_caption_jobs(client)
-
-
-async def channel_caption_worker(channel_id: int, client: Client):
-    """
-    Dedicated worker for a single channel.
-
-    • Reads jobs from the channel's own asyncio.Queue (unlimited capacity).
-    • Handles FloodWait by sleeping ONLY this channel's worker; all other
-      channels keep processing normally.
-    • Retries failed jobs up to MAX_RETRIES times.
-    • Exits after 30 s of idle; a fresh worker is spawned on the next job.
-    """
-    from body.database import (
-        CHANNEL_QUEUES, CHANNEL_PROGRESS,
-        mark_done, reschedule,
-    )
-
-    MAX_RETRIES = 5
-    q = CHANNEL_QUEUES[channel_id]
-
-    print(f"[QUEUE] Worker started for channel {channel_id}")
-
     while True:
-        # Wait up to 30 s; exit gracefully if channel stays idle
-        try:
-            job = await asyncio.wait_for(q.get(), timeout=30.0)
-        except asyncio.TimeoutError:
-            print(f"[QUEUE] Channel {channel_id} idle — worker exiting")
-            CHANNEL_PROGRESS[channel_id] = {"enqueued": 0, "edited": 0, "failed": 0}
-            return
-
+        job = await fetch_channel_job()
+        if not job:
+            await asyncio.sleep(0.5)
+            continue
         ch = job["chat_id"]
-
+        released = False
         try:
             await client.edit_message_caption(
                 chat_id=ch,
                 message_id=job["message_id"],
                 caption=job["caption"],
                 parse_mode=ParseMode.HTML,
-                reply_markup=(
-                    InlineKeyboardMarkup([
-                        [InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row]
-                        for row in job.get("url_buttons", [])
-                    ])
-                    if job.get("url_buttons") else None
-                )
+                reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row] for row in job.get("url_buttons", [])]) 
+                              if job.get("url_buttons") else None
+                             )
             )
-
-            # Dump copy if enabled
             if not await is_dump_skip(ch):
                 try:
                     original = await client.get_messages(ch, job["message_id"])
@@ -604,45 +536,25 @@ async def channel_caption_worker(channel_id: int, client: Client):
                         message_id=job["message_id"],
                         caption=fname
                     )
-                except Exception:
+                except:
                     pass
-
             await mark_done(job["_id"])
-            CHANNEL_PROGRESS[ch]["edited"] += 1
-
-            edited    = CHANNEL_PROGRESS[ch]["edited"]
-            enqueued  = CHANNEL_PROGRESS[ch]["enqueued"]
-            remaining = max(0, enqueued - edited - CHANNEL_PROGRESS[ch]["failed"])
-            print(f"[QUEUE] ch={ch} | edited={edited} | remaining≈{remaining} | queue={q.qsize()}")
-
             await asyncio.sleep(DEFAULT_EDIT_DELAY)
-
         except FloodWait as e:
             wait = e.value + 2
-            print(f"[FLOODWAIT] ch={ch} — sleeping {wait}s (queue has {q.qsize()} more jobs)")
+            CHANNEL_COOLDOWN[ch] = time.time() + wait
             await reschedule(job["_id"], delay=wait)
-            await asyncio.sleep(wait)
-            # Re-enqueue the job so it gets processed after the wait
-            await q.put(job)
-
         except errors.MessageNotModified:
             await mark_done(job["_id"])
-            CHANNEL_PROGRESS[ch]["edited"] += 1
-
-        except Exception as e:
-            retries = job.get("retries", 0)
-            if retries >= MAX_RETRIES:
-                print(f"[QUEUE] Job {job.get('_id')} dropped after {MAX_RETRIES} retries: {e}")
+        except Exception:
+            if job.get("retries", 0) >= 5:
                 await mark_done(job["_id"])
-                CHANNEL_PROGRESS[ch]["failed"] += 1
             else:
-                job["retries"] = retries + 1
                 await reschedule(job["_id"], delay=10)
-                await asyncio.sleep(10)
-                await q.put(job)
-
         finally:
-            q.task_done()
+            if not released:
+                CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
+                released = True
 
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
@@ -741,7 +653,7 @@ async def reCap(client, msg):
         "caption": new_caption,
         "url_buttons": url_buttons or [],
         "user_id": msg.from_user.id if msg.from_user else None
-    }, client=client)
+    })
 
 # ---------------- Smart File Name Helper ----------------
 LANG_LIST = [
