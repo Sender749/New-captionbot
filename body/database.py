@@ -1,3 +1,4 @@
+import asyncio
 import motor.motor_asyncio
 from info import *
 from typing import Optional
@@ -31,6 +32,46 @@ FORWARD_DELAY        = 0.8   # forward cooldown per worker (generous)
 # ════════════════════════════════════════════════════════
 CHANNEL_ACTIVE   = defaultdict(int)   # channel_id  -> active caption workers
 CHANNEL_COOLDOWN = {}                 # channel_id  -> FloodWait unblock time
+
+# ════════════════════════════════════════════════════════
+#  Per-channel in-memory queue system  (NEW)
+#  Each channel gets its own asyncio.Queue and a dedicated
+#  worker task.  Channels are completely isolated so a
+#  FloodWait or a flood of files in one channel can never
+#  block any other channel.
+# ════════════════════════════════════════════════════════
+
+# channel_id -> asyncio.Queue  (unlimited capacity)
+CHANNEL_QUEUES: dict[int, asyncio.Queue] = {}
+
+# channel_id -> asyncio.Task  (the dedicated worker coroutine)
+CHANNEL_WORKER_TASKS: dict[int, asyncio.Task] = {}
+
+# Per-channel progress counters  (in-memory only; reset on restart)
+# { channel_id: {"enqueued": int, "edited": int, "failed": int} }
+CHANNEL_PROGRESS: dict[int, dict] = defaultdict(lambda: {"enqueued": 0, "edited": 0, "failed": 0})
+
+# Kept so bot.py import of CAPTION_WORKERS still works; the new system
+# does NOT use a fixed pool of global workers.
+# (CAPTION_WORKERS is kept for backward-compat but unused by the new engine)
+
+
+def get_channel_queue(channel_id: int) -> asyncio.Queue:
+    """Return (and lazily create) the per-channel in-memory queue."""
+    if channel_id not in CHANNEL_QUEUES:
+        CHANNEL_QUEUES[channel_id] = asyncio.Queue()
+    return CHANNEL_QUEUES[channel_id]
+
+
+def get_channel_progress(channel_id: int) -> dict:
+    """Return live progress counters for a channel."""
+    return CHANNEL_PROGRESS[channel_id]
+
+
+def reset_channel_progress(channel_id: int):
+    """Reset progress counters (call when queue drains to zero)."""
+    CHANNEL_PROGRESS[channel_id] = {"enqueued": 0, "edited": 0, "failed": 0}
+
 
 # ════════════════════════════════════════════════════════
 #  Channel settings cache  (avoids repeated DB reads)
@@ -98,9 +139,20 @@ async def ensure_global_ff_indexes():
 
 
 # ════════════════════════════════════════════════════════
-#  Caption queue helpers
+#  Caption queue helpers  (UPDATED — uses per-channel queues)
 # ════════════════════════════════════════════════════════
 async def enqueue_caption(job: dict):
+    """
+    Enqueue a caption-edit job.
+
+    1. Persist to MongoDB (survives restart).
+    2. Push into the channel's in-memory asyncio.Queue.
+    3. Spawn a dedicated worker task for this channel if one
+       isn't already running.
+    """
+    ch = job["chat_id"]
+
+    # Persist to Mongo for /queue stats and crash-recovery
     await queue_col.insert_one({
         **job,
         "status":  "pending",
@@ -108,9 +160,39 @@ async def enqueue_caption(job: dict):
         "ts":      time.time(),
     })
 
+    # Track total enqueued for this channel
+    CHANNEL_PROGRESS[ch]["enqueued"] += 1
+
+    # Push into the per-channel in-memory queue
+    q = get_channel_queue(ch)
+    await q.put(job)
+
+    # Ensure a dedicated worker is alive for this channel
+    _ensure_channel_worker(ch)
+
+
+def _ensure_channel_worker(channel_id: int):
+    """
+    Spawn a per-channel worker task if none is running.
+    Must be called from within a running asyncio event loop.
+    """
+    task = CHANNEL_WORKER_TASKS.get(channel_id)
+    if task is None or task.done():
+        # Import here to avoid circular imports at module load
+        from body.Caption import channel_caption_worker
+        t = asyncio.create_task(
+            channel_caption_worker(channel_id),
+            name=f"cap_worker_ch_{channel_id}",
+        )
+        CHANNEL_WORKER_TASKS[channel_id] = t
+
+
+# ── Legacy helpers kept for /queue stats command ─────────────────────────────
 
 async def fetch_channel_job():
     """
+    Legacy fetch — still used by the old caption_worker if somehow called.
+    The new per-channel workers call queue.get() directly.
     Fair-pick: scan pending caption jobs oldest-first.
     Skip channels that are cooled down or at concurrency cap.
     Atomically claim the first eligible job.
@@ -163,6 +245,25 @@ async def recover_stuck_jobs(timeout=300):
     )
     if r2.modified_count:
         print(f"[RECOVER] Reset {r2.modified_count} stuck forward job(s)")
+
+
+async def recover_pending_caption_jobs():
+    """
+    On startup: fetch all pending caption jobs from MongoDB and
+    push them back into their per-channel in-memory queues so
+    jobs queued before a restart are not lost.
+    """
+    count = 0
+    cursor = queue_col.find({"status": "pending"}).sort("ts", 1)
+    async for job in cursor:
+        ch = job["chat_id"]
+        q = get_channel_queue(ch)
+        await q.put(job)
+        CHANNEL_PROGRESS[ch]["enqueued"] += 1
+        _ensure_channel_worker(ch)
+        count += 1
+    if count:
+        print(f"[RECOVER] Re-queued {count} pending caption job(s) from MongoDB")
 
 
 # ════════════════════════════════════════════════════════
