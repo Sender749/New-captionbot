@@ -27,4 +27,4 @@ FF_CH = os.environ.get("FF_CH", "-1003073036876")
 
 # ── Admin global-forward destination ─────────────────────────────────────────
 # Files forwarded via /channels → "File Forwarding" are sent here.
-MANUAL_FF = int(os.environ.get("MANUAL_FF", "-1003741441979"))
+MANUAL_FF = int(os.environ.get("MANUAL_FF", "-1003979911149"))
