@@ -12,7 +12,30 @@ from collections import deque, defaultdict
 from imdb import IMDb
 from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
 
-ia = IMDb()
+ia = None  # lazily created — see _get_ia() below. NEVER call IMDb() at import time:
+           # on some hosts (Koyeb included) imdbpy's default 's3' access system tries
+           # to open a local SQLite cache via a malformed URL ("sqlite://cinemagoer.db"),
+           # which raises sqlalchemy.exc.ArgumentError and crashes the entire bot process
+           # before it can even connect to Telegram — with no useful traceback in the
+           # platform's truncated log view.
+
+def _get_ia():
+    """Lazily build (and cache) the IMDb client. Falls back to a disabled
+    state on any failure so a broken local cache backend can never take the
+    whole bot down — IMDB title enrichment is a best-effort nice-to-have,
+    not something the bot should die over.
+    """
+    global ia
+    if ia is False:
+        return None
+    if ia is None:
+        try:
+            ia = IMDb("http")  # "http" backend — no local SQLite cache involved
+        except Exception as e:
+            print(f"[WARN] IMDb() init failed, disabling title enrichment: {e}")
+            ia = False
+            return None
+    return ia
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
 DEFAULT_EDIT_DELAY = 0.3                 # per channel
 bot_data = {
@@ -1031,7 +1054,10 @@ def imdb_enrich_title(title: str, year: str):
     if not title or not year or len(title) < 3:
         return title, year
     try:
-        results = ia.search_movie(title)
+        client_ia = _get_ia()
+        if client_ia is None:
+            return title, year
+        results = client_ia.search_movie(title)
         for r in results[:5]:
             if str(r.get("year", "")) == year:
                 clean = r.get("title", title)
