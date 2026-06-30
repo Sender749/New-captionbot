@@ -1870,6 +1870,98 @@ async def capture_user_input(client, message):
         )
         return
 
+    # ================= FILE FORWARD CAPTION-PANEL TEXT INPUT =================
+    # Handles text typed in response to the per-session caption customization
+    # panel (Set Caption / Block Words / Replace Words / Prefix / Suffix /
+    # Button URL). These settings live only on FF_SESSIONS — never the DB —
+    # so they only apply to the current forwarding session.
+    if user_id in FF_SESSIONS and FF_SESSIONS[user_id].get("pending_input"):
+        session = FF_SESSIONS[user_id]
+        pending = session.get("pending_input")
+        cs      = session.setdefault("caption_settings", {})
+        chat_id = session["chat_id"]
+        msg_id  = session["msg_id"]
+
+        if not text.strip():
+            return
+
+        if pending == "caption":
+            cs["template"] = text
+            try:
+                await client.delete_messages(user_id, message.id)
+            except Exception:
+                pass
+            session.pop("pending_input", None)
+            await _render_ff_capsub(client, chat_id, msg_id, cs)
+            return
+
+        if pending == "block_words":
+            cs["block_words"] = text.strip()
+            try:
+                await client.delete_messages(user_id, message.id)
+            except Exception:
+                pass
+            session.pop("pending_input", None)
+            await _render_ff_words_menu(client, chat_id, msg_id, cs)
+            return
+
+        if pending == "replace_words":
+            cs["replace_words"] = text.strip()
+            try:
+                await client.delete_messages(user_id, message.id)
+            except Exception:
+                pass
+            session.pop("pending_input", None)
+            await _render_ff_replace_menu(client, chat_id, msg_id, cs)
+            return
+
+        if pending == "prefix":
+            cs["prefix"] = text.strip()
+            try:
+                await client.delete_messages(user_id, message.id)
+            except Exception:
+                pass
+            session.pop("pending_input", None)
+            await _render_ff_suffixprefix_menu(client, chat_id, msg_id, cs)
+            return
+
+        if pending == "suffix":
+            cs["suffix"] = text.strip()
+            try:
+                await client.delete_messages(user_id, message.id)
+            except Exception:
+                pass
+            session.pop("pending_input", None)
+            await _render_ff_suffixprefix_menu(client, chat_id, msg_id, cs)
+            return
+
+        if pending == "url_buttons":
+            rows = []
+            for line in text.strip().splitlines():
+                row = []
+                parts = [p.strip() for p in line.split("|") if p.strip()]
+                for part in parts:
+                    matched = re.findall(r'"([^"]+)"', part)
+                    if len(matched) == 2:
+                        row.append({"text": matched[0], "url": matched[1]})
+                if not row:
+                    matched = re.findall(r'"([^"]+)"', line)
+                    if len(matched) == 2:
+                        row.append({"text": matched[0], "url": matched[1]})
+                if row:
+                    rows.append(row)
+            if not rows:
+                await message.reply_text("❌ Invalid format. Please try again.")
+                return
+            cs["url_buttons"] = rows
+            try:
+                await client.delete_messages(user_id, message.id)
+            except Exception:
+                pass
+            session.pop("pending_input", None)
+            await _render_ff_url_menu(client, chat_id, msg_id, cs)
+            return
+
     # ================= FILE FORWARD SKIP HANDLER =================
     if user_id in FF_SESSIONS:
         session = FF_SESSIONS[user_id]
