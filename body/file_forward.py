@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 import time
@@ -6,14 +7,16 @@ import uuid
 from collections import defaultdict
 
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, MessageNotModified, MessageIdInvalid
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from pyrogram.enums import ParseMode
 
 from body.database import (
     FORWARD_WORKERS,
     MAX_FORWARD_PER_PAIR,
+    MAX_GLOBAL_FF_SESSIONS,
     FORWARD_DELAY,
+    FF_PROGRESS_INTERVAL,
     enqueue_forward,
     forward_done,
     forward_retry,
@@ -21,12 +24,24 @@ from body.database import (
 )
 from info import ADMIN, FF_CH
 
+# ── structured logger (goes to stdout → Koyeb log stream) ────────────────────
+log = logging.getLogger("FF")
+
 # ── in-memory state ──────────────────────────────────────────────────────────
 FORWARD_ACTIVE   = defaultdict(int)   # (src, dst) -> active worker count
 FORWARD_COOLDOWN = {}                 # (src, dst) -> unblock timestamp
 
 FF_SESSIONS        = {}               # uid -> session dict
 CANCELLED_SESSIONS = set()            # session_ids that were cancelled
+
+# ── Global slot limiter ───────────────────────────────────────────────────────
+# Tracks UIDs of sessions that are ACTIVELY scanning/forwarding right now.
+# When full, new sessions are placed in _FF_SLOT_QUEUE (FIFO) and auto-start
+# when a slot opens up.  This prevents file-forwarding from eating the CPU/RAM
+# budget that caption editing needs.
+_FF_ACTIVE_UIDS:  set  = set()            # UIDs currently using a slot
+_FF_SLOT_QUEUE:   list = []               # [(uid, client)] waiting for a slot
+_FF_SLOT_LOCK:    asyncio.Lock | None = None  # created lazily in async context
 
 # ── regex helpers ─────────────────────────────────────────────────────────────
 USERNAME_RE = re.compile(r"@\w+",           flags=re.IGNORECASE)
@@ -45,14 +60,14 @@ ANIM_FRAMES = [
     "🔄 Transferring files...",
 ]
 
-# Rate-limit progress edits: update UI every N completions (per session)
-_PROGRESS_EVERY = 3
+# Progress UI: update at most once every FF_PROGRESS_INTERVAL seconds per session.
+# Keyed by session_id → last update timestamp.
+_session_last_progress: dict[str, float] = {}
 
-# Per-session counters: session_id -> number of files forwarded so far
+# Per-session done counter: session_id → forwarded count (in-memory, single-thread safe)
 _session_done_count: dict[str, int] = defaultdict(int)
 
 # Sessions whose completion message has already been sent.
-# Prevents multiple workers racing to send "✅ Forwarding completed".
 _session_completed: set = set()
 
 
@@ -73,34 +88,127 @@ def _default_ff_caption_settings() -> dict:
     }
 
 
-async def _edit_with_retry(client: Client, chat_id, msg_id, text, reply_markup=None, max_retries: int = 4) -> bool:
+async def _edit_with_retry(client: Client, chat_id, msg_id, text, reply_markup=None, max_retries: int = 5) -> bool:
     """
-    Like client.edit_message_text but retries on FloodWait / transient errors
-    instead of silently giving up. Used for the completion message so that a
-    rate-limit hit can never leave the UI stuck on "🔄 Transferring files…"
-    after forwarding has actually finished.
+    Edit a message, retrying on FloodWait or transient errors.
+    Used for the completion message so a rate-limit hit can never leave
+    the UI stuck on "🔄 Transferring…" after forwarding actually finished.
     """
     for attempt in range(max_retries):
         try:
-            await client.edit_message_text(chat_id, msg_id, text, reply_markup=reply_markup)
+            await client.edit_message_text(
+                chat_id, msg_id, text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
             return True
         except FloodWait as e:
-            await asyncio.sleep(int(e.value) + 1)
+            wait = int(e.value) + 1
+            log.warning("[EDIT_RETRY] FloodWait %ds (attempt %d)", wait, attempt + 1)
+            await asyncio.sleep(wait)
+        except (MessageNotModified, MessageIdInvalid):
+            return True   # idempotent — message is already correct
         except Exception as e:
-            # MessageNotModified etc. — nothing more we can do, and nothing to retry
-            print(f"[FF_EDIT_RETRY_FAIL] attempt={attempt} err={e}")
+            log.warning("[EDIT_RETRY] attempt=%d err=%s", attempt + 1, e)
             if attempt == max_retries - 1:
                 return False
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
     return False
+
+
+# ── Global FF slot management ─────────────────────────────────────────────────
+def _get_slot_lock() -> asyncio.Lock:
+    global _FF_SLOT_LOCK
+    if _FF_SLOT_LOCK is None:
+        _FF_SLOT_LOCK = asyncio.Lock()
+    return _FF_SLOT_LOCK
+
+
+async def _acquire_ff_slot(uid: int, client: Client) -> bool:
+    """
+    Try to acquire a forwarding slot for `uid`.
+    • If a slot is free  → grants it immediately, returns True.
+    • If all slots full  → queues the user, sends a "waiting" message,
+                           returns False (caller should NOT start the scan).
+    The queued session will be auto-started by _release_ff_slot() when
+    another session finishes.
+    """
+    async with _get_slot_lock():
+        if uid in _FF_ACTIVE_UIDS:
+            log.info("[FF_SLOT] uid=%d already has an active session — blocked", uid)
+            return False
+        if len(_FF_ACTIVE_UIDS) < MAX_GLOBAL_FF_SESSIONS:
+            _FF_ACTIVE_UIDS.add(uid)
+            log.info("[FF_SLOT] uid=%d acquired slot (%d/%d active)",
+                     uid, len(_FF_ACTIVE_UIDS), MAX_GLOBAL_FF_SESSIONS)
+            return True
+        # All slots full — queue the user
+        if any(u == uid for u, _ in _FF_SLOT_QUEUE):
+            return False  # already queued
+        _FF_SLOT_QUEUE.append((uid, client))
+        position = len(_FF_SLOT_QUEUE)
+        s = FF_SESSIONS.get(uid)
+        if s:
+            try:
+                await client.edit_message_text(
+                    s["chat_id"], s["msg_id"],
+                    f"⏳ <b>Forwarding queue full</b>\n\n"
+                    f"All {MAX_GLOBAL_FF_SESSIONS} forwarding slots are busy.\n"
+                    f"Your session is in position <b>#{position}</b> in the queue.\n\n"
+                    f"Bot will automatically start your forwarding when a slot opens up. "
+                    f"Please don't cancel unless you want to stop.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]
+                    ),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+        log.info("[FF_SLOT] uid=%d queued at position %d (%d/%d slots full)",
+                 uid, position, len(_FF_ACTIVE_UIDS), MAX_GLOBAL_FF_SESSIONS)
+        return False
+
+
+async def _release_ff_slot(uid: int, client: Client):
+    """Release the forwarding slot for `uid` and start the next queued session."""
+    async with _get_slot_lock():
+        _FF_ACTIVE_UIDS.discard(uid)
+        log.info("[FF_SLOT] uid=%d released slot (%d/%d now active)",
+                 uid, len(_FF_ACTIVE_UIDS), MAX_GLOBAL_FF_SESSIONS)
+
+        # Promote the next queued user
+        while _FF_SLOT_QUEUE and len(_FF_ACTIVE_UIDS) < MAX_GLOBAL_FF_SESSIONS:
+            next_uid, next_client = _FF_SLOT_QUEUE.pop(0)
+            if next_uid not in FF_SESSIONS:
+                log.info("[FF_SLOT] queued uid=%d session expired — skipping", next_uid)
+                continue
+            if FF_SESSIONS[next_uid].get("session_id") in CANCELLED_SESSIONS:
+                log.info("[FF_SLOT] queued uid=%d session cancelled — skipping", next_uid)
+                continue
+            _FF_ACTIVE_UIDS.add(next_uid)
+            log.info("[FF_SLOT] uid=%d promoted from queue — starting scan", next_uid)
+            asyncio.create_task(
+                _scan_and_enqueue(next_client, next_uid),
+                name=f"scan_{next_uid}_{int(time.time())}",
+            )
+            break
 
 
 # ── startup hook ──────────────────────────────────────────────────────────────
 def on_bot_start(client: Client):
-    """Launch the fixed pool of forward workers once at bot start."""
+    """Configure logging and launch the fixed pool of forward workers."""
+    # Configure root logger so all [FF] messages appear in Koyeb log stream
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     for i in range(FORWARD_WORKERS):
         asyncio.create_task(forward_worker(client), name=f"ff_worker_{i}")
-    print(f"[FF] {FORWARD_WORKERS} forward workers started")
+    log.info(
+        "[BOOT] %d forward worker(s) started | slots=%d | delay=%.1fs | max_pair=%d",
+        FORWARD_WORKERS, MAX_GLOBAL_FF_SESSIONS, FORWARD_DELAY, MAX_FORWARD_PER_PAIR,
+    )
 
 
 # ── text utilities ────────────────────────────────────────────────────────────
@@ -169,6 +277,17 @@ async def validate_msg_in_channel(client: Client, channel_id: int, msg_id: int) 
 @Client.on_callback_query(filters.regex(r"^ff_src_(-?\d+)$"))
 async def ff_src(client, query):
     uid = query.from_user.id
+
+    # Prevent a user from starting a new session while one is already active
+    if uid in _FF_ACTIVE_UIDS:
+        await query.answer(
+            "⚠️ You already have an active forwarding session! "
+            "Cancel it first with ❌ Cancel before starting a new one.",
+            show_alert=True,
+        )
+        log.warning("[FF_SRC] uid=%d tried to start duplicate session — blocked", uid)
+        return
+
     s = FF_SESSIONS.get(uid)
     if not s:
         return
@@ -177,13 +296,14 @@ async def ff_src(client, query):
     s["source_title"] = next(x["channel_title"] for x in s["channels"] if x["channel_id"] == src)
     s["channels"]     = [x for x in s["channels"] if x["channel_id"] != src]
     s["step"]         = "dst"
+    log.info("[FF_SRC] uid=%d selected source=%d (%s)", uid, src, s["source_title"])
     kb = [
         [InlineKeyboardButton(x["channel_title"], callback_data=f"ff_dst_{x['channel_id']}")]
         for x in s["channels"]
     ]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")])
     await query.message.edit_text(
-        "📥 **Select DESTINATION channel**",
+        "📥 <b>Select DESTINATION channel</b>",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -660,120 +780,148 @@ async def ffc_continue(client, query):
 async def _scan_and_enqueue(client: Client, uid: int):
     """
     Scans the source channel and writes one DB job per media message.
-    Runs entirely in the background – never blocks caption workers.
-    Uses asyncio.sleep(0) on every iteration so the event loop stays free.
-
-    FIX: total count is now tracked on the session dict (s["total"]) and
-    also stored on each job document once scanning finishes.  Workers read
-    total from the session, not from the job, so they always get the correct
-    value even while scanning is still running.
+    Runs in the background – never blocks caption workers.
+    Releases the global FF slot when done (success, cancel, or error).
     """
     s = FF_SESSIONS.get(uid)
     if not s:
+        await _release_ff_slot(uid, client)
         return
     session_id = s["session_id"]
     src        = s["source"]
     dst        = s["destination"]
     start_id   = int(s["skip"]) + 1
     end_id     = s.get("end_id")
-    # Snapshot caption settings as finalized by the user before scanning starts
     caption_settings_snapshot = dict(s.get("caption_settings") or _default_ff_caption_settings())
 
     # Reset counters for this scan
     s["total"]     = 0
-    s["forwarded"] = 0   # ← NEW: track forwarded count on session
+    s["forwarded"] = 0
+    s["scan_done"] = False
     msg_id              = start_id
     consecutive_missing = 0
     MAX_CONSECUTIVE_MISSING = 500
 
-    while True:
-        if end_id is not None and msg_id > end_id:
-            break
-        # Yield every iteration so other handlers run freely
-        await asyncio.sleep(0)
+    log.info(
+        "[SCAN] uid=%d session=%s src=%d dst=%d start=%d end=%s",
+        uid, session_id[:8], src, dst, start_id, end_id,
+    )
+    t_scan_start = time.time()
 
-        if session_id in CANCELLED_SESSIONS:
-            return
-
-        try:
-            msg = await client.get_messages(src, msg_id)
-        except FloodWait as e:
-            wait = int(e.value) + 2
-            print(f"[SCAN] FloodWait {wait}s on {src}")
-            await asyncio.sleep(wait)
-            continue
-        except Exception as e:
-            print(f"[SCAN] get_messages error: {e}")
-            msg = None
-
-        if not msg or getattr(msg, "empty", True):
-            consecutive_missing += 1
-            if consecutive_missing >= MAX_CONSECUTIVE_MISSING:
+    try:
+        while True:
+            if end_id is not None and msg_id > end_id:
                 break
+            await asyncio.sleep(0)  # yield so caption workers aren't starved
+
+            if session_id in CANCELLED_SESSIONS:
+                log.info("[SCAN] uid=%d session=%s cancelled during scan", uid, session_id[:8])
+                return
+
+            try:
+                msg = await client.get_messages(src, msg_id)
+            except FloodWait as e:
+                wait = int(e.value) + 2
+                log.warning("[SCAN] FloodWait %ds uid=%d msg=%d", wait, uid, msg_id)
+                await asyncio.sleep(wait)
+                continue
+            except Exception as e:
+                log.warning("[SCAN] get_messages error uid=%d msg=%d: %s", uid, msg_id, e)
+                msg = None
+
+            if not msg or getattr(msg, "empty", True):
+                consecutive_missing += 1
+                if consecutive_missing >= MAX_CONSECUTIVE_MISSING:
+                    log.info("[SCAN] uid=%d hit %d consecutive missing — stopping scan", uid, MAX_CONSECUTIVE_MISSING)
+                    break
+                msg_id += 1
+                continue
+
+            consecutive_missing = 0
+            if not msg.media:
+                msg_id += 1
+                continue
+
+            await enqueue_forward({
+                "user_id":           uid,
+                "src":               src,
+                "dst":               dst,
+                "msg_id":            msg.id,
+                "chat_id":           s["chat_id"],
+                "ui_msg":            s["msg_id"],
+                "source_title":      s["source_title"],
+                "destination_title": s["destination_title"],
+                "session_id":        session_id,
+                "total":             0,
+                "caption_settings":  caption_settings_snapshot,
+            })
+            s["total"] += 1
             msg_id += 1
-            continue
 
-        consecutive_missing = 0
-        if not msg.media:
-            msg_id += 1
-            continue
+        # ── Stamp total on all pending jobs ───────────────────────────────────
+        if s["total"] > 0:
+            await forward_queue.update_many(
+                {"session_id": session_id, "total": 0},
+                {"$set": {"total": s["total"]}},
+            )
 
-        await enqueue_forward({
-            "user_id":           uid,
-            "src":               src,
-            "dst":               dst,
-            "msg_id":            msg.id,
-            "chat_id":           s["chat_id"],
-            "ui_msg":            s["msg_id"],
-            "source_title":      s["source_title"],
-            "destination_title": s["destination_title"],
-            "session_id":        session_id,
-            # NOTE: total=0 here; we stamp the real value below after scan
-            "total":             0,
-            # Snapshot of the caption-customization settings chosen for this
-            # session. Stored on the job itself so it survives restarts and
-            # is unaffected by the user starting another session afterwards.
-            "caption_settings":  caption_settings_snapshot,
-        })
-        s["total"] += 1
-        msg_id += 1
-
-    # ── Stamp actual total on all pending jobs for this session ───────────────
-    # Workers that started before this runs will update their total from the
-    # session dict via _maybe_update_progress — the DB value is a fallback.
-    if s["total"] > 0:
-        await forward_queue.update_many(
-            {"session_id": session_id, "total": 0},
-            {"$set": {"total": s["total"]}},
+        scan_elapsed = time.time() - t_scan_start
+        log.info(
+            "[SCAN] uid=%d session=%s done: %d file(s) queued in %.1fs",
+            uid, session_id[:8], s["total"], scan_elapsed,
         )
 
-    if session_id not in CANCELLED_SESSIONS:
-        try:
-            await client.edit_message_text(
-                s["chat_id"],
-                s["msg_id"],
-                (
+        if s["total"] == 0:
+            log.info("[SCAN] uid=%d no media found — releasing slot", uid)
+            try:
+                await client.edit_message_text(
+                    s["chat_id"], s["msg_id"],
+                    "⚠️ <b>No media files found</b> in the specified range.\n\n"
+                    "Please check the source channel and range, then try again.",
+                )
+            except Exception:
+                pass
+            FF_SESSIONS.pop(uid, None)
+            return  # slot released in finally
+
+        if session_id not in CANCELLED_SESSIONS:
+            try:
+                await client.edit_message_text(
+                    s["chat_id"], s["msg_id"],
                     f"📤 <b>{s['source_title']}</b>\n"
                     f"         ⬇️⬇️⬇️\n"
                     f"📥 <b>{s['destination_title']}</b>\n\n"
-                    f"🔄 Preparing {s['total']} file(s) for transfer…"
-                ),
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]
-                ),
-            )
-        except Exception:
-            pass
+                    f"📦 Found <b>{s['total']}</b> file(s) — forwarding started…",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]
+                    ),
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
 
-    # Mark scan complete on session so workers know the total is final
-    s["scan_done"] = True
+        # Mark scan complete so workers know the total is final
+        s["scan_done"] = True
+
+    except Exception as e:
+        log.error("[SCAN] uid=%d unexpected error: %s", uid, e, exc_info=True)
+        s["scan_done"] = True
+    finally:
+        # NOTE: we do NOT release the slot here — the slot is held until the
+        # last forward job completes (see _maybe_update_progress completion block).
+        # We only release early if no files were found (handled above) or on error
+        # with nothing queued.
+        if s.get("total", 0) == 0:
+            await _release_ff_slot(uid, client)
 
 
 async def enqueue_forward_jobs(client: Client, uid: int):
     """
-    Called from the message handler.
-    Shows instant 'Scanning…' feedback then fires the background scan task.
-    Returns immediately so the handler is free for all other requests.
+    Called from the message handler after the user enters the range.
+    Tries to acquire a global FF slot:
+    • If a slot is free  → shows 'Scanning…' and starts the scan task immediately.
+    • If all slots full  → places user in queue; _acquire_ff_slot() already
+                           updates the message with a "waiting" notice.
     """
     s = FF_SESSIONS.get(uid)
     if not s:
@@ -783,26 +931,37 @@ async def enqueue_forward_jobs(client: Client, uid: int):
 
     # Reset per-session counters
     _session_done_count.pop(s["session_id"], None)
+    _session_last_progress.pop(s["session_id"], None)
     _session_completed.discard(s["session_id"])
 
+    log.info(
+        "[FF_ENQUEUE] uid=%d session=%s src=%d dst=%d skip=%s end=%s",
+        uid, s["session_id"][:8],
+        s.get("source", 0), s.get("destination", 0),
+        s.get("skip"), s.get("end_id"),
+    )
+
+    # Try to get a slot — if full, user is queued and informed automatically
+    got_slot = await _acquire_ff_slot(uid, client)
+    if not got_slot:
+        return  # queued or already active
+
+    # Got a slot — show scanning status and start
     try:
         await client.edit_message_text(
-            s["chat_id"],
-            s["msg_id"],
-            (
-                f"📤 <b>{s['source_title']}</b>\n"
-                f"         ⬇️⬇️⬇️\n"
-                f"📥 <b>{s['destination_title']}</b>\n\n"
-                "🔄 Scanning files…"
-            ),
+            s["chat_id"], s["msg_id"],
+            f"📤 <b>{s['source_title']}</b>\n"
+            f"         ⬇️⬇️⬇️\n"
+            f"📥 <b>{s['destination_title']}</b>\n\n"
+            "🔍 Scanning files…",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]
             ),
+            disable_web_page_preview=True,
         )
     except Exception:
         pass
 
-    # Each user's scan runs in its own independent task
     asyncio.create_task(
         _scan_and_enqueue(client, uid),
         name=f"scan_{uid}_{s['session_id'][:8]}",
@@ -1047,10 +1206,13 @@ async def _forward_with_thumb(
 # ── forward worker ────────────────────────────────────────────────────────────
 async def forward_worker(client: Client):
     """
-    Single long-running worker.  Pulls one job at a time, sends it,
+    Single long-running worker. Pulls one DB job at a time, sends the file,
     handles FloodWait with exponential back-off, then loops.
-    Only FORWARD_WORKERS of these run concurrently (set in database.py).
+    Only FORWARD_WORKERS of these run concurrently.
     """
+    worker_name = asyncio.current_task().get_name() if asyncio.current_task() else "ff_worker"
+    log.info("[WORKER] %s started", worker_name)
+
     while True:
         job = await _fetch_forward_job()
         if not job:
@@ -1060,9 +1222,12 @@ async def forward_worker(client: Client):
         key        = (job["src"], job["dst"])
         session_id = job.get("session_id")
         msg_id     = job.get("msg_id")
+        uid        = job.get("user_id")
 
         try:
             if session_id in CANCELLED_SESSIONS:
+                log.info("[WORKER] %s skipping cancelled job session=%s msg=%d",
+                         worker_name, str(session_id)[:8], msg_id)
                 await forward_done(job["_id"])
                 continue
 
@@ -1074,7 +1239,8 @@ async def forward_worker(client: Client):
                 try:
                     custom_caption, ff_reply_markup = await build_ff_caption(msg, cs)
                 except Exception as e:
-                    print(f"[FF_CAPTION_BUILD_FAIL] {e}")
+                    log.warning("[WORKER] caption build fail session=%s msg=%d: %s",
+                                str(session_id)[:8], msg_id, e)
                     custom_caption, ff_reply_markup = None, None
 
             await _forward_with_thumb(
@@ -1082,11 +1248,12 @@ async def forward_worker(client: Client):
                 custom_caption=custom_caption,
                 reply_markup=ff_reply_markup,
             )
+            log.info("[WORKER] %s forwarded msg=%d src=%d→dst=%d session=%s",
+                     worker_name, msg_id, job["src"], job["dst"], str(session_id)[:8])
 
             # Dump copy (non-admin users)
-            job_user = job.get("user_id")
-            is_admin = (job_user in ADMIN) if isinstance(ADMIN, (list, tuple, set)) else (job_user == ADMIN)
-            if not is_admin:
+            is_admin = (uid in ADMIN) if isinstance(ADMIN, (list, tuple, set)) else (uid == ADMIN)
+            if not is_admin and FF_CH:
                 try:
                     fname = None
                     for t in ("document", "video", "audio", "voice"):
@@ -1102,13 +1269,11 @@ async def forward_worker(client: Client):
                         caption=fname,
                     )
                 except Exception as e:
-                    print(f"[FF_DUMP_FAIL] {e}")
+                    log.warning("[WORKER] dump-copy fail msg=%d: %s", msg_id, e)
 
             await forward_done(job["_id"])
 
-            # ── FIX: increment session forwarded counter ───────────────────
-            # Read total from session dict (accurate) not from job document.
-            uid = job.get("user_id")
+            # Update session forwarded counter
             s = FF_SESSIONS.get(uid) if uid else None
             if s and s.get("session_id") == session_id:
                 s["forwarded"] = s.get("forwarded", 0) + 1
@@ -1118,14 +1283,15 @@ async def forward_worker(client: Client):
 
         except FloodWait as e:
             retries = job.get("retries", 0)
-            # Exponential back-off: base wait + 2^retries seconds, max 300 s
             wait = min(300, int(e.value) + 2 + (2 ** min(retries, 7)))
-            print(f"[FF_WORKER] FloodWait {wait}s on ({key})")
+            log.warning("[WORKER] %s FloodWait %ds retry=%d session=%s msg=%d",
+                        worker_name, wait, retries, str(session_id)[:8], msg_id)
             FORWARD_COOLDOWN[key] = time.time() + wait
             await forward_retry(job["_id"], wait)
 
         except Exception as e:
-            print(f"[FF_WORKER_ERR] {e}")
+            log.error("[WORKER] %s unexpected error session=%s msg=%d: %s",
+                      worker_name, str(session_id)[:8], msg_id, e, exc_info=True)
             await forward_done(job["_id"])  # don't retry unknown errors forever
 
         finally:
@@ -1135,110 +1301,85 @@ async def forward_worker(client: Client):
 # ── rate-limited progress update ──────────────────────────────────────────────
 async def _maybe_update_progress(client: Client, job: dict):
     """
-    Update the progress message after each forwarded file.
-
-    BUG FIXES vs previous version:
-    ─────────────────────────────────────────────────────────────────────────
-    1. "Still showing transferring after all done":
-       Old code counted `remaining = count_documents()` which raced with
-       deletes from multiple concurrent workers.  A worker deleting the last
-       document could race with another still checking — both would see
-       remaining > 0.
-       Fix: use session["forwarded"] >= session["total"] as the completion
-       check.  This is updated atomically in the asyncio single-thread and
-       needs no DB round-trip.
-
-    2. Inaccurate total in progress:
-       Old code read total from job["total"] which was 0 until the scan
-       finished and stamped it.  Early jobs always showed "0/0".
-       Fix: read total from FF_SESSIONS[uid]["total"] which is updated live
-       during the scan.  Fall back to job["total"] only if session is gone.
-
-    3. Per-session done counter was never reset between sessions:
-       Fix: counter is reset in enqueue_forward_jobs() when a new session
-       starts, so the first _PROGRESS_EVERY files always show an update.
-
-    4. Completion message could be sent before scan finished (total still 0):
-       Fix: only send completion if session["scan_done"] is True.
-    ─────────────────────────────────────────────────────────────────────────
+    Update the progress message at most once every FF_PROGRESS_INTERVAL seconds
+    per session (time-based, not count-based — immune to varying send speeds).
+    Sends the completion message once and releases the global FF slot.
     """
     session_id = job.get("session_id")
     if not session_id or session_id in CANCELLED_SESSIONS:
         return
-
-    # Already completed by another worker for this session
     if session_id in _session_completed:
         return
 
-    # ── Read counters from session dict (authoritative) ───────────────────
     uid = job.get("user_id")
     s   = FF_SESSIONS.get(uid) if uid else None
 
     if s and s.get("session_id") == session_id:
-        forwarded  = s.get("forwarded", 0)
-        total      = s.get("total", 0)
-        scan_done  = s.get("scan_done", False)
+        forwarded = s.get("forwarded", 0)
+        total     = s.get("total", 0)
+        scan_done = s.get("scan_done", False)
     else:
-        # Session was cleaned up (e.g. cancelled); fall back to DB count
-        forwarded  = _session_done_count.get(session_id, 0) + 1
-        total      = job.get("total", 0)
-        scan_done  = True  # if session is gone, assume scan finished
+        forwarded = _session_done_count.get(session_id, 0) + 1
+        total     = job.get("total", 0)
+        scan_done = True
 
     _session_done_count[session_id] = forwarded
 
     # ── Completion check ──────────────────────────────────────────────────
-    # Only complete if: scan has finished AND all files have been forwarded
     is_complete = scan_done and total > 0 and forwarded >= total
 
     if is_complete:
-        # Guard: only the first worker to reach this point sends the final msg.
         if session_id in _session_completed:
             return
         _session_completed.add(session_id)
 
-        # Cleanup session
+        elapsed = time.time() - s.get("_start_ts", time.time()) if s else 0
+        log.info(
+            "[FF_DONE] session=%s uid=%d forwarded=%d total=%d elapsed=%.0fs",
+            session_id[:8], uid or 0, forwarded, total, elapsed,
+        )
+
+        # Cleanup session dict (slot released here)
         if uid and uid in FF_SESSIONS and FF_SESSIONS[uid].get("session_id") == session_id:
             FF_SESSIONS.pop(uid, None)
         _session_done_count.pop(session_id, None)
+        _session_last_progress.pop(session_id, None)
         CANCELLED_SESSIONS.discard(session_id)
 
-        try:
-            await _edit_with_retry(
-                client,
-                job["chat_id"],
-                job["ui_msg"],
-                (
-                    "✅ <b>Forwarding completed</b>\n\n"
-                    f"📤 <b>Source:</b> {job['source_title']}\n"
-                    f"📥 <b>Destination:</b> {job['destination_title']}\n\n"
-                    f"📦 <b>Files forwarded:</b> <code>{forwarded}</code>\n"
-                    f"🗂 <b>Total detected:</b> <code>{total}</code>"
-                ),
-            )
-        except Exception:
-            pass
+        # Release the global FF slot — may promote next queued user
+        await _release_ff_slot(uid or 0, client)
 
-        # Delayed cleanup so any late-arriving workers still see it and bail
-        async def _cleanup_session():
+        await _edit_with_retry(
+            client,
+            job["chat_id"],
+            job["ui_msg"],
+            (
+                "✅ <b>Forwarding completed!</b>\n\n"
+                f"📤 <b>Source:</b> {job['source_title']}\n"
+                f"📥 <b>Destination:</b> {job['destination_title']}\n\n"
+                f"📦 <b>Files forwarded:</b> <code>{forwarded}</code> / <code>{total}</code>"
+            ),
+        )
+
+        async def _cleanup():
             await asyncio.sleep(30)
             _session_completed.discard(session_id)
-
-        asyncio.create_task(_cleanup_session())
+        asyncio.create_task(_cleanup())
         return
 
-    # ── Rate-limit intermediate updates ───────────────────────────────────
-    if forwarded % _PROGRESS_EVERY != 0:
+    # ── Time-throttled intermediate progress update ───────────────────────
+    now  = time.time()
+    last = _session_last_progress.get(session_id, 0)
+    if now - last < FF_PROGRESS_INTERVAL:
         return
-
-    # Don't overwrite a completion message that was just sent
     if session_id in _session_completed:
         return
+    _session_last_progress[session_id] = now
 
-    # Build progress bar
     pct      = int((forwarded / total) * 100) if total > 0 else 0
     bar_fill = int(pct / 10)
     bar      = "▓" * bar_fill + "░" * (10 - bar_fill)
-    frame    = ANIM_FRAMES[int(time.time()) % len(ANIM_FRAMES)]
+    frame    = ANIM_FRAMES[int(now) % len(ANIM_FRAMES)]
 
     text = (
         f"📤 <b>{job['source_title']}</b>\n"
@@ -1251,15 +1392,18 @@ async def _maybe_update_progress(client: Client, job: dict):
 
     try:
         await client.edit_message_text(
-            job["chat_id"],
-            job["ui_msg"],
-            text,
+            job["chat_id"], job["ui_msg"], text,
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]
             ),
+            disable_web_page_preview=True,
         )
-    except Exception:
+    except (MessageNotModified, MessageIdInvalid):
         pass
+    except FloodWait as e:
+        log.warning("[FF_PROGRESS] FloodWait %ds for progress edit", int(e.value))
+    except Exception as e:
+        log.warning("[FF_PROGRESS] edit failed: %s", e)
 
 
 # ── cancel ────────────────────────────────────────────────────────────────────
@@ -1267,6 +1411,11 @@ async def _maybe_update_progress(client: Client, job: dict):
 async def ff_cancel(client, query):
     uid = query.from_user.id
     s   = FF_SESSIONS.pop(uid, None)
+
+    # Also remove from slot queue if the user was waiting
+    async with _get_slot_lock():
+        _FF_SLOT_QUEUE[:] = [(u, c) for u, c in _FF_SLOT_QUEUE if u != uid]
+
     if not s:
         await query.message.edit_text("❌ Nothing to cancel.")
         return
@@ -1277,10 +1426,16 @@ async def ff_cancel(client, query):
         forwarded = s.get("forwarded", 0)
         total     = s.get("total", 0)
 
-        # Clean up pending DB jobs for this session
+        log.info("[FF_CANCEL] uid=%d session=%s forwarded=%d total=%d",
+                 uid, str(session_id)[:8], forwarded, total)
+
         await forward_queue.delete_many({"session_id": session_id})
         _session_done_count.pop(session_id, None)
+        _session_last_progress.pop(session_id, None)
         _session_completed.discard(session_id)
+
+        # Release the global slot
+        await _release_ff_slot(uid, client)
 
         await query.message.edit_text(
             "🛑 <b>Forwarding cancelled</b>\n\n"
@@ -1288,4 +1443,5 @@ async def ff_cancel(client, query):
             f"🗂 <b>Total detected:</b> <code>{total}</code>"
         )
     else:
+        await _release_ff_slot(uid, client)
         await query.message.edit_text("🛑 Cancelled.")
