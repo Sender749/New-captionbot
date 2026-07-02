@@ -280,17 +280,55 @@ async def remove_dump_cmd(client, message):
 @Client.on_message(filters.private & filters.command("file_forward"))
 async def ff_start(client, message):
     uid = message.from_user.id
+
+    # ── Block duplicate sessions without touching the running one ─────────────
+    # If the user already has an active forwarding session, we must NOT
+    # overwrite FF_SESSIONS[uid] (that would orphan/corrupt the running session).
+    # Instead send a separate informational message with a dismiss button that
+    # just deletes itself — it does NOT cancel the running session.
+    if uid in _FF_ACTIVE_UIDS or (uid in FF_SESSIONS and FF_SESSIONS[uid].get("step") not in ("src", None)):
+        # Find info about the running session for a helpful message
+        running = FF_SESSIONS.get(uid, {})
+        src_title = running.get("source_title", "")
+        dst_title = running.get("destination_title", "")
+        forwarded = running.get("forwarded", 0)
+        total     = running.get("total", 0)
+        detail = ""
+        if src_title and dst_title:
+            detail = (
+                f"\n\n📤 <b>{src_title}</b>  →  📥 <b>{dst_title}</b>"
+                f"\n📦 Progress: <code>{forwarded}</code> / <code>{total if total else '?'}</code> files"
+            )
+        notice = await message.reply_text(
+            "⚠️ <b>You already have an active forwarding session!</b>"
+            + detail +
+            "\n\nPlease wait for it to finish, or cancel it first.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ OK, got it", callback_data="ff_dismiss_notice")
+            ]]),
+        )
+        log.warning("[FF_START] uid=%d blocked — already has active session", uid)
+        return
+
     channels = await get_user_channels(uid)
     if not channels:
         return await message.reply_text("❌ No admin channels found.")
+
+    # Fresh session — safe to create
     FF_SESSIONS[uid] = {
-        "step": "src",
+        "step":     "src",
         "channels": channels,
-        "expires": None  
+        "expires":  None,
     }
-    kb = [[InlineKeyboardButton(ch["channel_title"], callback_data=f"ff_src_{ch['channel_id']}")] for ch in channels]
+    kb = [
+        [InlineKeyboardButton(ch["channel_title"], callback_data=f"ff_src_{ch['channel_id']}")]
+        for ch in channels
+    ]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")])
-    await message.reply_text("📤 **Select SOURCE channel**", reply_markup=InlineKeyboardMarkup(kb))
+    await message.reply_text(
+        "📤 <b>Select SOURCE channel</b>",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
         
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("admin"))
 async def admin_help(client, message):
@@ -1929,8 +1967,9 @@ async def capture_user_input(client, message):
             session.pop("pending_input", None)
             await client.edit_message_text(
                 chat_id, msg_id,
-                "✅ Caption updated successfully!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_setcap")]]),
+                "✅ <b>Caption updated successfully!</b>\n\n"
+                f"📝 <b>Set to:</b>\n<code>{text[:200]}</code>",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back to Panel", callback_data="ffc_menu")]]),
             )
             return
 
