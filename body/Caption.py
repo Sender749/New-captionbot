@@ -1,4 +1,4 @@
-import sys, time, os, re, asyncio
+import sys, time, os, re, asyncio, logging
 from typing import Tuple, List, Optional
 from pyrogram import Client, filters, errors, enums
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated, CallbackQuery
@@ -11,6 +11,8 @@ from body.file_forward import *
 from collections import deque, defaultdict
 from imdb import IMDb
 from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
+
+log = logging.getLogger("CAP")
 
 ia = None  # lazily created — see _get_ia() below. NEVER call IMDb() at import time:
            # on some hosts (Koyeb included) imdbpy's default 's3' access system tries
@@ -770,6 +772,7 @@ def sanitize_caption_html(text: str) -> str:
     return re.sub(r"</?\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>", repl, text)
 
 async def caption_worker(client: Client):
+    worker_name = asyncio.current_task().get_name() if asyncio.current_task() else "cap_worker"
     while True:
         job = await fetch_channel_job()
         if not job:
@@ -810,14 +813,20 @@ async def caption_worker(client: Client):
             await asyncio.sleep(DEFAULT_EDIT_DELAY)
         except FloodWait as e:
             wait = e.value + 2
+            log.warning("[%s] FloodWait %ds on ch=%d msg=%d",
+                        worker_name, wait, ch, job["message_id"])
             CHANNEL_COOLDOWN[ch] = time.time() + wait
             await reschedule(job["_id"], delay=wait)
         except errors.MessageNotModified:
             await mark_done(job["_id"])
-        except Exception:
+        except Exception as e:
             if job.get("retries", 0) >= 5:
+                log.error("[%s] giving up on ch=%d msg=%d after 5 retries: %s",
+                          worker_name, ch, job["message_id"], e)
                 await mark_done(job["_id"])
             else:
+                log.warning("[%s] ch=%d msg=%d retry=%d err=%s",
+                            worker_name, ch, job["message_id"], job.get("retries", 0), e)
                 await reschedule(job["_id"], delay=10)
         finally:
             if not released:
@@ -1918,7 +1927,11 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await _render_ff_capsub(client, chat_id, msg_id, cs)
+            await client.edit_message_text(
+                chat_id, msg_id,
+                "✅ Caption updated successfully!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_setcap")]]),
+            )
             return
 
         if pending == "block_words":
@@ -1928,7 +1941,11 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await _render_ff_words_menu(client, chat_id, msg_id, cs)
+            await client.edit_message_text(
+                chat_id, msg_id,
+                "✅ Blocked words updated!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_words")]]),
+            )
             return
 
         if pending == "replace_words":
@@ -1938,7 +1955,11 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await _render_ff_replace_menu(client, chat_id, msg_id, cs)
+            await client.edit_message_text(
+                chat_id, msg_id,
+                "✅ Replace words updated!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_replace")]]),
+            )
             return
 
         if pending == "prefix":
@@ -1948,7 +1969,11 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await _render_ff_suffixprefix_menu(client, chat_id, msg_id, cs)
+            await client.edit_message_text(
+                chat_id, msg_id,
+                "✅ Prefix updated!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_suffixprefix")]]),
+            )
             return
 
         if pending == "suffix":
@@ -1958,7 +1983,11 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await _render_ff_suffixprefix_menu(client, chat_id, msg_id, cs)
+            await client.edit_message_text(
+                chat_id, msg_id,
+                "✅ Suffix updated!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_suffixprefix")]]),
+            )
             return
 
         if pending == "url_buttons":
@@ -1985,7 +2014,11 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await _render_ff_url_menu(client, chat_id, msg_id, cs)
+            await client.edit_message_text(
+                chat_id, msg_id,
+                "✅ URL buttons updated successfully!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_url")]]),
+            )
             return
 
     # ================= FILE FORWARD SKIP HANDLER =================
