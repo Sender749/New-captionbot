@@ -124,6 +124,16 @@ def _get_slot_lock() -> asyncio.Lock:
     return _FF_SLOT_LOCK
 
 
+def ff_user_is_active(uid: int) -> bool:
+    """
+    Public helper — returns True if `uid` currently holds a forwarding slot
+    (scanning or forwarding in progress).  Importable by Caption.py via
+    `from body.file_forward import *` unlike the underscore-prefixed
+    `_FF_ACTIVE_UIDS` set which `import *` silently skips.
+    """
+    return uid in _FF_ACTIVE_UIDS
+
+
 async def _acquire_ff_slot(uid: int, client: Client) -> bool:
     """
     Try to acquire a forwarding slot for `uid`.
