@@ -286,7 +286,7 @@ async def ff_start(client, message):
     # overwrite FF_SESSIONS[uid] (that would orphan/corrupt the running session).
     # Instead send a separate informational message with a dismiss button that
     # just deletes itself — it does NOT cancel the running session.
-    if uid in _FF_ACTIVE_UIDS or (uid in FF_SESSIONS and FF_SESSIONS[uid].get("step") not in ("src", None)):
+    if ff_user_is_active(uid) or (uid in FF_SESSIONS and FF_SESSIONS[uid].get("step") not in ("src", None)):
         # Find info about the running session for a helpful message
         running = FF_SESSIONS.get(uid, {})
         src_title = running.get("source_title", "")
