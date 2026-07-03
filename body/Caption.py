@@ -288,10 +288,11 @@ async def ff_start(client, message):
     # just deletes itself — it does NOT cancel the running session.
     if ff_user_is_active(uid) or (uid in FF_SESSIONS and FF_SESSIONS[uid].get("step") not in ("src", None)):
         # Find info about the running session for a helpful message
-        running = FF_SESSIONS.get(uid, {})
+        running   = FF_SESSIONS.get(uid, {})
         src_title = running.get("source_title", "")
         dst_title = running.get("destination_title", "")
-        forwarded = running.get("forwarded", 0)
+        session_id = running.get("session_id")
+        forwarded = _session_done_count.get(session_id, 0) if session_id else 0
         total     = running.get("total", 0)
         detail = ""
         if src_title and dst_title:
