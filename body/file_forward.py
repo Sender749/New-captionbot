@@ -839,8 +839,8 @@ async def _scan_and_enqueue(client: Client, uid: int):
 
     # Reset counters for this scan
     s["total"]     = 0
-    s["forwarded"] = 0
     s["scan_done"] = False
+    _session_done_count[session_id] = 0   # reset the ONE forwarded counter
     msg_id              = start_id
     consecutive_missing = 0
     MAX_CONSECUTIVE_MISSING = 500
@@ -976,7 +976,7 @@ async def enqueue_forward_jobs(client: Client, uid: int):
     if "session_id" not in s:
         s["session_id"] = str(uuid.uuid4())
 
-    # Reset per-session counters
+    # Reset per-session counters (single counter — no dual tracking)
     _session_done_count.pop(s["session_id"], None)
     _session_last_progress.pop(s["session_id"], None)
     _session_completed.discard(s["session_id"])
@@ -1260,6 +1260,10 @@ async def forward_worker(client: Client):
     Single long-running worker. Pulls one DB job at a time, sends the file,
     handles FloodWait with exponential back-off, then loops.
     Only FORWARD_WORKERS of these run concurrently.
+
+    Counter rule: _session_done_count[session_id] is the ONLY forwarded counter.
+    It is incremented on EVERY job exit path (success, error, cancelled skip)
+    so that forwarded always reaches total and completion always fires.
     """
     worker_name = asyncio.current_task().get_name() if asyncio.current_task() else "ff_worker"
     log.info("[WORKER] %s started", worker_name)
@@ -1274,16 +1278,33 @@ async def forward_worker(client: Client):
         session_id = job.get("session_id")
         msg_id     = job.get("msg_id")
         uid        = job.get("user_id")
+        _job_done  = False   # track whether forward_done() was already called
 
         try:
+            # ── Cancelled session: delete job and count it as done ─────────
             if session_id in CANCELLED_SESSIONS:
-                log.info("[WORKER] %s skipping cancelled job session=%s msg=%d",
+                log.info("[WORKER] %s skip-cancelled session=%s msg=%d",
                          worker_name, str(session_id)[:8], msg_id)
                 await forward_done(job["_id"])
+                _job_done = True
+                _session_done_count[session_id] = _session_done_count.get(session_id, 0) + 1
+                # Don't call _maybe_update_progress for cancelled sessions
                 continue
 
+            # ── Fetch source message ───────────────────────────────────────
             msg = await client.get_messages(job["src"], msg_id)
 
+            if not msg or getattr(msg, "empty", False) or not msg.media:
+                # Message deleted or no media — count as done, skip send
+                log.info("[WORKER] %s empty/no-media msg=%d session=%s — skipping",
+                         worker_name, msg_id, str(session_id)[:8])
+                await forward_done(job["_id"])
+                _job_done = True
+                _session_done_count[session_id] = _session_done_count.get(session_id, 0) + 1
+                await _maybe_update_progress(client, job)
+                continue
+
+            # ── Build custom caption if set ────────────────────────────────
             custom_caption, ff_reply_markup = None, None
             cs = job.get("caption_settings")
             if cs and cs.get("template"):
@@ -1292,17 +1313,17 @@ async def forward_worker(client: Client):
                 except Exception as e:
                     log.warning("[WORKER] caption build fail session=%s msg=%d: %s",
                                 str(session_id)[:8], msg_id, e)
-                    custom_caption, ff_reply_markup = None, None
 
+            # ── Send to destination ────────────────────────────────────────
             await _forward_with_thumb(
                 client, job["src"], job["dst"], msg,
                 custom_caption=custom_caption,
                 reply_markup=ff_reply_markup,
             )
-            log.info("[WORKER] %s forwarded msg=%d src=%d→dst=%d session=%s",
+            log.info("[WORKER] %s ✓ msg=%d src=%d→dst=%d session=%s",
                      worker_name, msg_id, job["src"], job["dst"], str(session_id)[:8])
 
-            # Dump copy (non-admin users)
+            # ── Dump copy for non-admin users ──────────────────────────────
             is_admin = (uid in ADMIN) if isinstance(ADMIN, (list, tuple, set)) else (uid == ADMIN)
             if not is_admin and FF_CH:
                 try:
@@ -1322,31 +1343,31 @@ async def forward_worker(client: Client):
                 except Exception as e:
                     log.warning("[WORKER] dump-copy fail msg=%d: %s", msg_id, e)
 
+            # ── Mark done and update counters ──────────────────────────────
             await forward_done(job["_id"])
-
-            # Update forwarded counter — always update both paths so
-            # _session_done_count stays accurate even if session dict is gone.
-            s = FF_SESSIONS.get(uid) if uid else None
-            if s and s.get("session_id") == session_id:
-                s["forwarded"] = s.get("forwarded", 0) + 1
-            # Always tick the fallback counter too (used when session dict gone)
+            _job_done = True
             _session_done_count[session_id] = _session_done_count.get(session_id, 0) + 1
-
             await _maybe_update_progress(client, job)
             await asyncio.sleep(FORWARD_DELAY)
 
         except FloodWait as e:
             retries = job.get("retries", 0)
-            wait = min(300, int(e.value) + 2 + (2 ** min(retries, 7)))
+            wait    = min(300, int(e.value) + 2 + (2 ** min(retries, 7)))
             log.warning("[WORKER] %s FloodWait %ds retry=%d session=%s msg=%d",
                         worker_name, wait, retries, str(session_id)[:8], msg_id)
             FORWARD_COOLDOWN[key] = time.time() + wait
             await forward_retry(job["_id"], wait)
+            # Do NOT increment counter — job will be retried
 
         except Exception as e:
-            log.error("[WORKER] %s unexpected error session=%s msg=%d: %s",
+            log.error("[WORKER] %s error session=%s msg=%d: %s",
                       worker_name, str(session_id)[:8], msg_id, e, exc_info=True)
-            await forward_done(job["_id"])  # don't retry unknown errors forever
+            if not _job_done:
+                await forward_done(job["_id"])
+                _job_done = True
+            # Count this as done even on error so completion can fire
+            _session_done_count[session_id] = _session_done_count.get(session_id, 0) + 1
+            await _maybe_update_progress(client, job)
 
         finally:
             FORWARD_ACTIVE[key] = max(0, FORWARD_ACTIVE[key] - 1)
@@ -1355,15 +1376,14 @@ async def forward_worker(client: Client):
 # ── rate-limited progress update ──────────────────────────────────────────────
 async def _maybe_update_progress(client: Client, job: dict):
     """
-    Update the progress message at most once every FF_PROGRESS_INTERVAL seconds.
-    Sends the completion message exactly once and releases the global FF slot.
+    Called after every job is processed (success OR error).
+    Uses _session_done_count as the SINGLE forwarded counter — no dual tracking.
 
-    Sources of truth (in priority order):
-      forwarded → session["forwarded"] if session still alive, else _session_done_count
-      total     → session["total"] if session alive AND scan_done, else job["total"]
-                  (job["total"] is always stamped after scan completes, so it's always
-                   correct for workers that outlive the session dict)
-      scan_done → session["scan_done"] if session alive, else True (job exists means scan ran)
+    Completion fires when:
+      scan_done=True  AND  total > 0  AND  forwarded >= total
+
+    Because every job (including errors/skips) increments _session_done_count,
+    forwarded will always reach total and the completion message will always fire.
     """
     session_id = job.get("session_id")
     if not session_id or session_id in CANCELLED_SESSIONS:
@@ -1375,47 +1395,42 @@ async def _maybe_update_progress(client: Client, job: dict):
     s   = FF_SESSIONS.get(uid) if uid else None
     session_alive = s is not None and s.get("session_id") == session_id
 
+    # ── Single authoritative forwarded counter ────────────────────────────────
+    forwarded = _session_done_count.get(session_id, 0)
+
+    # ── Total: prefer live session dict (updated during scan), fall back to job
     if session_alive:
-        forwarded = s.get("forwarded", 0)
-        # Use session total if scan is done, else job total (which updates every scan iter)
-        total     = s["total"] if s.get("scan_done") else max(s.get("total", 0), job.get("total", 0))
+        total     = s.get("total", 0)
         scan_done = s.get("scan_done", False)
     else:
-        # Session dict is gone (restart recovery or already cleaned up).
-        # forwarded is tracked in _session_done_count, total comes from job doc.
-        forwarded = _session_done_count.get(session_id, 0)
         total     = job.get("total", 0)
-        scan_done = True  # if session gone, scan must have finished
+        scan_done = True   # session dict gone → scan definitely finished
 
-    # Always keep the per-session counter updated as the authoritative forwarded count
-    _session_done_count[session_id] = forwarded
+    log.debug("[FF_PROGRESS] session=%s forwarded=%d total=%d scan_done=%s",
+              str(session_id)[:8], forwarded, total, scan_done)
 
-    # ── Completion guard ──────────────────────────────────────────────────────
-    # Only mark complete when:
-    #   1. scan has finished (total is final)
-    #   2. total > 0 (avoid completing before any files were found)
-    #   3. forwarded >= total
+    # ── Completion check ──────────────────────────────────────────────────────
     is_complete = scan_done and total > 0 and forwarded >= total
 
     if is_complete:
         if session_id in _session_completed:
-            return  # another worker beat us here
+            return   # another worker beat us — race guard
         _session_completed.add(session_id)
 
-        log.info(
-            "[FF_DONE] session=%s uid=%d forwarded=%d total=%d",
-            session_id[:8], uid or 0, forwarded, total,
-        )
+        log.info("[FF_DONE] session=%s uid=%d forwarded=%d total=%d",
+                 session_id[:8], uid or 0, forwarded, total)
 
-        # Cleanup
+        # Cleanup all state for this session
         if uid and uid in FF_SESSIONS and FF_SESSIONS[uid].get("session_id") == session_id:
             FF_SESSIONS.pop(uid, None)
         _session_done_count.pop(session_id, None)
         _session_last_progress.pop(session_id, None)
         CANCELLED_SESSIONS.discard(session_id)
 
+        # Release the global slot — may auto-start the next queued user
         await _release_ff_slot(uid or 0, client)
 
+        # Send completion message (retries on FloodWait so it always arrives)
         await _edit_with_retry(
             client,
             job["chat_id"],
@@ -1426,13 +1441,14 @@ async def _maybe_update_progress(client: Client, job: dict):
             f"📦 <b>Files forwarded:</b> <code>{forwarded}</code> / <code>{total}</code>",
         )
 
+        # Keep session_id in _session_completed for 60 s so late workers bail early
         async def _cleanup():
             await asyncio.sleep(60)
             _session_completed.discard(session_id)
         asyncio.create_task(_cleanup())
         return
 
-    # ── Time-throttled intermediate progress ──────────────────────────────────
+    # ── Time-throttled intermediate progress bar ──────────────────────────────
     now  = time.time()
     last = _session_last_progress.get(session_id, 0)
     if now - last < FF_PROGRESS_INTERVAL:
@@ -1441,23 +1457,23 @@ async def _maybe_update_progress(client: Client, job: dict):
         return
     _session_last_progress[session_id] = now
 
-    total_display = str(total) if total > 0 else "?"
-    pct      = int((forwarded / total) * 100) if total > 0 else 0
-    bar_fill = int(pct / 10)
-    bar      = "▓" * bar_fill + "░" * (10 - bar_fill)
-    frame    = ANIM_FRAMES[int(now) % len(ANIM_FRAMES)]
+    total_disp = str(total) if total > 0 else "?"
+    pct        = int((forwarded / total) * 100) if total > 0 else 0
+    bar_fill   = int(pct / 10)
+    bar        = "▓" * bar_fill + "░" * (10 - bar_fill)
+    frame      = ANIM_FRAMES[int(now) % len(ANIM_FRAMES)]
 
-    status_line = (
-        f"🔍 Scanning… ({total_display} found so far)" if not scan_done and total == 0
-        else f"{frame}\n[{bar}] <code>{pct}%</code>"
-    )
+    if not scan_done:
+        status = f"🔍 Scanning… ({total} found so far)"
+    else:
+        status = f"{frame}\n[{bar}] <code>{pct}%</code>"
 
     text = (
         f"📤 <b>{job['source_title']}</b>\n"
         f"         ⬇️⬇️⬇️\n"
         f"📥 <b>{job['destination_title']}</b>\n\n"
-        f"{status_line}\n"
-        f"📦 <b>Forwarded:</b> <code>{forwarded}</code> / <code>{total_display}</code>"
+        f"{status}\n"
+        f"📦 <b>Forwarded:</b> <code>{forwarded}</code> / <code>{total_disp}</code>"
     )
 
     try:
@@ -1471,8 +1487,9 @@ async def _maybe_update_progress(client: Client, job: dict):
     except (MessageNotModified, MessageIdInvalid):
         pass
     except FloodWait as e:
-        log.warning("[FF_PROGRESS] FloodWait %ds", int(e.value))
-        _session_last_progress[session_id] = now + int(e.value)  # back off next update too
+        wait = int(e.value)
+        log.warning("[FF_PROGRESS] FloodWait %ds — backing off next update", wait)
+        _session_last_progress[session_id] = now + wait
     except Exception as e:
         log.warning("[FF_PROGRESS] edit failed: %s", e)
 
@@ -1537,7 +1554,7 @@ async def ff_cancel(client, query):
 
     # Session was active (scanning or forwarding)
     CANCELLED_SESSIONS.add(session_id)
-    forwarded = s.get("forwarded", 0)
+    forwarded = _session_done_count.get(session_id, 0)
     total     = s.get("total", 0)
 
     log.info("[FF_CANCEL] uid=%d session=%s forwarded=%d total=%d",
