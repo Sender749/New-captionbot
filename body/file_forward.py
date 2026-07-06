@@ -97,9 +97,25 @@ async def _edit_with_retry(client: Client, chat_id, msg_id, text, reply_markup=N
 
 # ── startup hook ──────────────────────────────────────────────────────────────
 def on_bot_start(client: Client):
-    """Launch the fixed pool of forward workers once at bot start."""
+    """Launch the fixed pool of forward workers once at bot start.
+
+    Each worker is wrapped so that if it ever exits unexpectedly (it
+    shouldn't, now that _fetch_forward_job() errors are caught above, but
+    this is a safety net matching the caption-queue supervisor), it's
+    logged and restarted instead of permanently shrinking the pool.
+    """
+    async def _guarded(i):
+        while True:
+            try:
+                await forward_worker(client)
+            except Exception as e:
+                print(f"[FF_WORKER_{i}] crashed unexpectedly, restarting in 3s: {e}")
+            else:
+                print(f"[FF_WORKER_{i}] exited unexpectedly, restarting in 3s")
+            await asyncio.sleep(3)
+
     for i in range(FORWARD_WORKERS):
-        asyncio.create_task(forward_worker(client), name=f"ff_worker_{i}")
+        asyncio.create_task(_guarded(i), name=f"ff_worker_{i}")
     print(f"[FF] {FORWARD_WORKERS} forward workers started")
 
 
@@ -1052,7 +1068,12 @@ async def forward_worker(client: Client):
     Only FORWARD_WORKERS of these run concurrently (set in database.py).
     """
     while True:
-        job = await _fetch_forward_job()
+        try:
+            job = await _fetch_forward_job()
+        except Exception as e:
+            print(f"[FF_WORKER] _fetch_forward_job error: {e}")
+            await asyncio.sleep(2)
+            continue
         if not job:
             await asyncio.sleep(1)
             continue
