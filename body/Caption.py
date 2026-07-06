@@ -1,4 +1,4 @@
-import sys, time, os, re, asyncio, logging
+import sys, time, os, re, asyncio
 from typing import Tuple, List, Optional
 from pyrogram import Client, filters, errors, enums
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated, CallbackQuery
@@ -12,32 +12,7 @@ from collections import deque, defaultdict
 from imdb import IMDb
 from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
 
-log = logging.getLogger("CAP")
-
-ia = None  # lazily created — see _get_ia() below. NEVER call IMDb() at import time:
-           # on some hosts (Koyeb included) imdbpy's default 's3' access system tries
-           # to open a local SQLite cache via a malformed URL ("sqlite://cinemagoer.db"),
-           # which raises sqlalchemy.exc.ArgumentError and crashes the entire bot process
-           # before it can even connect to Telegram — with no useful traceback in the
-           # platform's truncated log view.
-
-def _get_ia():
-    """Lazily build (and cache) the IMDb client. Falls back to a disabled
-    state on any failure so a broken local cache backend can never take the
-    whole bot down — IMDB title enrichment is a best-effort nice-to-have,
-    not something the bot should die over.
-    """
-    global ia
-    if ia is False:
-        return None
-    if ia is None:
-        try:
-            ia = IMDb("http")  # "http" backend — no local SQLite cache involved
-        except Exception as e:
-            print(f"[WARN] IMDb() init failed, disabling title enrichment: {e}")
-            ia = False
-            return None
-    return ia
+ia = IMDb()
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
 DEFAULT_EDIT_DELAY = 0.3                 # per channel
 bot_data = {
@@ -280,56 +255,17 @@ async def remove_dump_cmd(client, message):
 @Client.on_message(filters.private & filters.command("file_forward"))
 async def ff_start(client, message):
     uid = message.from_user.id
-
-    # ── Block duplicate sessions without touching the running one ─────────────
-    # If the user already has an active forwarding session, we must NOT
-    # overwrite FF_SESSIONS[uid] (that would orphan/corrupt the running session).
-    # Instead send a separate informational message with a dismiss button that
-    # just deletes itself — it does NOT cancel the running session.
-    if ff_user_is_active(uid) or (uid in FF_SESSIONS and FF_SESSIONS[uid].get("step") not in ("src", None)):
-        # Find info about the running session for a helpful message
-        running   = FF_SESSIONS.get(uid, {})
-        src_title = running.get("source_title", "")
-        dst_title = running.get("destination_title", "")
-        session_id = running.get("session_id")
-        forwarded = _session_done_count.get(session_id, 0) if session_id else 0
-        total     = running.get("total", 0)
-        detail = ""
-        if src_title and dst_title:
-            detail = (
-                f"\n\n📤 <b>{src_title}</b>  →  📥 <b>{dst_title}</b>"
-                f"\n📦 Progress: <code>{forwarded}</code> / <code>{total if total else '?'}</code> files"
-            )
-        notice = await message.reply_text(
-            "⚠️ <b>You already have an active forwarding session!</b>"
-            + detail +
-            "\n\nPlease wait for it to finish, or cancel it first.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ OK, got it", callback_data="ff_dismiss_notice")
-            ]]),
-        )
-        log.warning("[FF_START] uid=%d blocked — already has active session", uid)
-        return
-
     channels = await get_user_channels(uid)
     if not channels:
         return await message.reply_text("❌ No admin channels found.")
-
-    # Fresh session — safe to create
     FF_SESSIONS[uid] = {
-        "step":     "src",
+        "step": "src",
         "channels": channels,
-        "expires":  None,
+        "expires": None  
     }
-    kb = [
-        [InlineKeyboardButton(ch["channel_title"], callback_data=f"ff_src_{ch['channel_id']}")]
-        for ch in channels
-    ]
+    kb = [[InlineKeyboardButton(ch["channel_title"], callback_data=f"ff_src_{ch['channel_id']}")] for ch in channels]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")])
-    await message.reply_text(
-        "📤 <b>Select SOURCE channel</b>",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
+    await message.reply_text("📤 **Select SOURCE channel**", reply_markup=InlineKeyboardMarkup(kb))
         
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("admin"))
 async def admin_help(client, message):
@@ -811,7 +747,6 @@ def sanitize_caption_html(text: str) -> str:
     return re.sub(r"</?\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>", repl, text)
 
 async def caption_worker(client: Client):
-    worker_name = asyncio.current_task().get_name() if asyncio.current_task() else "cap_worker"
     while True:
         job = await fetch_channel_job()
         if not job:
@@ -852,20 +787,14 @@ async def caption_worker(client: Client):
             await asyncio.sleep(DEFAULT_EDIT_DELAY)
         except FloodWait as e:
             wait = e.value + 2
-            log.warning("[%s] FloodWait %ds on ch=%d msg=%d",
-                        worker_name, wait, ch, job["message_id"])
             CHANNEL_COOLDOWN[ch] = time.time() + wait
             await reschedule(job["_id"], delay=wait)
         except errors.MessageNotModified:
             await mark_done(job["_id"])
-        except Exception as e:
+        except Exception:
             if job.get("retries", 0) >= 5:
-                log.error("[%s] giving up on ch=%d msg=%d after 5 retries: %s",
-                          worker_name, ch, job["message_id"], e)
                 await mark_done(job["_id"])
             else:
-                log.warning("[%s] ch=%d msg=%d retry=%d err=%s",
-                            worker_name, ch, job["message_id"], job.get("retries", 0), e)
                 await reschedule(job["_id"], delay=10)
         finally:
             if not released:
@@ -1102,10 +1031,7 @@ def imdb_enrich_title(title: str, year: str):
     if not title or not year or len(title) < 3:
         return title, year
     try:
-        client_ia = _get_ia()
-        if client_ia is None:
-            return title, year
-        results = client_ia.search_movie(title)
+        results = ia.search_movie(title)
         for r in results[:5]:
             if str(r.get("year", "")) == year:
                 clean = r.get("title", title)
@@ -1966,12 +1892,7 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await client.edit_message_text(
-                chat_id, msg_id,
-                "✅ <b>Caption updated successfully!</b>\n\n"
-                f"📝 <b>Set to:</b>\n<code>{text[:200]}</code>",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back to Panel", callback_data="ffc_menu")]]),
-            )
+            await _render_ff_capsub(client, chat_id, msg_id, cs)
             return
 
         if pending == "block_words":
@@ -1981,11 +1902,7 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await client.edit_message_text(
-                chat_id, msg_id,
-                "✅ Blocked words updated!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_words")]]),
-            )
+            await _render_ff_words_menu(client, chat_id, msg_id, cs)
             return
 
         if pending == "replace_words":
@@ -1995,11 +1912,7 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await client.edit_message_text(
-                chat_id, msg_id,
-                "✅ Replace words updated!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_replace")]]),
-            )
+            await _render_ff_replace_menu(client, chat_id, msg_id, cs)
             return
 
         if pending == "prefix":
@@ -2009,11 +1922,7 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await client.edit_message_text(
-                chat_id, msg_id,
-                "✅ Prefix updated!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_suffixprefix")]]),
-            )
+            await _render_ff_suffixprefix_menu(client, chat_id, msg_id, cs)
             return
 
         if pending == "suffix":
@@ -2023,11 +1932,7 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await client.edit_message_text(
-                chat_id, msg_id,
-                "✅ Suffix updated!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_suffixprefix")]]),
-            )
+            await _render_ff_suffixprefix_menu(client, chat_id, msg_id, cs)
             return
 
         if pending == "url_buttons":
@@ -2054,11 +1959,7 @@ async def capture_user_input(client, message):
             except Exception:
                 pass
             session.pop("pending_input", None)
-            await client.edit_message_text(
-                chat_id, msg_id,
-                "✅ URL buttons updated successfully!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_url")]]),
-            )
+            await _render_ff_url_menu(client, chat_id, msg_id, cs)
             return
 
     # ================= FILE FORWARD SKIP HANDLER =================
