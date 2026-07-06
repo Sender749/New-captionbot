@@ -1,8 +1,11 @@
 import motor.motor_asyncio
+import logging
 from info import *
 from typing import Optional
 import time
 from collections import defaultdict
+
+logger = logging.getLogger("captionbot.database")
 
 # ════════════════════════════════════════════════════════
 #  WORKER / EXECUTOR TUNING  (Koyeb free tier safe)
@@ -15,6 +18,10 @@ CAPTION_WORKERS      = 6     # was 30; 6 is enough with fair scheduling
 
 # Forward workers  ── how many concurrent file-forward tasks
 FORWARD_WORKERS      = 4     # was 12; 4 avoids flooding Telegram
+
+# Max pending docs scanned per fetch_channel_job() call — keeps polling cheap
+# even when thousands of jobs are queued across busy/cooling-down channels.
+_FETCH_SCAN_LIMIT    = 200
 
 # Max parallel edits per channel at once (rate-limit headroom)
 DEFAULT_MAX_WORKERS  = 2     # per channel concurrency cap
@@ -114,9 +121,19 @@ async def fetch_channel_job():
     Fair-pick: scan pending caption jobs oldest-first.
     Skip channels that are cooled down or at concurrency cap.
     Atomically claim the first eligible job.
+
+    The scan is capped at _FETCH_SCAN_LIMIT documents per call. Without a
+    cap, once thousands of jobs pile up for channels that are all
+    momentarily at their concurrency cap / cooldown, every single worker
+    would re-scan the *entire* pending backlog on every 0.5s poll just to
+    find nothing eligible -- wasted DB round-trips that get worse the more
+    files are queued, right when the queue needs to be draining fastest.
+    Capping the scan means a worker simply tries again next poll instead of
+    walking the whole collection every time; nothing is ever skipped since
+    finished jobs are deleted and paused ones are already excluded here.
     """
     now = time.time()
-    cursor = queue_col.find({"status": "pending"}).sort("ts", 1)
+    cursor = queue_col.find({"status": "pending"}).sort("ts", 1).limit(_FETCH_SCAN_LIMIT)
     async for job in cursor:
         ch = job["chat_id"]
         if CHANNEL_COOLDOWN.get(ch, 0) > now:
@@ -156,13 +173,13 @@ async def recover_stuck_jobs(timeout=300):
         {"$set": {"status": "pending"}},
     )
     if r1.modified_count:
-        print(f"[RECOVER] Reset {r1.modified_count} stuck caption job(s)")
+        logger.info(f"[RECOVER] Reset {r1.modified_count} stuck caption job(s)")
     r2 = await forward_queue.update_many(
         {"status": "processing", "started": {"$lt": cutoff}},
         {"$set": {"status": "pending"}},
     )
     if r2.modified_count:
-        print(f"[RECOVER] Reset {r2.modified_count} stuck forward job(s)")
+        logger.info(f"[RECOVER] Reset {r2.modified_count} stuck forward job(s)")
 
 
 # ════════════════════════════════════════════════════════
@@ -304,7 +321,7 @@ async def insert_user_check_new(user_id: int) -> bool:
         )
         return True
     except Exception as e:
-        print(f"[ERROR] insert_user_check_new: {e}")
+        logger.warning(f"[ERROR] insert_user_check_new: {e}")
         return False
 
 
