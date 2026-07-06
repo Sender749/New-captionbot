@@ -3,6 +3,8 @@ import asyncio
 import importlib
 import logging
 import pkgutil
+import platform
+import sys
 from pyrogram import Client
 from pyrogram.errors import FloodWait
 
@@ -13,18 +15,25 @@ from body.database import (
     ensure_forward_indexes,
     recover_stuck_jobs,
 )
-from body.Caption import caption_worker
+from body.Caption import start_caption_workers
 
 PLUGIN_ROOT = "body"
 
-# ── Logging — output to stdout so Koyeb log stream captures everything ────────
+# ── Global logging setup ──────────────────────────────────────────────────────
+# Everything logs to stdout (Koyeb captures stdout via supervisord ->
+# /app/logs/bot.log), so admins can `koyeb service logs` / tail the file to
+# see exactly what the bot is doing (queue workers, /channels, FloodWaits,
+# job failures, etc.) instead of the previous near-total silence.
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler()],
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    stream=sys.stdout,
 )
-log = logging.getLogger("BOT")
+# Pyrogram itself is fairly chatty at INFO; keep it at WARNING so our own
+# [CAP_WORKER]/[CHANNELS]/[GFF] logs aren't drowned out.
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
+logger = logging.getLogger("captionbot.bot")
 
 
 class Bot(Client):
@@ -42,31 +51,30 @@ class Bot(Client):
         )
 
     async def start(self):
-        log.info("[BOOT] Bot starting up…")
-
         # Connect with FloodWait guard
         try:
             await super().start()
         except FloodWait as e:
-            log.warning("[BOOT] Startup FloodWait: sleeping %ds", e.value)
+            logger.warning(f"🚨 Startup FloodWait: sleeping {e.value}s")
             await asyncio.sleep(e.value)
             await super().start()
 
         # One-time DB setup
-        log.info("[BOOT] Setting up DB indexes…")
         await ensure_queue_indexes()
         await ensure_forward_indexes()
+        await recover_stuck_jobs()
 
-        stuck = await recover_stuck_jobs()
-        log.info("[BOOT] DB indexes ready")
-
-        # Run per-plugin startup hooks (e.g. file_forward.on_bot_start)
+        # Run per-plugin startup hooks (e.g. file_forward.on_bot_start,
+        # admin_channels.on_bot_start)
         await self._run_plugin_startup_hooks()
 
-        # Start per-channel caption queue workers
-        for i in range(CAPTION_WORKERS):
-            asyncio.create_task(caption_worker(self), name=f"cap_worker_{i}")
-        log.info("[BOOT] %d caption worker(s) started", CAPTION_WORKERS)
+        # Start the caption queue system: CAPTION_WORKERS (default 6)
+        # parallel workers, each auto-restarted if it ever crashes, instead
+        # of the previous single un-recovering task. This is the fix for
+        # "bot only edits 10-15 files out of 1000+" — that happened because
+        # the one and only worker died silently on the first transient
+        # error and nothing ever replaced it.
+        start_caption_workers(self, count=CAPTION_WORKERS)
 
         me = await self.get_me()
         self.force_channel = FORCE_SUB
@@ -74,15 +82,18 @@ class Bot(Client):
             try:
                 self.invitelink = await self.export_chat_invite_link(FORCE_SUB)
             except Exception:
-                log.warning("[BOOT] Bot must be admin in force-sub channel")
+                logger.warning("⚠️  Bot must be admin in force-sub channel")
                 self.force_channel = None
 
-        log.info("[BOOT] %s is online ✨", me.first_name)
+        logger.info(
+            f"{me.first_name} is started ✨ | "
+            f"python={platform.python_version()} | "
+            f"platform={platform.system()} {platform.release()} | "
+            f"caption_workers={CAPTION_WORKERS}"
+        )
         try:
-            await self.send_message(
-                ADMIN[0] if isinstance(ADMIN, list) else ADMIN,
-                f"**{me.first_name} started ✨**"
-            )
+            await self.send_message(ADMIN[0] if isinstance(ADMIN, list) else ADMIN,
+                                    f"**{me.first_name} started ✨**")
         except Exception:
             pass
 
@@ -92,7 +103,7 @@ class Bot(Client):
             module = importlib.import_module(f"{PLUGIN_ROOT}.{module_name}")
             hook = getattr(module, "on_bot_start", None)
             if callable(hook):
-                log.info("[BOOT] Running startup hook: %s.on_bot_start()", module_name)
+                logger.info(f"🔌 Running startup hook: {module_name}.on_bot_start()")
                 hook(self)
 
 
