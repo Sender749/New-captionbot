@@ -1,13 +1,21 @@
 """
 admin_channels.py  ── /channels admin command
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• /channels  (admin-only): lists all user-added channels as buttons
+• /channels  (admin-only): lists all user-added channels as buttons, paginated
+  10 per page with Next/Back navigation.
 • Forwarding destination = MANUAL_FF (never CP_CH)
 • All progress helpers imported from database.py (no local redefinitions)
 • on_bot_start() only launches worker tasks (no DB calls — those run in bot.py)
+
+Every handler here is wrapped so a failure is logged (visible in Koyeb's
+stdout log stream) and reported back to the admin instead of failing
+completely silently, which previously made /channels look like it "did
+nothing" whenever an unexpected error occurred (e.g. too many channels for
+a single un-paginated keyboard, a transient Mongo/Telegram error, etc).
 """
 
 import asyncio
+import logging
 import time
 import uuid
 
@@ -24,6 +32,8 @@ from body.database import (
 )
 from info import ADMIN, MANUAL_FF
 
+logger = logging.getLogger("captionbot.admin_channels")
+
 # ── Pyrogram filter (evaluated once at import — works with list or int) ───────
 _ADMIN_FILTER = filters.user(ADMIN)
 
@@ -39,6 +49,13 @@ _GFF_FORWARD_DELAY       = 1.2
 _gff_job_queue           = asyncio.Queue()
 _gff_completed_sessions: set = set()
 
+# ── Pagination ─────────────────────────────────────────────────────────────────
+CHANNELS_PER_PAGE = 10
+# Remembers which page was last rendered for a given message id, so
+# "🔙 Back to Channels" from a channel-detail screen returns to the same
+# page the admin came from instead of always resetting to page 0.
+_LIST_PAGE_STATE: dict = {}
+
 
 # ── Startup hook ──────────────────────────────────────────────────────────────
 
@@ -49,7 +66,7 @@ def on_bot_start(client: Client):
             _global_ff_worker(client),
             name=f"gff_worker_{i}",
         )
-    print(f"[GFF] {GLOBAL_FF_WORKERS} global-forward workers started | dest={MANUAL_FF}")
+    logger.info(f"[GFF] {GLOBAL_FF_WORKERS} global-forward workers started | dest={MANUAL_FF}")
 
 
 # ── Helper: collect all non-admin user channels ───────────────────────────────
@@ -86,17 +103,37 @@ async def _get_all_user_channels() -> list:
 
 @Client.on_message(filters.private & _ADMIN_FILTER & filters.command("channels"))
 async def channels_cmd(client: Client, message):
-    await _show_channel_list(client, message)
+    logger.info(f"[CHANNELS] /channels requested by admin={message.from_user.id}")
+    try:
+        await _show_channel_list(client, message)
+    except Exception as e:
+        logger.exception(f"[CHANNELS] channels_cmd failed: {e}")
+        try:
+            await message.reply_text(f"❌ Failed to load channel list:\n<code>{e}</code>")
+        except Exception:
+            pass
 
 
 # ── Channel list renderer ─────────────────────────────────────────────────────
 
-async def _show_channel_list(client: Client, target):
+async def _show_channel_list(client: Client, target, page: int = None):
     """
-    Works for both Message (initial /channels) and CallbackQuery (Back button).
+    Works for both Message (initial /channels) and CallbackQuery (Back /
+    pagination buttons). Renders CHANNELS_PER_PAGE channels at a time with
+    Next/Back navigation when there is more than one page.
     """
-    channels = await _get_all_user_channels()
     is_query = hasattr(target, "data")   # True → CallbackQuery
+
+    try:
+        channels = await _get_all_user_channels()
+    except Exception as e:
+        logger.exception(f"[CHANNELS] Failed to fetch channel list from DB: {e}")
+        text = f"❌ <b>Failed to load channels.</b>\n<code>{e}</code>"
+        if is_query:
+            await target.message.edit_text(text)
+        else:
+            await target.reply_text(text)
+        return
 
     if not channels:
         text = (
@@ -109,13 +146,35 @@ async def _show_channel_list(client: Client, target):
             await target.reply_text(text)
         return
 
+    # Resolve the page to render. If not explicitly given (e.g. plain
+    # "Back to Channels" clicks), fall back to whatever page was last shown
+    # in this exact message, defaulting to the first page.
+    msg_id = target.message.id if is_query else None
+    if page is None:
+        page = _LIST_PAGE_STATE.get(msg_id, 0) if msg_id else 0
+
+    total_pages = max(1, (len(channels) + CHANNELS_PER_PAGE - 1) // CHANNELS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * CHANNELS_PER_PAGE
+    page_channels = channels[start:start + CHANNELS_PER_PAGE]
+
     kb = [
         [InlineKeyboardButton(
             f"📢 {ch['channel_title']}",
             callback_data=f"adm_ch_{ch['channel_id']}"
         )]
-        for ch in channels
+        for ch in page_channels
     ]
+
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀ Back", callback_data=f"adm_ch_pg_{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("Next ▶", callback_data=f"adm_ch_pg_{page + 1}"))
+        kb.append(nav_row)
+
     kb.append([InlineKeyboardButton("❌ Close", callback_data="close_msg")])
 
     text = (
@@ -124,9 +183,33 @@ async def _show_channel_list(client: Client, target):
     )
 
     if is_query:
-        await target.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        sent = await target.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
     else:
-        await target.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        sent = await target.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+
+    result_msg = sent if sent is not None else (target.message if is_query else None)
+    if result_msg is not None:
+        _LIST_PAGE_STATE[result_msg.id] = page
+
+
+# ── Pagination navigation ─────────────────────────────────────────────────────
+
+@Client.on_callback_query(filters.regex(r"^adm_ch_pg_(\d+)$") & _ADMIN_FILTER)
+async def adm_ch_page_nav(client: Client, query):
+    await query.answer()
+    page = int(query.matches[0].group(1))
+    try:
+        await _show_channel_list(client, query, page=page)
+    except Exception as e:
+        logger.exception(f"[CHANNELS] pagination to page={page} failed: {e}")
+        await query.answer(f"❌ Failed to load page: {e}", show_alert=True)
+
+
+@Client.on_callback_query(filters.regex(r"^noop$"))
+async def _noop_cb(client: Client, query):
+    # Purely decorative buttons (e.g. the page-indicator) need a callback_data
+    # so Telegram accepts them, but they shouldn't do anything.
+    await query.answer()
 
 
 # ── Channel detail ────────────────────────────────────────────────────────────
@@ -135,7 +218,12 @@ async def _show_channel_list(client: Client, target):
 async def adm_channel_detail(client: Client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    await _show_channel_detail(client, query, channel_id)
+    logger.info(f"[CHANNELS] admin={query.from_user.id} opened detail ch={channel_id}")
+    try:
+        await _show_channel_detail(client, query, channel_id)
+    except Exception as e:
+        logger.exception(f"[CHANNELS] channel detail failed ch={channel_id}: {e}")
+        await query.answer(f"❌ Failed to load channel: {e}", show_alert=True)
 
 
 async def _show_channel_detail(client: Client, query, channel_id: int):
@@ -237,7 +325,11 @@ async def _show_channel_detail(client: Client, query, channel_id: int):
 @Client.on_callback_query(filters.regex(r"^adm_ch_back$") & _ADMIN_FILTER)
 async def adm_ch_back(client: Client, query):
     await query.answer()
-    await _show_channel_list(client, query)
+    try:
+        await _show_channel_list(client, query)
+    except Exception as e:
+        logger.exception(f"[CHANNELS] adm_ch_back failed: {e}")
+        await query.answer(f"❌ Failed to reload channels: {e}", show_alert=True)
 
 
 # ── Start forwarding from message 1 ──────────────────────────────────────────
@@ -388,6 +480,8 @@ async def _gff_scan_and_enqueue(client: Client, session_id: str):
     consecutive_missing = 0
     total_found         = 0
 
+    logger.info(f"[GFF_SCAN] session={session_id[:8]} started ch={channel_id} from_msg={start_from}")
+
     while True:
         await asyncio.sleep(0)   # yield every iteration
 
@@ -398,11 +492,11 @@ async def _gff_scan_and_enqueue(client: Client, session_id: str):
             msg = await client.get_messages(channel_id, msg_id)
         except FloodWait as e:
             wait = int(e.value) + 2
-            print(f"[GFF_SCAN] FloodWait {wait}s on ch={channel_id}")
+            logger.warning(f"[GFF_SCAN] FloodWait {wait}s on ch={channel_id}")
             await asyncio.sleep(wait)
             continue
         except Exception as e:
-            print(f"[GFF_SCAN] error msg_id={msg_id}: {e}")
+            logger.warning(f"[GFF_SCAN] error msg_id={msg_id} ch={channel_id}: {e}")
             msg_id += 1
             continue
 
@@ -436,6 +530,7 @@ async def _gff_scan_and_enqueue(client: Client, session_id: str):
     # Scan complete
     if session_id not in ADMIN_FF_CANCELLED:
         session["scan_done"] = True
+        logger.info(f"[GFF_SCAN] session={session_id[:8]} scan done ch={channel_id} total_found={total_found}")
         if total_found == 0:
             try:
                 await client.edit_message_text(
@@ -518,14 +613,14 @@ async def _global_ff_worker(client: Client):
 
         except FloodWait as e:
             wait = min(300, int(e.value) + 5)
-            print(f"[GFF_WORKER] FloodWait {wait}s ch={channel_id}")
+            logger.warning(f"[GFF_WORKER] FloodWait {wait}s ch={channel_id}")
             await asyncio.sleep(wait)
             await _gff_job_queue.put(job)   # re-queue
             _gff_job_queue.task_done()
             continue
 
         except Exception as e:
-            print(f"[GFF_WORKER_ERR] msg_id={msg_id} ch={channel_id}: {e}")
+            logger.warning(f"[GFF_WORKER_ERR] msg_id={msg_id} ch={channel_id}: {e}")
 
         _gff_job_queue.task_done()
         await _gff_maybe_complete(client, job, session)
