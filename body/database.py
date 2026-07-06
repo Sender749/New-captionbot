@@ -7,49 +7,24 @@ from collections import defaultdict
 # ════════════════════════════════════════════════════════
 #  WORKER / EXECUTOR TUNING  (Koyeb free tier safe)
 #  Koyeb free: 512 MB RAM, 0.1 vCPU shared
-#
-#  Koyeb free CPU budget breakdown (approximate):
-#  ─────────────────────────────────────────────
-#  Caption workers          : 4  (primary function — highest priority)
-#  Forward workers          : 2  (conservative; caption is king)
-#  Max global FF sessions   : 3  (prevents user-FF from starving captions)
-#  ─────────────────────────────────────────────
-#  Total concurrent asyncio tasks ≤ 20 keeps the event loop responsive.
-#  Forward jobs are naturally I/O-bound (Telegram API calls + sleep), so 2
-#  workers is enough throughput while leaving CPU headroom for captions.
+#  Keep total asyncio tasks ≤ 30 so event loop stays snappy
 # ════════════════════════════════════════════════════════
 
-# Caption workers — how many concurrent caption-edit tasks run at once.
-# These are the bot's PRIMARY function. Keep at 4 to stay responsive.
-CAPTION_WORKERS      = 4
+# Caption workers  ── how many concurrent caption-edit tasks
+CAPTION_WORKERS      = 6     # was 30; 6 is enough with fair scheduling
 
-# Forward workers — how many DB jobs are being processed concurrently.
-# 2 is safe on Koyeb free: each worker spends most of its time sleeping
-# (FORWARD_DELAY) or waiting on Telegram I/O, so CPU impact is minimal.
-FORWARD_WORKERS      = 2
-
-# ── NEW: Global file-forwarding slot limit ─────────────────────────────
-# Maximum number of ACTIVE forwarding sessions across ALL users at once.
-# If all slots are taken, the next user's scan is queued (not rejected)
-# and auto-starts the moment a slot frees up.
-# • 3 is intentionally conservative to protect caption-editing throughput.
-# • Each active session = 1 running scan task + its share of FORWARD_WORKERS.
-MAX_GLOBAL_FF_SESSIONS = 3
+# Forward workers  ── how many concurrent file-forward tasks
+FORWARD_WORKERS      = 4     # was 12; 4 avoids flooding Telegram
 
 # Max parallel edits per channel at once (rate-limit headroom)
 DEFAULT_MAX_WORKERS  = 2     # per channel concurrency cap
 
-# How many forward jobs run simultaneously for a single src→dst pair.
-# Keep at 1 — Telegram throttles hard per destination chat.
-MAX_FORWARD_PER_PAIR = 1
+# How many forward jobs run simultaneously for a single src→dst pair
+MAX_FORWARD_PER_PAIR = 1     # keep 1 – Telegram throttles hard per chat
 
-# Seconds to sleep between caption edits / forwards
+# Seconds to sleep between edits (caption) / forwards
 DEFAULT_EDIT_DELAY   = 0.5   # caption edit cooldown per worker
-FORWARD_DELAY        = 1.5   # forward cooldown per worker
-                              # (1.5 s gives ~40 files/min per worker — safe)
-
-# Seconds between progress-bar UI edits (avoid hitting edit rate-limit)
-FF_PROGRESS_INTERVAL = 5.0   # update UI at most once every 5 s per session
+FORWARD_DELAY        = 0.8   # forward cooldown per worker (generous)
 
 # ════════════════════════════════════════════════════════
 #  Per-channel scheduler state  (in-memory, reset on restart)
