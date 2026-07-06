@@ -1,6 +1,7 @@
 import os
 import asyncio
 import importlib
+import logging
 import pkgutil
 from pyrogram import Client
 from pyrogram.errors import FloodWait
@@ -15,6 +16,15 @@ from body.database import (
 from body.Caption import caption_worker
 
 PLUGIN_ROOT = "body"
+
+# ── Logging — output to stdout so Koyeb log stream captures everything ────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler()],
+)
+log = logging.getLogger("BOT")
 
 
 class Bot(Client):
@@ -32,27 +42,31 @@ class Bot(Client):
         )
 
     async def start(self):
+        log.info("[BOOT] Bot starting up…")
+
         # Connect with FloodWait guard
         try:
             await super().start()
         except FloodWait as e:
-            print(f"🚨 Startup FloodWait: sleeping {e.value}s")
+            log.warning("[BOOT] Startup FloodWait: sleeping %ds", e.value)
             await asyncio.sleep(e.value)
             await super().start()
 
         # One-time DB setup
+        log.info("[BOOT] Setting up DB indexes…")
         await ensure_queue_indexes()
         await ensure_forward_indexes()
-        await recover_stuck_jobs()
+
+        stuck = await recover_stuck_jobs()
+        log.info("[BOOT] DB indexes ready")
 
         # Run per-plugin startup hooks (e.g. file_forward.on_bot_start)
         await self._run_plugin_startup_hooks()
 
-        # Start per-channel queue system.
-        # caption_worker now recovers pending jobs from MongoDB and
-        # spawns dedicated per-channel workers automatically.
-        asyncio.create_task(caption_worker(self), name="cap_recovery")
-        print("[BOT] Per-channel caption queue system started")
+        # Start per-channel caption queue workers
+        for i in range(CAPTION_WORKERS):
+            asyncio.create_task(caption_worker(self), name=f"cap_worker_{i}")
+        log.info("[BOOT] %d caption worker(s) started", CAPTION_WORKERS)
 
         me = await self.get_me()
         self.force_channel = FORCE_SUB
@@ -60,13 +74,15 @@ class Bot(Client):
             try:
                 self.invitelink = await self.export_chat_invite_link(FORCE_SUB)
             except Exception:
-                print("⚠️  Bot must be admin in force-sub channel")
+                log.warning("[BOOT] Bot must be admin in force-sub channel")
                 self.force_channel = None
 
-        print(f"{me.first_name} is started ✨")
+        log.info("[BOOT] %s is online ✨", me.first_name)
         try:
-            await self.send_message(ADMIN[0] if isinstance(ADMIN, list) else ADMIN,
-                                    f"**{me.first_name} started ✨**")
+            await self.send_message(
+                ADMIN[0] if isinstance(ADMIN, list) else ADMIN,
+                f"**{me.first_name} started ✨**"
+            )
         except Exception:
             pass
 
@@ -76,7 +92,7 @@ class Bot(Client):
             module = importlib.import_module(f"{PLUGIN_ROOT}.{module_name}")
             hook = getattr(module, "on_bot_start", None)
             if callable(hook):
-                print(f"🔌 Running startup hook: {module_name}.on_bot_start()")
+                log.info("[BOOT] Running startup hook: %s.on_bot_start()", module_name)
                 hook(self)
 
 
