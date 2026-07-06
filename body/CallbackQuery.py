@@ -176,6 +176,11 @@ async def _show_suffixprefix_menu(client, query, channel_id: int):
 @Client.on_callback_query(filters.regex(r"^chinfo_(-?\d+)$"))
 async def channel_settings(client, query):
     await query.answer()
+    # If this message is the "✅ Bot added to <channel>" notification that
+    # was scheduled to auto-delete, the user is now actively using it to
+    # configure the channel — cancel that timer so it doesn't get yanked
+    # away mid-setup. Safe no-op for any other message.
+    cancel_pending_auto_delete(query.message.id)
     channel_id = int(query.matches[0].group(1))
     await _show_channel_settings(client, query, channel_id)
 
