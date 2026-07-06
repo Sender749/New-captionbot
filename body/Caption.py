@@ -1,4 +1,4 @@
-import sys, time, os, re, asyncio
+import sys, time, os, re, asyncio, logging
 from typing import Tuple, List, Optional
 from pyrogram import Client, filters, errors, enums
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated, CallbackQuery
@@ -12,7 +12,28 @@ from collections import deque, defaultdict
 from imdb import IMDb
 from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
 
-ia = IMDb()
+logger = logging.getLogger("captionbot.caption")
+
+_ia = None
+
+def _get_ia():
+    """Lazily create the IMDb() client on first use.
+
+    Creating IMDb() at import time makes cinemagoer build its default
+    S3/SQLite-backed access system, which calls sqlalchemy.create_engine()
+    with a malformed 'sqlite://cinemagoer.db' URL on this
+    environment/version combo and raises immediately -> the whole bot
+    process crashes on import (exit status 1 right after startup, before
+    it even connects to Telegram). Using the "http" backend and building
+    it lazily avoids touching sqlalchemy entirely and keeps the crash
+    contained (best-effort, silent on any error) instead of taking the
+    whole bot down.
+    """
+    global _ia
+    if _ia is None:
+        _ia = IMDb("http")
+    return _ia
+
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
 DEFAULT_EDIT_DELAY = 0.3                 # per channel
 bot_data = {
@@ -77,7 +98,7 @@ async def when_added_as_admin(client, chat_member_update):
                 owner_id,
                 f"✅ Bot added to <b>{chat.title}</b>.\nYou can manage it anytime using /settings.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⚙️ Open Settings", callback_data="settings_cb")]
+                    [InlineKeyboardButton("⚙️ Open Settings", callback_data=f"chinfo_{chat.id}")]
                 ])
             )
             print(f"[NEW] Added to {chat.title} by {owner_name} ({owner_id})")
@@ -102,12 +123,38 @@ async def when_added_as_admin(client, chat_member_update):
     except Exception as e:
         print(f"[ERROR] when_added_as_admin: {e}")
 
+_PENDING_AUTO_DELETE: dict = {}   # message_id -> asyncio.Task
+
 async def auto_delete_message(msg, delay: int):
-    await asyncio.sleep(delay)
+    """
+    Schedules `msg` for deletion after `delay` seconds. The task is tracked
+    by message id in _PENDING_AUTO_DELETE so it can be cancelled (see
+    cancel_pending_auto_delete) if the user interacts with the message
+    before the timer fires -- e.g. tapping "⚙️ Open Settings" on a
+    channel-added notification. Previously this message always vanished
+    after a fixed delay even while the user was actively using it to
+    configure the channel's caption, which yanked the settings UI away
+    mid-setup.
+    """
+    task = asyncio.current_task()
+    if task is not None:
+        _PENDING_AUTO_DELETE[msg.id] = task
     try:
+        await asyncio.sleep(delay)
         await msg.delete()
-    except:
+    except asyncio.CancelledError:
         pass
+    except Exception:
+        pass
+    finally:
+        _PENDING_AUTO_DELETE.pop(msg.id, None)
+
+
+def cancel_pending_auto_delete(message_id: int):
+    """Cancel a scheduled auto-delete for `message_id`, if one is pending."""
+    task = _PENDING_AUTO_DELETE.pop(message_id, None)
+    if task and not task.done():
+        task.cancel()
 
 @Client.on_callback_query(filters.regex(r"^settings_cb$"))
 async def settings_button_handler(client: Client, query: CallbackQuery):
@@ -515,31 +562,26 @@ async def reset_db(client, message):
 
     await message.reply_text("✅ All database records have been deleted successfully!")
 
-@Client.on_message(filters.private & filters.command("queue"))
+@Client.on_message(filters.private & filters.user(ADMIN) & filters.command("queue"))
 async def queue_status(client, message):
     """
-    /queue — available to ALL users (not admin-only).
+    /queue — admin-only.
 
-    • Regular users  → see only their own caption tasks and file-forward sessions.
-    • Admins         → see ALL tasks across all users, plus the global-forward
-                       (admin /channels) queue from admin_channels.py.
+    Shows caption-edit and file-forward progress for ALL users (not just
+    the caller), plus the global-forward (admin /channels) queue from
+    admin_channels.py.
     """
     uid      = message.from_user.id
-    is_admin = uid in (ADMIN if isinstance(ADMIN, (list, tuple, set)) else [ADMIN])
+    is_admin = True
 
     loading = await message.reply_text("🔄 Fetching queue…")
     try:
         # ════════════════════════════════════════════════════
-        #  CAPTION QUEUE
+        #  CAPTION QUEUE  (all users)
         # ════════════════════════════════════════════════════
-        if is_admin:
-            cap_pending    = await queue_col.count_documents({"status": "pending"})
-            cap_processing = await queue_col.count_documents({"status": "processing"})
-            cap_match      = {"status": {"$in": ["pending", "processing"]}}
-        else:
-            cap_pending    = await queue_col.count_documents({"status": "pending",    "user_id": uid})
-            cap_processing = await queue_col.count_documents({"status": "processing", "user_id": uid})
-            cap_match      = {"status": {"$in": ["pending", "processing"]}, "user_id": uid}
+        cap_pending    = await queue_col.count_documents({"status": "pending"})
+        cap_processing = await queue_col.count_documents({"status": "processing"})
+        cap_match      = {"status": {"$in": ["pending", "processing"]}}
 
         cap_pipeline = [
             {"$match": cap_match},
@@ -589,16 +631,11 @@ async def queue_status(client, message):
             )
 
         # ════════════════════════════════════════════════════
-        #  FILE FORWARD QUEUE  (user /file_forward sessions)
+        #  FILE FORWARD QUEUE  (all users' /file_forward sessions)
         # ════════════════════════════════════════════════════
-        if is_admin:
-            f_pending    = await forward_queue.count_documents({"status": "pending"})
-            f_processing = await forward_queue.count_documents({"status": "processing"})
-            fwd_match    = {"status": {"$in": ["pending", "processing"]}}
-        else:
-            f_pending    = await forward_queue.count_documents({"status": "pending",    "user_id": uid})
-            f_processing = await forward_queue.count_documents({"status": "processing", "user_id": uid})
-            fwd_match    = {"status": {"$in": ["pending", "processing"]}, "user_id": uid}
+        f_pending    = await forward_queue.count_documents({"status": "pending"})
+        f_processing = await forward_queue.count_documents({"status": "processing"})
+        fwd_match    = {"status": {"$in": ["pending", "processing"]}}
 
         f_pipeline = [
             {"$match": fwd_match},
@@ -692,7 +729,7 @@ async def queue_status(client, message):
         # ════════════════════════════════════════════════════
         #  COMPOSE REPLY
         # ════════════════════════════════════════════════════
-        scope_label = "📋 <b>QUEUE STATUS</b>" if is_admin else "📋 <b>YOUR QUEUE STATUS</b>"
+        scope_label = "📋 <b>QUEUE STATUS (All Users)</b>"
 
         text = (
             f"{scope_label}\n"
@@ -719,16 +756,13 @@ async def queue_status(client, message):
         else:
             text += "✅ Forward queue is empty\n\n"
 
-        if is_admin:
-            text += "🌐 <b>GLOBAL FORWARD (/channels)</b>\n"
-            if gff_lines:
-                text += "\n\n".join(gff_lines)
-            else:
-                text += "✅ No active global-forward sessions"
+        text += "🌐 <b>GLOBAL FORWARD (/channels)</b>\n"
+        if gff_lines:
+            text += "\n\n".join(gff_lines)
+        else:
+            text += "✅ No active global-forward sessions"
 
         text += "\n\n━━━━━━━━━━━━━━━━━━━━━━━━"
-        if not is_admin:
-            text += "\n<i>💡 Use /file_forward to start a new forwarding session.</i>"
 
         await loading.edit_text(text, parse_mode=ParseMode.HTML,
                                  disable_web_page_preview=True)
@@ -746,12 +780,41 @@ def sanitize_caption_html(text: str) -> str:
         return match.group(0) if tag in allowed_tags else ""
     return re.sub(r"</?\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>", repl, text)
 
-async def caption_worker(client: Client):
+async def caption_worker(client: Client, worker_id: int = 0):
+    """
+    Single caption-queue consumer.
+
+    IMPORTANT: previously `job = await fetch_channel_job()` sat OUTSIDE the
+    try/except block below, so any transient error inside it (a Mongo
+    cursor hiccup, a network blip, etc.) raised straight out of this
+    function. Since bot.py only ever started ONE of these tasks, that single
+    unhandled exception permanently killed the *only* consumer of the
+    queue -- every job already enqueued after that point (often after only
+    ~10-15 files) just sat in MongoDB as "pending" forever, with nothing
+    left running to pick it up, and no restart happened until the process
+    itself was restarted. There was also no logging at all here, so the
+    failure was completely invisible in the Koyeb logs.
+
+    Fixed by: (1) wrapping the fetch itself in its own try/except so a
+    single bad poll never stops the loop, (2) logging every failure/retry
+    so admins can see what's happening from `koyeb logs`, and (3) this
+    function is now started multiple times in parallel (see
+    `start_caption_workers` below) and auto-restarted by a supervisor if it
+    ever does exit unexpectedly, so there's no more single point of failure.
+    """
+    logger.info(f"[CAP_WORKER_{worker_id}] started")
     while True:
-        job = await fetch_channel_job()
+        try:
+            job = await fetch_channel_job()
+        except Exception as e:
+            logger.warning(f"[CAP_WORKER_{worker_id}] fetch_channel_job error: {e}")
+            await asyncio.sleep(2)
+            continue
+
         if not job:
             await asyncio.sleep(0.5)
             continue
+
         ch = job["chat_id"]
         released = False
         try:
@@ -781,25 +844,58 @@ async def caption_worker(client: Client):
                         message_id=job["message_id"],
                         caption=fname
                     )
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[CAP_WORKER_{worker_id}] dump-copy skipped ch={ch} msg={job['message_id']}: {e}")
             await mark_done(job["_id"])
+            logger.info(f"[CAP_WORKER_{worker_id}] edited ch={ch} msg={job['message_id']}")
             await asyncio.sleep(DEFAULT_EDIT_DELAY)
         except FloodWait as e:
             wait = e.value + 2
             CHANNEL_COOLDOWN[ch] = time.time() + wait
+            logger.warning(f"[CAP_WORKER_{worker_id}] FloodWait {wait}s ch={ch}")
             await reschedule(job["_id"], delay=wait)
         except errors.MessageNotModified:
             await mark_done(job["_id"])
-        except Exception:
+        except Exception as e:
             if job.get("retries", 0) >= 5:
                 await mark_done(job["_id"])
+                logger.error(f"[CAP_WORKER_{worker_id}] giving up ch={ch} msg={job.get('message_id')} after 5 retries: {e}")
             else:
+                logger.warning(f"[CAP_WORKER_{worker_id}] job failed ch={ch} msg={job.get('message_id')} (retry {job.get('retries', 0) + 1}/5): {e}")
                 await reschedule(job["_id"], delay=10)
         finally:
             if not released:
                 CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
                 released = True
+
+
+def start_caption_workers(client: Client, count: int = None):
+    """
+    Spawns `count` (defaults to CAPTION_WORKERS from database.py) parallel
+    caption_worker tasks, each wrapped in a self-healing supervisor: if a
+    worker ever exits unexpectedly (should no longer happen given the fix
+    above, but this is a safety net), it's logged and automatically
+    restarted after a short delay instead of silently reducing capacity
+    forever.
+    """
+    n = count or CAPTION_WORKERS
+
+    async def _guarded(i):
+        while True:
+            try:
+                await caption_worker(client, worker_id=i)
+            except Exception as e:
+                logger.exception(f"[CAP_WORKER_{i}] crashed unexpectedly, restarting in 3s: {e}")
+                await asyncio.sleep(3)
+            else:
+                # caption_worker's own while-True loop should never return
+                # normally; if it somehow does, restart it anyway.
+                logger.warning(f"[CAP_WORKER_{i}] exited unexpectedly, restarting in 3s")
+                await asyncio.sleep(3)
+
+    for i in range(n):
+        asyncio.create_task(_guarded(i), name=f"cap_worker_{i}")
+    logger.info(f"[CAP] {n} caption workers started")
 
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
@@ -1031,7 +1127,7 @@ def imdb_enrich_title(title: str, year: str):
     if not title or not year or len(title) < 3:
         return title, year
     try:
-        results = ia.search_movie(title)
+        results = _get_ia().search_movie(title)
         for r in results[:5]:
             if str(r.get("year", "")) == year:
                 clean = r.get("title", title)
