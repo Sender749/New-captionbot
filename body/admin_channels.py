@@ -1,3 +1,19 @@
+"""
+admin_channels.py  ── /channels admin command
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• /channels  (admin-only): lists all user-added channels as buttons, paginated
+  10 per page with Next/Back navigation.
+• Forwarding destination = MANUAL_FF (never CP_CH)
+• All progress helpers imported from database.py (no local redefinitions)
+• on_bot_start() only launches worker tasks (no DB calls — those run in bot.py)
+
+Every handler here is wrapped so a failure is logged (visible in Koyeb's
+stdout log stream) and reported back to the admin instead of failing
+completely silently, which previously made /channels look like it "did
+nothing" whenever an unexpected error occurred (e.g. too many channels for
+a single un-paginated keyboard, a transient Mongo/Telegram error, etc).
+"""
+
 import asyncio
 import logging
 import time
@@ -22,61 +38,27 @@ logger = logging.getLogger("captionbot.admin_channels")
 _ADMIN_FILTER = filters.user(ADMIN)
 
 
-async def count_channel_files(
-    client: Client,
-    channel_id: int,
-    cap: int = 20000,
-    chunk_size: int = 100,
-    max_consecutive_missing: int = 500,
-) -> tuple[int, bool]:
+async def get_channel_file_count(client: Client, channel_id: int) -> int:
     """
-    Counts media messages currently in a channel.
+    Fast file/message count for a channel.
 
-    GLITCH FIX: the old implementation used client.get_chat_history(), which
-    (like get_chat_history_count()/search_messages_count()) is a USER-ONLY
-    Telegram method — it always raises for a bot account (BOT_METHOD_INVALID),
-    so /channels silently fell back to "N/A" on every single click, with the
-    error swallowed by a bare `except Exception: pass`.
+    The previous approach walked every message id in chunks of 100, which
+    for a 100k+ file channel meant 1000+ sequential API calls -- easily
+    minutes, sometimes much longer once a FloodWait or two hit. That's why
+    /channels got stuck on "Counting files, please wait...".
 
-    Bots CAN fetch messages by explicit id, so this walks message ids from 1
-    upward, fetching in batches of `chunk_size` (one API call per 100
-    messages instead of one per message) and counts how many carry media.
-    Tolerates gaps from deleted messages — only stops once
-    `max_consecutive_missing` ids in a row come back empty, exactly like the
-    existing /file_forward channel scanner does.
+    Telegram assigns message ids sequentially per chat, so sending one
+    throwaway message to the channel and reading back the id it's given
+    tells us the current highest message id in a single round trip --
+    then we immediately delete that throwaway message. One send + one
+    delete, regardless of whether the channel has 10 files or 500,000.
     """
-    count = 0
-    msg_id = 1
-    consecutive_missing = 0
-
-    while msg_id <= cap:
-        chunk_ids = list(range(msg_id, min(msg_id + chunk_size, cap + 1)))
-        try:
-            msgs = await client.get_messages(channel_id, chunk_ids)
-        except FloodWait as e:
-            await asyncio.sleep(e.value + 2)
-            continue
-        except Exception as e:
-            logger.warning(f"[CHANNELS] count_channel_files batch failed ch={channel_id} ids={chunk_ids[0]}-{chunk_ids[-1]}: {e}")
-            msgs = []
-
-        if not isinstance(msgs, list):
-            msgs = [msgs] if msgs else []
-
-        for m in msgs:
-            if m and not getattr(m, "empty", True):
-                consecutive_missing = 0
-                if m.media:
-                    count += 1
-            else:
-                consecutive_missing += 1
-                if consecutive_missing >= max_consecutive_missing:
-                    return count, False
-
-        msg_id += chunk_size
-        await asyncio.sleep(0)
-
-    return count, True
+    temp = await client.send_message(channel_id, ".")
+    try:
+        await client.delete_messages(channel_id, temp.id)
+    except Exception:
+        pass
+    return max(0, temp.id - 1)
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 ADMIN_FF_SESSIONS: dict  = {}   # session_id → session dict
@@ -112,6 +94,10 @@ def on_bot_start(client: Client):
 
 # ── Helper: collect all non-admin user channels ───────────────────────────────
 
+_CHANNEL_LIST_CACHE: dict = {"data": None, "ts": 0.0}
+_CHANNEL_LIST_TTL   = 30  # seconds
+
+
 async def _get_all_user_channels() -> list:
     """
     Scan the users collection and return every channel added by a non-admin.
@@ -140,13 +126,29 @@ async def _get_all_user_channels() -> list:
     return result
 
 
+async def _get_all_user_channels_cached(force: bool = False) -> list:
+    """
+    Same as _get_all_user_channels(), but reuses the result for
+    _CHANNEL_LIST_TTL seconds so clicking Next/Back doesn't re-scan the
+    whole `users` collection on every single page turn -- it just re-renders
+    the already-fetched list, so the page switch is effectively instant.
+    """
+    now = time.time()
+    if not force and _CHANNEL_LIST_CACHE["data"] is not None and (now - _CHANNEL_LIST_CACHE["ts"]) < _CHANNEL_LIST_TTL:
+        return _CHANNEL_LIST_CACHE["data"]
+    data = await _get_all_user_channels()
+    _CHANNEL_LIST_CACHE["data"] = data
+    _CHANNEL_LIST_CACHE["ts"]   = now
+    return data
+
+
 # ── /channels command ─────────────────────────────────────────────────────────
 
 @Client.on_message(filters.private & _ADMIN_FILTER & filters.command("channels"))
 async def channels_cmd(client: Client, message):
     logger.info(f"[CHANNELS] /channels requested by admin={message.from_user.id}")
     try:
-        await _show_channel_list(client, message)
+        await _show_channel_list(client, message, force_refresh=True)
     except Exception as e:
         logger.exception(f"[CHANNELS] channels_cmd failed: {e}")
         try:
@@ -157,7 +159,7 @@ async def channels_cmd(client: Client, message):
 
 # ── Channel list renderer ─────────────────────────────────────────────────────
 
-async def _show_channel_list(client: Client, target, page: int = None):
+async def _show_channel_list(client: Client, target, page: int = None, force_refresh: bool = False):
     """
     Works for both Message (initial /channels) and CallbackQuery (Back /
     pagination buttons). Renders CHANNELS_PER_PAGE channels at a time with
@@ -166,7 +168,7 @@ async def _show_channel_list(client: Client, target, page: int = None):
     is_query = hasattr(target, "data")   # True → CallbackQuery
 
     try:
-        channels = await _get_all_user_channels()
+        channels = await _get_all_user_channels_cached(force=force_refresh)
     except Exception as e:
         logger.exception(f"[CHANNELS] Failed to fetch channel list from DB: {e}")
         text = f"❌ <b>Failed to load channels.</b>\n<code>{e}</code>"
@@ -305,15 +307,9 @@ async def _show_channel_detail(client: Client, query, channel_id: int):
         if added_by_id:
             break
 
-    try:
-        await query.message.edit_text(f"🔎 Loading channel info for <b>{title}</b>...\n\n🗂 Counting files, please wait...")
-    except Exception:
-        pass
-
     # File count
     try:
-        count, hit_cap = await count_channel_files(client, channel_id)
-        file_count = f"{count}+" if hit_cap else str(count)
+        file_count = str(await get_channel_file_count(client, channel_id))
     except Exception as e:
         logger.warning(f"[CHANNELS] file count failed ch={channel_id}: {e}")
         file_count = "N/A"
