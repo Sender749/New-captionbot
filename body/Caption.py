@@ -902,13 +902,12 @@ async def caption_worker(client: Client, worker_id: int = 0):
             )
             if not await is_dump_skip(ch):
                 try:
-                    # No caption= override here -> Telegram copies the file's
-                    # own default/original caption (and entities) as-is, with
-                    # no smart-filename placeholder rebuilding of any kind.
+                    dump_caption = sanitize_dump_caption(job.get("default_caption") or "")
                     dump_sent = await client.copy_message(
                         chat_id=CP_CH,
                         from_chat_id=ch,
                         message_id=job["message_id"],
+                        caption=dump_caption,
                     )
                     await save_dump_origin(dump_sent.id, ch, job["message_id"])
                 except Exception as e:
@@ -1068,6 +1067,7 @@ async def reCap(client, msg):
         "chat_id": msg.chat.id,
         "message_id": msg.id,
         "caption": new_caption,
+        "default_caption": default_caption,
         "url_buttons": url_buttons or [],
         "user_id": msg.from_user.id if msg.from_user else None
     })
@@ -1795,6 +1795,35 @@ def strip_links_only(text: str) -> str:
     text = re.sub(r'\[\s*\]', '', text)   # []
     text = re.sub(r'\{\s*\}', '', text)   # {}
     text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+DUMP_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"   # symbols/pictographs, emoticons, transport, supplemental symbols
+    "\U00002600-\U000027BF"   # misc symbols, dingbats (includes 👉-style arrows' neighbours)
+    "\U00002190-\U000021FF"   # arrows
+    "\U00002B00-\U00002BFF"   # misc symbols/arrows
+    "\U0001F1E6-\U0001F1FF"   # regional indicators (flag letters)
+    "\U0000FE0F"              # variation selector
+    "\U0000200D"              # zero-width joiner
+    "]+",
+    flags=re.UNICODE,
+)
+
+def sanitize_dump_caption(text: str) -> str:
+    """
+    Cleans a file's original/default caption before it's sent to the CP_CH
+    dump channel: strips @usernames, links/websites (http, www, t.me),
+    markdown/HTML links, and emojis -- leaving the rest of the original
+    caption text untouched (no smart-filename rebuilding of any kind).
+    """
+    if not text:
+        return ""
+    text = strip_links_only(text)
+    text = remove_emojis(text)
+    text = DUMP_EMOJI_RE.sub("", text)
+    # Drop now-empty lines left behind by stripped links/mentions
+    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
     return text.strip()
 
 def apply_block_words(caption_html: str, raw_blocked: str) -> str:
