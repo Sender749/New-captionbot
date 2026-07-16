@@ -1,19 +1,3 @@
-"""
-admin_channels.py  ── /channels admin command
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• /channels  (admin-only): lists all user-added channels as buttons, paginated
-  10 per page with Next/Back navigation.
-• Forwarding destination = MANUAL_FF (never CP_CH)
-• All progress helpers imported from database.py (no local redefinitions)
-• on_bot_start() only launches worker tasks (no DB calls — those run in bot.py)
-
-Every handler here is wrapped so a failure is logged (visible in Koyeb's
-stdout log stream) and reported back to the admin instead of failing
-completely silently, which previously made /channels look like it "did
-nothing" whenever an unexpected error occurred (e.g. too many channels for
-a single un-paginated keyboard, a transient Mongo/Telegram error, etc).
-"""
-
 import asyncio
 import logging
 import time
@@ -36,6 +20,63 @@ logger = logging.getLogger("captionbot.admin_channels")
 
 # ── Pyrogram filter (evaluated once at import — works with list or int) ───────
 _ADMIN_FILTER = filters.user(ADMIN)
+
+
+async def count_channel_files(
+    client: Client,
+    channel_id: int,
+    cap: int = 20000,
+    chunk_size: int = 100,
+    max_consecutive_missing: int = 500,
+) -> tuple[int, bool]:
+    """
+    Counts media messages currently in a channel.
+
+    GLITCH FIX: the old implementation used client.get_chat_history(), which
+    (like get_chat_history_count()/search_messages_count()) is a USER-ONLY
+    Telegram method — it always raises for a bot account (BOT_METHOD_INVALID),
+    so /channels silently fell back to "N/A" on every single click, with the
+    error swallowed by a bare `except Exception: pass`.
+
+    Bots CAN fetch messages by explicit id, so this walks message ids from 1
+    upward, fetching in batches of `chunk_size` (one API call per 100
+    messages instead of one per message) and counts how many carry media.
+    Tolerates gaps from deleted messages — only stops once
+    `max_consecutive_missing` ids in a row come back empty, exactly like the
+    existing /file_forward channel scanner does.
+    """
+    count = 0
+    msg_id = 1
+    consecutive_missing = 0
+
+    while msg_id <= cap:
+        chunk_ids = list(range(msg_id, min(msg_id + chunk_size, cap + 1)))
+        try:
+            msgs = await client.get_messages(channel_id, chunk_ids)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 2)
+            continue
+        except Exception as e:
+            logger.warning(f"[CHANNELS] count_channel_files batch failed ch={channel_id} ids={chunk_ids[0]}-{chunk_ids[-1]}: {e}")
+            msgs = []
+
+        if not isinstance(msgs, list):
+            msgs = [msgs] if msgs else []
+
+        for m in msgs:
+            if m and not getattr(m, "empty", True):
+                consecutive_missing = 0
+                if m.media:
+                    count += 1
+            else:
+                consecutive_missing += 1
+                if consecutive_missing >= max_consecutive_missing:
+                    return count, False
+
+        msg_id += chunk_size
+        await asyncio.sleep(0)
+
+    return count, True
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 ADMIN_FF_SESSIONS: dict  = {}   # session_id → session dict
@@ -264,16 +305,18 @@ async def _show_channel_detail(client: Client, query, channel_id: int):
         if added_by_id:
             break
 
-    # File count
-    file_count = "N/A"
     try:
-        count = 0
-        async for msg in client.get_chat_history(channel_id, limit=10000):
-            if msg.media:
-                count += 1
-        file_count = f"{count}+" if count == 10000 else str(count)
+        await query.message.edit_text(f"🔎 Loading channel info for <b>{title}</b>...\n\n🗂 Counting files, please wait...")
     except Exception:
         pass
+
+    # File count
+    try:
+        count, hit_cap = await count_channel_files(client, channel_id)
+        file_count = f"{count}+" if hit_cap else str(count)
+    except Exception as e:
+        logger.warning(f"[CHANNELS] file count failed ch={channel_id}: {e}")
+        file_count = "N/A"
 
     # Forwarding progress
     progress  = await get_global_ff_progress(channel_id)
