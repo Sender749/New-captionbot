@@ -299,6 +299,53 @@ async def remove_dump_cmd(client, message):
     text += await format_dump_skip_list(client)
     await message.reply_text(text, parse_mode=ParseMode.HTML)
 
+@Client.on_message(filters.private & filters.user(ADMIN) & filters.command("id"))
+async def dump_origin_id_cmd(client, message):
+    """
+    Reply /id to a message forwarded FROM the CP_CH dump channel (or to a
+    message inside CP_CH itself) to find out which channel that file
+    originally came from — so it can be passed straight to /dump_skip.
+    """
+    reply = message.reply_to_message
+    if not reply:
+        return await message.reply_text(
+            "❌ <b>Usage:</b> Forward a file from the dump channel "
+            "(or open it inside the dump channel) and reply to it with /id.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    cp_ch_msg_id = None
+    if reply.forward_from_chat and reply.forward_from_chat.id == CP_CH:
+        cp_ch_msg_id = reply.forward_from_message_id
+    elif reply.chat and reply.chat.id == CP_CH:
+        cp_ch_msg_id = reply.id
+
+    if not cp_ch_msg_id:
+        return await message.reply_text(
+            "❌ That message isn't a file forwarded from the dump channel."
+        )
+
+    origin = await get_dump_origin(cp_ch_msg_id)
+    if not origin:
+        return await message.reply_text(
+            "❌ No origin info found for this file "
+            "(it may predate this tracking feature)."
+        )
+
+    origin_channel_id = origin["origin_channel_id"]
+    title = await get_channel_title_cached(origin_channel_id)
+    skipped = await is_dump_skip(origin_channel_id)
+
+    await message.reply_text(
+        "📡 <b>Origin Channel Found</b>\n\n"
+        f"📢 <b>Channel:</b> {title}\n"
+        f"🆔 <b>Channel ID:</b> <code>{origin_channel_id}</code>\n"
+        f"🗂 <b>Dump skip:</b> {'✅ Enabled' if skipped else '❌ Not enabled'}\n\n"
+        f"Use <code>/dump_skip {origin_channel_id}</code> to stop dumping files from this channel.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
 @Client.on_message(filters.private & filters.command("file_forward"))
 async def ff_start(client, message):
     uid = message.from_user.id
@@ -480,12 +527,38 @@ async def broadcast(client, message):
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("restart"))
 async def restart_bot(client, message):
+    """
+    /restart — admin-only.
+
+    Before restarting, immediately requeues every currently "processing"
+    caption-edit and file-forward job back to "pending". Since those jobs
+    (and any still-"pending" ones) live in MongoDB, not in memory, they
+    survive the restart untouched — after the new process comes back up,
+    the worker pools simply pick everything back up where the bot left
+    off, instead of starting over or waiting up to 5 minutes for
+    recover_stuck_jobs()'s normal stuck-job timeout to kick in.
+    """
     silicon = await client.send_message(
         chat_id=message.chat.id,
-        text="**🔄 𝙿𝚁𝙾𝙲𝙴𝚂𝚂𝙴𝚂 𝚂𝚃𝙾𝙿𝙿ᴇᴅ. 𝙱𝙾𝚃 𝙸𝚂 𝚁𝙴𝚂𝚃𝙰𝚁𝚃𝙸𝙽𝙶...**",
+        text="**🔄 𝚂𝚃𝙾𝙿𝙿𝙸𝙽𝙶 𝙰𝙻𝙻 𝚃𝙰𝚂𝙺𝚂 & 𝚁𝙴𝚂𝚃𝙰𝚁𝚃𝙸𝙽𝙶...**",
     )
-    await asyncio.sleep(3)
-    await silicon.edit("**✅️ 𝙱𝙾𝚃 𝙸𝚂 𝚁𝙴𝚂𝚃𝙰𝚁𝚃𝙴𝙳. 𝙽𝙾𝚆 𝚈𝙾𝚄 𝙲𝙰𝙽 𝚄𝚂𝙴 𝙼𝙴**")
+    try:
+        cap_requeued, fwd_requeued = await reset_all_processing_to_pending()
+        logger.info(
+            f"[RESTART] requeued {cap_requeued} caption job(s) and "
+            f"{fwd_requeued} forward job(s) before restart"
+        )
+    except Exception as e:
+        logger.warning(f"[RESTART] failed to requeue in-flight jobs: {e}")
+        cap_requeued = fwd_requeued = 0
+
+    await silicon.edit(
+        "**✅️ 𝙰𝙻𝙻 𝚃𝙰𝚂𝙺𝚂 𝚂𝚃𝙾𝙿𝙿𝙴𝙳 & 𝚂𝙰𝙵𝙴𝙻𝚈 𝚁𝙴𝚀𝚄𝙴𝚄𝙴𝙳**\n\n"
+        f"📋 Caption jobs requeued: `{cap_requeued}`\n"
+        f"📦 Forward jobs requeued: `{fwd_requeued}`\n\n"
+        "🔄 Restarting now — resuming exactly where I left off..."
+    )
+    await asyncio.sleep(1)
     os.execl(sys.executable, sys.executable, *sys.argv)
 
 @Client.on_message(filters.command("settings") & filters.private)
@@ -829,21 +902,15 @@ async def caption_worker(client: Client, worker_id: int = 0):
             )
             if not await is_dump_skip(ch):
                 try:
-                    original = await client.get_messages(ch, job["message_id"])
-                    fname = None
-                    for t in ("document", "video", "audio", "voice"):
-                        obj = getattr(original, t, None)
-                        if obj:
-                            fname = getattr(obj, "file_name", None)
-                            break
-                    fname = clean_text(fname or "File")
-                    fname = remove_emojis(fname)
-                    await client.copy_message(
+                    # No caption= override here -> Telegram copies the file's
+                    # own default/original caption (and entities) as-is, with
+                    # no smart-filename placeholder rebuilding of any kind.
+                    dump_sent = await client.copy_message(
                         chat_id=CP_CH,
                         from_chat_id=ch,
                         message_id=job["message_id"],
-                        caption=fname
                     )
+                    await save_dump_origin(dump_sent.id, ch, job["message_id"])
                 except Exception as e:
                     logger.debug(f"[CAP_WORKER_{worker_id}] dump-copy skipped ch={ch} msg={job['message_id']}: {e}")
             await mark_done(job["_id"])
@@ -1781,7 +1848,20 @@ def apply_replacements(text: str, pairs: List[Tuple[str, str]]) -> str:
     return new_text
 
 # ---------------- Function Handler ----------------
-@Client.on_message(filters.private)
+# NOTE: must NOT match commands (anything starting with "/"). This handler
+# is a catch-all for plain-text session input (captions, block words,
+# suffixes, etc.). Pyrogram stops checking further handlers in the same
+# group once one handler's filter matches -- so if this matched commands
+# too, any command defined in a plugin module loaded after Caption.py
+# (e.g. /channels in body/admin_channels.py) would be silently swallowed
+# here and never even reach its own handler, with nothing printed to the
+# log since this function simply falls through when no session is active.
+_NOT_A_COMMAND = filters.create(
+    lambda _, __, m: not (m.text or m.caption or "").startswith("/")
+)
+
+
+@Client.on_message(filters.private & _NOT_A_COMMAND)
 async def capture_user_input(client, message):
     """
     Single handler for all user text input collected via bot_data sessions.
@@ -1965,98 +2045,6 @@ async def capture_user_input(client, message):
             ),
         )
         return
-
-    # ================= FILE FORWARD CAPTION-PANEL TEXT INPUT =================
-    # Handles text typed in response to the per-session caption customization
-    # panel (Set Caption / Block Words / Replace Words / Prefix / Suffix /
-    # Button URL). These settings live only on FF_SESSIONS — never the DB —
-    # so they only apply to the current forwarding session.
-    if user_id in FF_SESSIONS and FF_SESSIONS[user_id].get("pending_input"):
-        session = FF_SESSIONS[user_id]
-        pending = session.get("pending_input")
-        cs      = session.setdefault("caption_settings", {})
-        chat_id = session["chat_id"]
-        msg_id  = session["msg_id"]
-
-        if not text.strip():
-            return
-
-        if pending == "caption":
-            cs["template"] = text
-            try:
-                await client.delete_messages(user_id, message.id)
-            except Exception:
-                pass
-            session.pop("pending_input", None)
-            await _render_ff_capsub(client, chat_id, msg_id, cs)
-            return
-
-        if pending == "block_words":
-            cs["block_words"] = text.strip()
-            try:
-                await client.delete_messages(user_id, message.id)
-            except Exception:
-                pass
-            session.pop("pending_input", None)
-            await _render_ff_words_menu(client, chat_id, msg_id, cs)
-            return
-
-        if pending == "replace_words":
-            cs["replace_words"] = text.strip()
-            try:
-                await client.delete_messages(user_id, message.id)
-            except Exception:
-                pass
-            session.pop("pending_input", None)
-            await _render_ff_replace_menu(client, chat_id, msg_id, cs)
-            return
-
-        if pending == "prefix":
-            cs["prefix"] = text.strip()
-            try:
-                await client.delete_messages(user_id, message.id)
-            except Exception:
-                pass
-            session.pop("pending_input", None)
-            await _render_ff_suffixprefix_menu(client, chat_id, msg_id, cs)
-            return
-
-        if pending == "suffix":
-            cs["suffix"] = text.strip()
-            try:
-                await client.delete_messages(user_id, message.id)
-            except Exception:
-                pass
-            session.pop("pending_input", None)
-            await _render_ff_suffixprefix_menu(client, chat_id, msg_id, cs)
-            return
-
-        if pending == "url_buttons":
-            rows = []
-            for line in text.strip().splitlines():
-                row = []
-                parts = [p.strip() for p in line.split("|") if p.strip()]
-                for part in parts:
-                    matched = re.findall(r'"([^"]+)"', part)
-                    if len(matched) == 2:
-                        row.append({"text": matched[0], "url": matched[1]})
-                if not row:
-                    matched = re.findall(r'"([^"]+)"', line)
-                    if len(matched) == 2:
-                        row.append({"text": matched[0], "url": matched[1]})
-                if row:
-                    rows.append(row)
-            if not rows:
-                await message.reply_text("❌ Invalid format. Please try again.")
-                return
-            cs["url_buttons"] = rows
-            try:
-                await client.delete_messages(user_id, message.id)
-            except Exception:
-                pass
-            session.pop("pending_input", None)
-            await _render_ff_url_menu(client, chat_id, msg_id, cs)
-            return
 
     # ================= FILE FORWARD SKIP HANDLER =================
     if user_id in FF_SESSIONS:
