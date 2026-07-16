@@ -56,23 +56,6 @@ _session_done_count: dict[str, int] = defaultdict(int)
 _session_completed: set = set()
 
 
-# ── per-session caption customization defaults ────────────────────────────────
-def _default_ff_caption_settings() -> dict:
-    """Fresh, empty caption-customization state for one forwarding session.
-    `template` of None means "Same Caption" — files are forwarded untouched.
-    """
-    return {
-        "template":      None,
-        "block_words":   "",
-        "replace_words": "",
-        "prefix":        "",
-        "suffix":        "",
-        "url_buttons":   [],
-        "link_remover":  False,
-        "emoji_remover": False,
-    }
-
-
 async def _edit_with_retry(client: Client, chat_id, msg_id, text, reply_markup=None, max_retries: int = 4) -> bool:
     """
     Like client.edit_message_text but retries on FloodWait / transient errors
@@ -216,13 +199,12 @@ async def ff_dst(client, query):
     s["destination_title"] = next(
         x["channel_title"] for x in s["channels"] if x["channel_id"] == dst
     )
-    s["step"]    = "cap_menu"
+    s["step"]    = "skip"
     s["chat_id"] = query.message.chat.id
     s["msg_id"]  = query.message.id
     s["expires"] = time.time() + 900  # 15 minutes
-    s["caption_settings"] = _default_ff_caption_settings()
     s.pop("pending_input", None)
-    await _render_ff_cap_panel(client, s["chat_id"], s["msg_id"])
+    await _show_ff_range_prompt(client, s["chat_id"], s["msg_id"])
 
 
 async def _show_ff_range_prompt(client: Client, chat_id, msg_id):
@@ -241,435 +223,9 @@ async def _show_ff_range_prompt(client: Client, chat_id, msg_id):
         "<code>https://t.me/c/1234/100 - https://t.me/c/1234/500</code>\n\n"
         "• Session expires in <b>15 minutes</b>",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅ Back", callback_data="ffc_menu")],
-             [InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]
+            [[InlineKeyboardButton("❌ Cancel", callback_data="ff_cancel")]]
         ),
     )
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Per-session forwarding caption-customization panel
-#  (mirrors the /settings autocaption panel, but state lives only on
-#   FF_SESSIONS[uid]["caption_settings"] — never written to the DB)
-# ══════════════════════════════════════════════════════════════════════════
-async def _render_ff_cap_panel(client: Client, chat_id, msg_id):
-    uid = None
-    for u, sess in FF_SESSIONS.items():
-        if sess.get("chat_id") == chat_id and sess.get("msg_id") == msg_id:
-            uid = u
-            break
-    if uid is None:
-        return
-    s  = FF_SESSIONS[uid]
-    cs = s.setdefault("caption_settings", _default_ff_caption_settings())
-
-    template = cs.get("template")
-    cap_preview = template if template else "♻️ <i>Same Caption — original caption kept as is</i>"
-    link_text  = "Link & Username Remover (ON)"  if cs.get("link_remover")  else "Link & Username Remover (OFF)"
-    emoji_text = "Emoji Remover (ON)"            if cs.get("emoji_remover") else "Emoji Remover (OFF)"
-
-    text = (
-        "🎨 <b>Customize Forwarding Caption</b>\n\n"
-        f"📤 <b>{s['source_title']}</b>\n"
-        f"         ⬇️⬇️⬇️\n"
-        f"📥 <b>{s['destination_title']}</b>\n\n"
-        f"📝 <b>Caption:</b>\n{cap_preview}\n\n"
-        "<i>These settings apply only to this forwarding session — "
-        "you'll need to set them again next time.</i>"
-    )
-    kb = [
-        [InlineKeyboardButton("📝 Set Caption",            callback_data="ffc_setcap")],
-        [InlineKeyboardButton("🧹 Set Words Remover",      callback_data="ffc_words")],
-        [InlineKeyboardButton("🔤 Set Prefix & Suffix",    callback_data="ffc_suffixprefix")],
-        [InlineKeyboardButton("🔄 Set Replace Words",      callback_data="ffc_replace")],
-        [InlineKeyboardButton("🔘 Button URL",             callback_data="ffc_url")],
-        [InlineKeyboardButton(f"🔗 {link_text}",          callback_data="ffc_togglelink")],
-        [InlineKeyboardButton(f"😀 {emoji_text}",         callback_data="ffc_toggleemoji")],
-        [InlineKeyboardButton("♻️ Same Caption",           callback_data="ffc_samecap")],
-        [InlineKeyboardButton("➡️ Continue", callback_data="ffc_continue"),
-         InlineKeyboardButton("❌ Cancel",   callback_data="ff_cancel")],
-    ]
-    try:
-        await client.edit_message_text(
-            chat_id, msg_id, text,
-            reply_markup=InlineKeyboardMarkup(kb),
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        pass
-
-
-async def _render_ff_capsub(client: Client, chat_id, msg_id, cs: dict):
-    template = cs.get("template")
-    disp = f"📝 <b>Current Caption:</b>\n{template}" if template else "📝 <b>Current Caption:</b> None set (Same Caption active)."
-    kb = [
-        [InlineKeyboardButton("🆕 Set Caption",   callback_data="ffc_setcapmsg"),
-         InlineKeyboardButton("❌ Delete Caption", callback_data="ffc_delcap")],
-        [InlineKeyboardButton("↩ Back", callback_data="ffc_menu")],
-    ]
-    await client.edit_message_text(
-        chat_id, msg_id,
-        f"⚙️ <b>Forwarding Caption</b>\n{disp}\n\nChoose what you want to do 👇",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-
-async def _render_ff_words_menu(client: Client, chat_id, msg_id, cs: dict):
-    blocked = cs.get("block_words", "")
-    words_text = (
-        "\n".join(f"• {w.strip()}" for w in re.split(r"[,\n]+", blocked) if w.strip())
-        if blocked else "None set yet."
-    )
-    kb = [
-        [InlineKeyboardButton("📝 Set Block Words",    callback_data="ffc_addwords"),
-         InlineKeyboardButton("🗑️ Delete Block Words", callback_data="ffc_delwords")],
-        [InlineKeyboardButton("↩ Back", callback_data="ffc_menu")],
-    ]
-    await client.edit_message_text(
-        chat_id, msg_id,
-        f"🚫 <b>Blocked Words:</b>\n{words_text}\n\nChoose what you want to do 👇",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-
-async def _render_ff_replace_menu(client: Client, chat_id, msg_id, cs: dict):
-    replace_raw = cs.get("replace_words", "")
-    replace_text = (
-        "\n".join(line.strip() for line in replace_raw.splitlines() if line.strip())
-        if replace_raw else "None set yet."
-    )
-    kb = [
-        [InlineKeyboardButton("📝 Set Replace Words",    callback_data="ffc_addreplace"),
-         InlineKeyboardButton("🗑️ Delete Replace Words", callback_data="ffc_delreplace")],
-        [InlineKeyboardButton("↩ Back", callback_data="ffc_menu")],
-    ]
-    await client.edit_message_text(
-        chat_id, msg_id,
-        f"🔤 <b>Replace Words:</b>\n{replace_text}\n\nChoose what you want to do 👇",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-
-async def _render_ff_suffixprefix_menu(client: Client, chat_id, msg_id, cs: dict):
-    kb = [
-        [InlineKeyboardButton("Set Suffix", callback_data="ffc_setsuf"),
-         InlineKeyboardButton("Del Suffix", callback_data="ffc_delsuf")],
-        [InlineKeyboardButton("Set Prefix", callback_data="ffc_setpre"),
-         InlineKeyboardButton("Del Prefix", callback_data="ffc_delpre")],
-        [InlineKeyboardButton("↩ Back", callback_data="ffc_menu")],
-    ]
-    await client.edit_message_text(
-        chat_id, msg_id,
-        f"📌 Current Suffix: {cs.get('suffix') or 'None'}\n"
-        f"📌 Current Prefix: {cs.get('prefix') or 'None'}",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-
-async def _render_ff_url_menu(client: Client, chat_id, msg_id, cs: dict):
-    has_urls = bool(cs.get("url_buttons"))
-    kb = [
-        [InlineKeyboardButton("➕ Set URL",   callback_data="ffc_seturlmsg"),
-         InlineKeyboardButton("🗑 Delete URL", callback_data="ffc_delurl")],
-        [InlineKeyboardButton("↩ Back", callback_data="ffc_menu")],
-    ]
-    await client.edit_message_text(
-        chat_id, msg_id,
-        f"🔘 <b>Button URLs:</b> {'Configured' if has_urls else 'None set yet.'}",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-
-def _ff_session_for(uid: int):
-    s = FF_SESSIONS.get(uid)
-    if not s:
-        return None
-    return s, s.setdefault("caption_settings", _default_ff_caption_settings())
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_menu$"))
-async def ffc_menu(client, query):
-    await query.answer()
-    uid = query.from_user.id
-    if uid not in FF_SESSIONS:
-        return
-    FF_SESSIONS[uid].pop("pending_input", None)
-    FF_SESSIONS[uid]["step"] = "cap_menu"
-    await _render_ff_cap_panel(client, query.message.chat.id, query.message.id)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_setcap$"))
-async def ffc_setcap(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    await _render_ff_capsub(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_setcapmsg$"))
-async def ffc_setcapmsg(client, query):
-    await query.answer()
-    uid = query.from_user.id
-    pair = _ff_session_for(uid)
-    if not pair:
-        return
-    s, _ = pair
-    s["pending_input"] = "caption"
-    await client.edit_message_text(
-        query.message.chat.id, query.message.id,
-        "📌 <b>Send the caption for this forwarding session</b>\n\n"
-        "<blockquote expandable>"
-        "📦 <b>Placeholders</b>\n\n"
-        "File name ⇛ <code>{file_name}</code>\n"
-        "File size ⇛ <code>{file_size}</code>\n"
-        "Original caption ⇛ <code>{default_caption}</code>\n"
-        "Smart file name ⇛ <code>{smart_file_name}</code>\n"
-        "Title ⇛ <code>{title}</code>  Year ⇛ <code>{year}</code>\n"
-        "Season ⇛ <code>{season}</code>  Episode ⇛ <code>{episode}</code>\n"
-        "Audio ⇛ <code>{audio}</code>  Subtitle ⇛ <code>{subtitle}</code>\n"
-        "Quality ⇛ <code>{quality}</code>  Source ⇛ <code>{source}</code>\n"
-        "Video codec ⇛ <code>{vcodec}</code>  Audio codec ⇛ <code>{acodec}</code>"
-        "</blockquote>\n\n"
-        "✍️ <b>Example:</b>\n"
-        "<code>&lt;b&gt;{title}&lt;/b&gt; {season}{episode} ({year})\n"
-        "{audio} | {quality} | {subtitle}\n"
-        "💾 {file_size}</code>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_setcap")]]),
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_delcap$"))
-async def ffc_delcap(client, query):
-    await query.answer("Caption cleared — Same Caption is now active.")
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    cs["template"] = None
-    await _render_ff_capsub(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_words$"))
-async def ffc_words(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    await _render_ff_words_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_addwords$"))
-async def ffc_addwords(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    s, _ = pair
-    s["pending_input"] = "block_words"
-    await client.edit_message_text(
-        query.message.chat.id, query.message.id,
-        "📝 <b>Send words to block</b> (comma or newline separated).\n"
-        "These words will be stripped from the built caption.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_words")]]),
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_delwords$"))
-async def ffc_delwords(client, query):
-    await query.answer("Blocked words cleared.")
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    cs["block_words"] = ""
-    await _render_ff_words_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_replace$"))
-async def ffc_replace(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    await _render_ff_replace_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_addreplace$"))
-async def ffc_addreplace(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    s, _ = pair
-    s["pending_input"] = "replace_words"
-    await client.edit_message_text(
-        query.message.chat.id, query.message.id,
-        "🔄 <b>Send replace pairs</b>, one per line, e.g.\n"
-        "<code>old text = new text</code>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_replace")]]),
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_delreplace$"))
-async def ffc_delreplace(client, query):
-    await query.answer("Replace words cleared.")
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    cs["replace_words"] = ""
-    await _render_ff_replace_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_suffixprefix$"))
-async def ffc_suffixprefix(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    await _render_ff_suffixprefix_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_setpre$"))
-async def ffc_setpre(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    s, _ = pair
-    s["pending_input"] = "prefix"
-    await client.edit_message_text(
-        query.message.chat.id, query.message.id, "🔤 <b>Send the prefix text.</b>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_suffixprefix")]]),
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_setsuf$"))
-async def ffc_setsuf(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    s, _ = pair
-    s["pending_input"] = "suffix"
-    await client.edit_message_text(
-        query.message.chat.id, query.message.id, "🔤 <b>Send the suffix text.</b>",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_suffixprefix")]]),
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_delpre$"))
-async def ffc_delpre(client, query):
-    await query.answer("Prefix cleared.")
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    cs["prefix"] = ""
-    await _render_ff_suffixprefix_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_delsuf$"))
-async def ffc_delsuf(client, query):
-    await query.answer("Suffix cleared.")
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    cs["suffix"] = ""
-    await _render_ff_suffixprefix_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_url$"))
-async def ffc_url(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    await _render_ff_url_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_seturlmsg$"))
-async def ffc_seturlmsg(client, query):
-    await query.answer()
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    s, _ = pair
-    s["pending_input"] = "url_buttons"
-    await client.edit_message_text(
-        query.message.chat.id, query.message.id,
-        "🔘 <b>Send button rows</b>, one row per line, e.g.\n"
-        '<code>"Button 1" "https://example.com"</code>',
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Back", callback_data="ffc_url")]]),
-    )
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_delurl$"))
-async def ffc_delurl(client, query):
-    await query.answer("Button URLs cleared.")
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    _, cs = pair
-    cs["url_buttons"] = []
-    await _render_ff_url_menu(client, query.message.chat.id, query.message.id, cs)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_togglelink$"))
-async def ffc_togglelink(client, query):
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    s, cs = pair
-    cs["link_remover"] = not cs.get("link_remover", False)
-    await query.answer("Link & Username Remover " + ("enabled" if cs["link_remover"] else "disabled"))
-    await _render_ff_cap_panel(client, query.message.chat.id, query.message.id)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_toggleemoji$"))
-async def ffc_toggleemoji(client, query):
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    s, cs = pair
-    cs["emoji_remover"] = not cs.get("emoji_remover", False)
-    await query.answer("Emoji Remover " + ("enabled" if cs["emoji_remover"] else "disabled"))
-    await _render_ff_cap_panel(client, query.message.chat.id, query.message.id)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_samecap$"))
-async def ffc_samecap(client, query):
-    """'Same Caption' — the only button that doesn't open a sub-menu.
-    Clearing the template means the file caption is left untouched on
-    forward, exactly like the bot behaved before this feature existed.
-    """
-    pair = _ff_session_for(query.from_user.id)
-    if not pair:
-        return
-    s, cs = pair
-    cs["template"] = None
-    await query.answer("✅ Same Caption selected — captions will not be changed.", show_alert=True)
-    await _render_ff_cap_panel(client, query.message.chat.id, query.message.id)
-
-
-@Client.on_callback_query(filters.regex(r"^ffc_continue$"))
-async def ffc_continue(client, query):
-    await query.answer()
-    uid = query.from_user.id
-    s = FF_SESSIONS.get(uid)
-    if not s:
-        return
-    s.pop("pending_input", None)
-    s["step"]    = "skip"
-    s["expires"] = time.time() + 900
-    await _show_ff_range_prompt(client, query.message.chat.id, query.message.id)
 
 
 # ── scan & enqueue (background task, one per user session) ───────────────────
@@ -692,8 +248,6 @@ async def _scan_and_enqueue(client: Client, uid: int):
     dst        = s["destination"]
     start_id   = int(s["skip"]) + 1
     end_id     = s.get("end_id")
-    # Snapshot caption settings as finalized by the user before scanning starts
-    caption_settings_snapshot = dict(s.get("caption_settings") or _default_ff_caption_settings())
 
     # Reset counters for this scan
     s["total"]     = 0
@@ -746,10 +300,6 @@ async def _scan_and_enqueue(client: Client, uid: int):
             "session_id":        session_id,
             # NOTE: total=0 here; we stamp the real value below after scan
             "total":             0,
-            # Snapshot of the caption-customization settings chosen for this
-            # session. Stored on the job itself so it survives restarts and
-            # is unaffected by the user starting another session afterwards.
-            "caption_settings":  caption_settings_snapshot,
         })
         s["total"] += 1
         msg_id += 1
@@ -848,132 +398,12 @@ async def _fetch_forward_job():
     return None
 
 
-# ── caption builder for custom forwarding captions ────────────────────────────
-async def build_ff_caption(msg, cs: dict):
-    """
-    Build a (caption, reply_markup) pair for a forwarded message using the
-    per-session caption_settings snapshot `cs`.
-
-    Returns (None, None) when `cs["template"]` is empty/None — this is the
-    "Same Caption" case, meaning the caller should leave the original
-    caption completely untouched.
-
-    Reuses the same building blocks as the autocaption pipeline in
-    body/Caption.py. Imported lazily (inside the function) to avoid a
-    circular import, since Caption.py does `from body.file_forward import *`
-    at module load time.
-    """
-    template = (cs or {}).get("template")
-    if not template:
-        return None, None
-
-    from body.Caption import (
-        parse_file_info, build_smart_filename, apply_block_words,
-        apply_replacements, parse_replace_pairs, strip_links_only,
-        remove_emojis, sanitize_caption_html, extract_audio_languages,
-        extract_year, normalize_series_name, get_size,
-    )
-
-    default_caption = msg.caption or ""
-    original_file_name = ""
-    file_size = get_size(0)
-    file_name = "File"
-    for t in ("video", "audio", "document", "voice"):
-        obj = getattr(msg, t, None)
-        if obj:
-            original_file_name = getattr(obj, "file_name", None) or ""
-            raw_name = original_file_name or ("Voice Message" if t == "voice" else "File")
-            file_name = raw_name.replace("_", " ").replace(".", " ")
-            file_size = get_size(getattr(obj, "file_size", 0))
-            break
-
-    combined_raw = f"{original_file_name} {default_caption}"
-    audio_lang_list = extract_audio_languages(combined_raw)
-    language = " + ".join(audio_lang_list) if audio_lang_list else ""
-    year = extract_year(default_caption) or extract_year(original_file_name) or ""
-
-    try:
-        raw_file_name = normalize_series_name(file_name)
-        file_info = parse_file_info(original_file_name or raw_file_name, default_caption)
-        smart_file_name = ""
-        if "{smart_file_name}" in template:
-            smart_file_name = build_smart_filename(original_file_name or raw_file_name, default_caption)
-        new_caption = template.format(
-            file_name=raw_file_name,
-            smart_file_name=smart_file_name,
-            file_size=file_size,
-            default_caption=default_caption,
-            language=language or file_info.get("audio", ""),
-            year=year or file_info.get("year", ""),
-            title=file_info.get("title", ""),
-            season=file_info.get("season", ""),
-            episode=file_info.get("episode", ""),
-            audio=file_info.get("audio", ""),
-            subtitle=file_info.get("subtitle", ""),
-            quality=file_info.get("quality", ""),
-            resolution=file_info.get("resolution", ""),
-            source=file_info.get("source", ""),
-            vcodec=file_info.get("vcodec", ""),
-            acodec=file_info.get("acodec", ""),
-            extension=file_info.get("extension", ""),
-            duration="",
-            empty="",
-        )
-    except Exception:
-        new_caption = template
-
-    blocked = cs.get("block_words") or ""
-    if blocked:
-        new_caption = apply_block_words(new_caption, blocked)
-
-    replace_raw = cs.get("replace_words") or ""
-    if replace_raw:
-        pairs = parse_replace_pairs(replace_raw)
-        if pairs:
-            new_caption = apply_replacements(new_caption, pairs)
-
-    if cs.get("link_remover"):
-        new_caption = strip_links_only(new_caption)
-
-    prefix = cs.get("prefix") or ""
-    if prefix:
-        new_caption = f"{prefix}\n{new_caption}".strip()
-
-    suffix = cs.get("suffix") or ""
-    if suffix:
-        new_caption = f"{new_caption}\n{suffix}".strip()
-
-    if cs.get("emoji_remover"):
-        new_caption = remove_emojis(new_caption)
-
-    new_caption = new_caption.strip()
-    if "<" in new_caption and ">" in new_caption:
-        new_caption = sanitize_caption_html(new_caption)
-
-    reply_markup = None
-    url_buttons = cs.get("url_buttons") or []
-    if url_buttons:
-        reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton(b["text"], url=b["url"]) for b in row]
-            for row in url_buttons
-        ])
-    return new_caption, reply_markup
-
-
 # ── media send helpers ────────────────────────────────────────────────────────
-async def _forward_with_thumb(
-    client: Client, src: int, dst: int, msg,
-    custom_caption: str | None = None,
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
+async def _forward_with_thumb(client: Client, src: int, dst: int, msg) -> None:
     """
-    Re-sends the media preserving its thumbnail.
-    Falls back to copy_message when no special handling is needed.
-
-    custom_caption=None means "Same Caption" — the original caption/entities
-    are forwarded untouched (the pre-existing behaviour). When a custom
-    caption string is supplied (built via build_ff_caption), it overrides
-    the original caption and is parsed as HTML.
+    Re-sends the media preserving its thumbnail, with the original caption
+    and entities left completely untouched (file forwarding is now a plain
+    copy — no caption customization).
     """
     thumb_path = None
     try:
@@ -986,10 +416,7 @@ async def _forward_with_thumb(
                 media_obj  = obj
                 break
 
-        use_custom = custom_caption is not None
-        caption    = custom_caption if use_custom else (msg.caption or "")
-        parse_mode = ParseMode.HTML if use_custom else None
-        has_thumb  = bool(media_obj and getattr(media_obj, "thumbs", None))
+        has_thumb = bool(media_obj and getattr(media_obj, "thumbs", None))
 
         if media_type == "video" and has_thumb:
             thumb_path = await client.download_media(
@@ -999,14 +426,12 @@ async def _forward_with_thumb(
             await client.send_video(
                 chat_id=dst,
                 video=media_obj.file_id,
-                caption=caption,
+                caption=msg.caption or "",
                 thumb=thumb_path,
                 duration=getattr(media_obj, "duration", 0),
                 width=getattr(media_obj, "width", 0),
                 height=getattr(media_obj, "height", 0),
                 supports_streaming=True,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
             )
         elif media_type == "animation" and has_thumb:
             thumb_path = await client.download_media(
@@ -1016,10 +441,8 @@ async def _forward_with_thumb(
             await client.send_animation(
                 chat_id=dst,
                 animation=media_obj.file_id,
-                caption=caption,
+                caption=msg.caption or "",
                 thumb=thumb_path,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
             )
         elif media_type == "document" and has_thumb:
             thumb_path = await client.download_media(
@@ -1029,29 +452,16 @@ async def _forward_with_thumb(
             await client.send_document(
                 chat_id=dst,
                 document=media_obj.file_id,
-                caption=caption,
+                caption=msg.caption or "",
                 thumb=thumb_path,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
             )
         else:
-            if use_custom or reply_markup:
-                # Need to override caption and/or attach buttons
-                await client.copy_message(
-                    chat_id=dst,
-                    from_chat_id=src,
-                    message_id=msg.id,
-                    caption=caption,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup,
-                )
-            else:
-                # Fast path – Same Caption, no thumb needed, no buttons
-                await client.copy_message(
-                    chat_id=dst,
-                    from_chat_id=src,
-                    message_id=msg.id,
-                )
+            # Fast path – no special thumb handling needed, plain copy
+            await client.copy_message(
+                chat_id=dst,
+                from_chat_id=src,
+                message_id=msg.id,
+            )
     finally:
         if thumb_path:
             try:
@@ -1089,20 +499,7 @@ async def forward_worker(client: Client):
 
             msg = await client.get_messages(job["src"], msg_id)
 
-            custom_caption, ff_reply_markup = None, None
-            cs = job.get("caption_settings")
-            if cs and cs.get("template"):
-                try:
-                    custom_caption, ff_reply_markup = await build_ff_caption(msg, cs)
-                except Exception as e:
-                    print(f"[FF_CAPTION_BUILD_FAIL] {e}")
-                    custom_caption, ff_reply_markup = None, None
-
-            await _forward_with_thumb(
-                client, job["src"], job["dst"], msg,
-                custom_caption=custom_caption,
-                reply_markup=ff_reply_markup,
-            )
+            await _forward_with_thumb(client, job["src"], job["dst"], msg)
 
             # Dump copy (non-admin users)
             job_user = job.get("user_id")
