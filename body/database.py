@@ -68,6 +68,13 @@ forward_queue   = db.forward_queue
 #   { channel_id: int, last_msg_id: int, total_forwarded: int, updated_at: float }
 global_ff_progress = db.global_ff_progress
 
+# ── Dump-origin tracking ──────────────────────────────────────────────────────
+# Maps a message posted in CP_CH back to the channel (and message) it was
+# originally copied from, so /id can answer "where did this dumped file
+# come from" when replied to a forward of that CP_CH message.
+#   { cp_ch_msg_id: int, origin_channel_id: int, origin_message_id: int, ts: float }
+dump_origin_map = db.dump_origin_map
+
 
 # ════════════════════════════════════════════════════════
 #  Index setup  (called once at startup)
@@ -100,6 +107,21 @@ async def ensure_global_ff_indexes():
     await global_ff_progress.create_index(
         [("channel_id", 1)],
         unique=True,
+        background=True,
+    )
+
+
+async def ensure_dump_origin_indexes():
+    """Create indexes for the CP_CH dump-origin tracking collection."""
+    await dump_origin_map.create_index(
+        [("cp_ch_msg_id", 1)],
+        unique=True,
+        background=True,
+    )
+    # Auto-expire mappings after 60 days so this collection doesn't grow forever.
+    await dump_origin_map.create_index(
+        [("ts", 1)],
+        expireAfterSeconds=60 * 24 * 3600,
         background=True,
     )
 
@@ -237,6 +259,53 @@ async def save_global_ff_progress(
 async def reset_global_ff_progress(channel_id: int):
     """Delete saved progress for a channel (use before a fresh full-forward)."""
     await global_ff_progress.delete_one({"channel_id": channel_id})
+
+
+# ════════════════════════════════════════════════════════
+#  Dump-origin tracking helpers
+# ════════════════════════════════════════════════════════
+async def save_dump_origin(cp_ch_msg_id: int, origin_channel_id: int, origin_message_id: int):
+    await dump_origin_map.update_one(
+        {"cp_ch_msg_id": cp_ch_msg_id},
+        {
+            "$set": {
+                "origin_channel_id": origin_channel_id,
+                "origin_message_id": origin_message_id,
+                "ts": time.time(),
+            }
+        },
+        upsert=True,
+    )
+
+
+async def get_dump_origin(cp_ch_msg_id: int) -> dict:
+    return await dump_origin_map.find_one({"cp_ch_msg_id": cp_ch_msg_id}) or {}
+
+
+# ════════════════════════════════════════════════════════
+#  Restart-recovery helpers
+# ════════════════════════════════════════════════════════
+async def reset_all_processing_to_pending():
+    """
+    Immediately requeues every in-flight ("processing") job in both the
+    caption and forward queues back to "pending".
+
+    Used by /restart so in-flight work is never abandoned waiting on
+    recover_stuck_jobs()'s normal 5-minute stuck-timeout — right after the
+    process comes back up, workers pick these jobs straight back up from
+    where the bot left off, instead of starting over.
+
+    Returns (caption_jobs_requeued, forward_jobs_requeued).
+    """
+    r1 = await queue_col.update_many(
+        {"status": "processing"},
+        {"$set": {"status": "pending", "ts": time.time()}},
+    )
+    r2 = await forward_queue.update_many(
+        {"status": "processing"},
+        {"$set": {"status": "pending", "ts": time.time()}},
+    )
+    return r1.modified_count, r2.modified_count
 
 
 # ════════════════════════════════════════════════════════
