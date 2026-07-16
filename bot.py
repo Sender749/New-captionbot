@@ -13,6 +13,7 @@ from body.database import (
     CAPTION_WORKERS,
     ensure_queue_indexes,
     ensure_forward_indexes,
+    ensure_dump_origin_indexes,
     recover_stuck_jobs,
 )
 from body.Caption import start_caption_workers
@@ -62,7 +63,15 @@ class Bot(Client):
         # One-time DB setup
         await ensure_queue_indexes()
         await ensure_forward_indexes()
+        await ensure_dump_origin_indexes()
         await recover_stuck_jobs()
+
+        # Safety net for ungraceful shutdowns (Koyeb OOM-kill, crash, etc.)
+        # that don't go through /restart's immediate requeue: periodically
+        # re-run the same stuck-job recovery so orphaned "processing" jobs
+        # never sit stranded for long — the bot recovers on its own instead
+        # of needing a manual /restart every time it looks stuck.
+        asyncio.create_task(self._periodic_recovery(), name="periodic_recovery")
 
         # Run per-plugin startup hooks (e.g. file_forward.on_bot_start,
         # admin_channels.on_bot_start)
@@ -105,6 +114,16 @@ class Bot(Client):
             if callable(hook):
                 logger.info(f"🔌 Running startup hook: {module_name}.on_bot_start()")
                 hook(self)
+
+    async def _periodic_recovery(self):
+        """Runs recover_stuck_jobs() every 90s so the bot self-heals from
+        orphaned "processing" jobs without requiring a manual /restart."""
+        while True:
+            await asyncio.sleep(90)
+            try:
+                await recover_stuck_jobs()
+            except Exception as e:
+                logger.warning(f"[RECOVER] periodic recovery failed: {e}")
 
 
 Bot().run()
