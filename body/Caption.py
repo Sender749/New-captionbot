@@ -1049,9 +1049,15 @@ async def reCap(client, msg):
     if link_remover_on:
         new_caption = strip_links_only(new_caption)
     if prefix:
-        new_caption = f"{prefix}\n{new_caption}".strip()
+        # prefix/suffix are stored as a comma/newline-separated list of
+        # entries (same canonical format as block/replace words) — render
+        # each entry on its own line in the real caption rather than
+        # showing the raw comma-joined storage string.
+        prefix_display = "\n".join(_split_items(prefix))
+        new_caption = f"{prefix_display}\n{new_caption}".strip()
     if suffix:
-        new_caption = f"{new_caption}\n{suffix}".strip()
+        suffix_display = "\n".join(_split_items(suffix))
+        new_caption = f"{new_caption}\n{suffix_display}".strip()
     if emoji_remover_on:
         new_caption = remove_emojis(new_caption)
     new_caption = new_caption.strip()
@@ -1075,6 +1081,27 @@ async def reCap(client, msg):
 # ═══════════════════════════════════════════════════════════════════
 #  Smart File Name Engine  –  professional media caption builder
 #  Supports: Movies · Web Series · TV Shows · Anime · OTT originals
+#
+#  v2 — enhanced accuracy + new tags:
+#    • Bigger quality / source / codec tables (WEB-DL, Theater Print,
+#      HDCAM, HDTS, R5, Remux … · 144p→8K · HEVC/x265/x264/XviD … ·
+#      DD/DDP/DTS/TrueHD/Atmos + bitrate)
+#    • Website names, usernames (@handle), t.me links and ad phrases
+#      ("join our channel", "subscribe now" …) are stripped BEFORE
+#      parsing so they never leak into the Title or any tag.
+#    • Context-aware language vs subtitle detection: "English Subtitle"
+#      (spelled out, not just ESub) is correctly read as a SUBTITLE,
+#      not an audio language — even when other real audio languages
+#      (Hindi, Punjabi …) are present in the same text.
+#    • Automatic "Dual Audio" / "Multi Audio" tag whenever 2 / 3+
+#      languages are detected (no longer depends on the source text
+#      explicitly saying "Dual Audio").
+#    • "Combined Episodes" tag for batch ranges (S01 E01-05) and
+#      "Complete Season" tag when only "S01" is present with no
+#      episode number at all.
+#    • "Remastered" tag + standalone audio bitrate tag (e.g. 224Kbps).
+#    • Pure regex / no network calls on the hot path → stays fast even
+#      for large (100k+ file) batches.
 # ═══════════════════════════════════════════════════════════════════
 
 # ── Language tables ──────────────────────────────────────────────
@@ -1084,11 +1111,12 @@ LANG_LIST = [
     "Malayalam", "Kannada", "Marathi", "Gujarati", "Bengali",
     "Punjabi", "Bhojpuri", "Rajasthani", "Haryanvi", "Odia",
     "Assamese", "Maithili", "Santali", "Kashmiri", "Sindhi",
+    "Konkani", "Manipuri", "Dogri", "Tulu",
     "Telugu", "Tamil", "Hindi", "English", "Urdu",
     "Japanese", "Korean", "Mandarin", "Chinese", "Cantonese",
     "Spanish", "French", "German", "Italian", "Russian",
     "Arabic", "Dutch", "Portuguese", "Turkish", "Thai",
-    "Vietnamese", "Indonesian", "Malay", "Tagalog", "Sinhala",
+    "Vietnamese", "Indonesian", "Malay", "Tagalog", "Filipino", "Sinhala",
     "Nepali", "Burmese",
 ]
 
@@ -1111,16 +1139,23 @@ LANG_CODE_MAP = {
 # ── Quality / Resolution ─────────────────────────────────────────
 # Listed longest-first so "2160p" is matched before "1080p" etc.
 QUALITY_LIST = [
-    "2160p", "4K UHD", "4K", "UHD",
-    "1080p", "720p", "480p", "360p", "240p",
+    "2160p", "1440p", "1080p", "900p", "720p",
+    "576p", "540p", "480p", "360p", "240p", "216p", "144p",
+    "8K", "4K UHD", "4K", "UHD",
 ]
 
 # ── Source / Rip type ────────────────────────────────────────────
-# Ordered: more specific first
+# Ordered: more specific first so e.g. "WEB-DL" wins over bare "WEB",
+# "UHD BluRay" wins over "BluRay", etc.
 SOURCE_LIST = [
-    "WEB-DL", "WEBRip",
-    "BluRay", "Blu-Ray", "BDRip", "BDRemux",
-    "HDRip", "DVDRip", "DVD", "HDTV", "HDCAM", "DVDSCR", "CAM",
+    "UHD BluRay", "BluRay REMUX", "BDRemux", "Remux",
+    "WEB-DL", "WEBRip", "WEB",
+    "BluRay", "Blu-Ray", "BRRip", "BDRip",
+    "HDRip", "DVDRip", "DVDScr", "DVD",
+    "HDTS", "HDTC", "HDCAM", "HDTV",
+    "Theater Print", "Theatrical Print", "TC Print",
+    "PreDVD", "Pre-DVD", "PDVD",
+    "R5", "TS", "TC", "SCR", "CAM",
     "AMZN", "DSNP", "NF", "HMAX", "ATVP", "PCOK",
     "SonyLIV", "ZEE5", "Hotstar", "JioCinema", "Voot", "ALTBalaji",
     "MXPlayer", "ErosNow",
@@ -1128,18 +1163,18 @@ SOURCE_LIST = [
 
 # ── Video codecs ─────────────────────────────────────────────────
 VIDEO_CODEC_LIST = [
-    "HEVC", "x265", "H.265",
-    "x264", "H.264", "AVC",
-    "AV1", "VP9", "MPEG-2",
+    "HEVC", "x265", "H.265", "H265",
+    "x264", "H.264", "H264", "AVC",
+    "AV1", "VP9", "MPEG-4", "MPEG-2", "XviD", "DivX",
 ]
 
 # ── Audio codecs ─────────────────────────────────────────────────
 # Listed longest/most specific first to avoid partial matches
 AUDIO_CODEC_LIST = [
-    "TrueHD Atmos", "DTS-HD MA", "DTS-HD", "DTS-X", "DTS",
-    "DD+5.1", "DDP5.1", "DD5.1", "DD+", "DDP",
+    "TrueHD Atmos", "Dolby Atmos", "DTS-HD MA", "DTS-HD", "DTS-X", "DTS",
+    "DD+5.1", "DDP5.1", "DD5.1", "DD+2.0", "DDP2.0", "DD2.0", "DD+", "DDP",
     "Atmos", "TrueHD",
-    "AAC5.1", "AAC", "AC3", "EAC3",
+    "AAC5.1", "AAC2.0", "AAC", "AC3", "EAC3",
     "MP3", "FLAC", "OPUS", "PCM",
 ]
 
@@ -1153,33 +1188,168 @@ MSUB_RE = re.compile(r'\bM\.?Subs?\b', re.I)
 # Generic "Sub / Subs / Subtitle / Subtitles" (not already E/H/M prefixed)
 SUB_RE  = re.compile(r'\b(?<!E\.)(?<!H\.)(?<!M\.)Subs?(?:titles?)?\b', re.I)
 
-# ── Subtitle-language relationship patterns ───────────────────────
-# "subtitle english", "subtitles hindi"
-_SUB_LANG_RE = re.compile(
-    r'\bsubtitles?\s+(' + '|'.join(re.escape(l) for l in LANG_LIST) + r')\b',
+# ── Subtitle-language relationship patterns (context aware) ──────
+# These are used to tell audio languages and SUBTITLE languages apart
+# even when the subtitle language is spelled out in full — e.g.
+# "Hindi Punjabi English Subtitle" → Hindi & Punjabi = audio,
+# English = subtitle only (NOT counted as a 3rd audio language).
+_LANG_ALT = '|'.join(re.escape(l) for l in LANG_LIST)
+_SUB_KEYWORD = r'(?:subtitles?|subs?)'
+
+# NOTE: a repeated language token is only chained into the SAME
+# subtitle-language group when an EXPLICIT separator (, + & / "and")
+# connects it to the next one. Bare whitespace between two language
+# words is deliberately NOT treated as a chain — "Hindi Punjabi
+# English Subtitle" must read as Hindi+Punjabi = AUDIO and only the
+# single word immediately touching "Subtitle" (English) as the
+# subtitle language, which matches how these are conventionally named.
+# Explicitly-joined lists ("English + Hindi Subtitle", "Subtitle:
+# Eng, Hindi") are still fully captured.
+_SEP = r'(?:\s*(?:,|\+|&|/|\band\b)\s*)'
+
+_SUB_KEYWORD_RE = re.compile(rf'\b{_SUB_KEYWORD}\b', re.I)
+
+# Language chain immediately AFTER the keyword: "Subtitle[:-] <lang> [<sep> <lang> ...]"
+_LANG_CHAIN_AFTER_RE = re.compile(
+    rf'\A\s*[:\-]?\s*((?:{_LANG_ALT})(?:{_SEP}(?:{_LANG_ALT})){{0,3}})',
     re.I
 )
-# "english subtitle", "hindi sub"
-_LANG_SUB_RE = re.compile(
-    r'\b(' + '|'.join(re.escape(l) for l in LANG_LIST) + r')\s+subtitles?\b',
+# Language chain immediately BEFORE the keyword: "<lang> [<sep> <lang> ...] Subtitle"
+_LANG_CHAIN_BEFORE_RE = re.compile(
+    rf'((?:{_LANG_ALT})(?:{_SEP}(?:{_LANG_ALT})){{0,3}})\s*\Z',
     re.I
 )
 
+def _scan_subtitle_context(text: str):
+    """
+    Single keyword-anchored pass that resolves the subtitle-language
+    relationship correctly even in ambiguous cases where a language sits
+    on BOTH sides of the "Subtitle" keyword — e.g. "Hindi Subtitle
+    English" (Hindi = audio, English = subtitle; NOT the other way
+    around, and Hindi must NOT be swallowed as a subtitle language just
+    because it happens to sit next to the keyword).
+
+    For every occurrence of the "Subtitle/Sub" keyword:
+      1. Look at the language(s) immediately AFTER it first — this is
+         the far more common convention ("Subtitle: English",
+         "Sub English") and takes priority.
+      2. Only if nothing follows, fall back to the language(s)
+         immediately BEFORE it ("English Subtitle").
+    This guarantees a language is never double-claimed by two keyword
+    occurrences and that a keyword sandwiched between two different
+    languages doesn't accidentally eat the audio-language one.
+
+    Returns (spans, langs):
+      spans — list of (start, end) character spans (in the SAME
+              dot/underscore-normalized text) covering just the
+              subtitle-language token(s), for excluding those specific
+              occurrences from audio-language extraction.
+      langs — set of canonical language names identified as subtitles.
+    """
+    text = _clean_raw(text)
+    spans: list = []
+    langs: set = set()
+
+    for kw_m in _SUB_KEYWORD_RE.finditer(text):
+        after_m = _LANG_CHAIN_AFTER_RE.match(text, kw_m.end())
+        if after_m:
+            start, end = after_m.start(1), after_m.end(1)
+        else:
+            before_m = _LANG_CHAIN_BEFORE_RE.search(text[:kw_m.start()])
+            if not before_m:
+                continue
+            start, end = before_m.start(1), before_m.end(1)
+
+        spans.append((start, end))
+        chunk = text[start:end]
+        for lang in LANG_LIST:
+            if re.search(rf'\b{re.escape(lang)}\b', chunk, re.I):
+                langs.add(lang)
+
+    return spans, langs
+
 # ── Content-type / label patterns ────────────────────────────────
+# NOTE: [\s.]* (not just \s*) so dot-separated filenames like
+# "Dual.Audio" / "Web.Series" / "Dolby.Vision" are recognized just as
+# well as their space-separated caption forms.
 _SERIES_RE    = re.compile(
-    r'\b(?:Web\s*Series|TV\s*Series|Mini\s*Series|OTT\s*Series|'
-    r'Limited\s*Series|Drama\s*Series|Short\s*Series)\b', re.I
+    r'\b(?:Web[\s.]*Series|TV[\s.]*Series|Mini[\s.]*Series|OTT[\s.]*Series|'
+    r'Limited[\s.]*Series|Drama[\s.]*Series|Short[\s.]*Series)\b', re.I
 )
 _ANIME_RE     = re.compile(r'\bAnime\b', re.I)
 _UNCUT_RE     = re.compile(r'\bUnCut\b', re.I)
 _SOUTH_RE     = re.compile(r'\bSouth\b', re.I)
 _BOLLYWOOD_RE = re.compile(r'\bBollywood\b', re.I)
 _HOLLYWOOD_RE = re.compile(r'\bHollywood\b', re.I)
-_DUAL_RE      = re.compile(r'\bDual\s*Audio\b', re.I)
-_MULTI_RE     = re.compile(r'\bMulti\s*(?:Audio|Lang(?:uage)?)?\b', re.I)
+_DUAL_RE      = re.compile(r'\bDual[\s.]*Audio\b', re.I)
+_MULTI_RE     = re.compile(r'\bMulti[\s.]*(?:Audio|Lang(?:uage)?)?\b', re.I)
 _COMPLETED_RE = re.compile(r'\bCompleted\b', re.I)
-_HD_RE        = re.compile(r'\b(?:HD|FHD|Full\s*HD)\b', re.I)
-_HDR_RE       = re.compile(r'\b(?:HDR10\+|HDR10|HDR|Dolby\s*Vision|DV)\b', re.I)
+_HD_RE        = re.compile(r'\b(?:HD|FHD|Full[\s.]*HD)\b', re.I)
+_HDR_RE       = re.compile(r'\b(?:HDR10\+|HDR10|HDR|Dolby[\s.]*Vision|DV)\b', re.I)
+_REMASTER_RE  = re.compile(r'\bRe[\s.\-]?master(?:ed)?\b', re.I)
+_BITRATE_RE   = re.compile(r'\b(\d{2,4})[\s\-]?[Kk]bps\b')
+
+# ── Promotional / junk-noise stripper ─────────────────────────────
+# Website names, @usernames, t.me links and common ad phrases must
+# NEVER show up in the Title or any other smart-filename field.
+_URL_RE       = re.compile(r'(?:https?://|www\.)\S+', re.I)
+_TME_RE       = re.compile(r't\.me/\S+', re.I)
+_MENTION_RE   = re.compile(r'@[A-Za-z0-9_]{3,}')
+_DOMAIN_RE    = re.compile(
+    r'\b[A-Za-z0-9-]{2,30}\.(?:com|net|in|co|org|me|xyz|info|live|cc|to|link|pw|icu|site)\b',
+    re.I
+)
+_AD_PHRASE_RE = re.compile(
+    r'\b(?:join[\s.]+(?:us|our|now)?|subscribe(?:[\s.]+now)?|follow[\s.]+us|'
+    r'click[\s.]+here|visit[\s.]+(?:us|now)?|for[\s.]+more[\s.]+(?:movies|videos|updates)?|'
+    r'download[\s.]+from|powered[\s.]+by|uploaded[\s.]+by|encoded[\s.]+by|'
+    r'telegram[\s.]+channel|our[\s.]+channel|official[\s.]+channel)\b',
+    re.I
+)
+
+def strip_promo_noise(text: str) -> str:
+    """
+    Remove URLs, @mentions, website/domain names and common ad phrases
+    from raw text BEFORE any smart-filename parsing, so third-party
+    website names, usernames and adverts never end up in the Title or
+    in any extracted tag.
+    """
+    if not text:
+        return text
+    t = _URL_RE.sub(' ', text)
+    t = _TME_RE.sub(' ', t)
+    t = _MENTION_RE.sub(' ', t)
+    t = _DOMAIN_RE.sub(' ', t)
+    t = _AD_PHRASE_RE.sub(' ', t)
+    return t
+
+def _build_clean_raw(filename: str, caption: str) -> str:
+    """Combine filename + caption and strip promo/ad noise once."""
+    return strip_promo_noise(f"{filename or ''} {caption or ''}")
+
+# ── Dynamic noise table for title cleanup ─────────────────────────
+# Built once from the tables above so the title parser always stays
+# in sync with whatever quality/source/codec/language tags exist —
+# no more manually duplicated noise lists to keep updated by hand.
+def _build_noise_pattern() -> str:
+    tokens = []
+    tokens += [re.escape(q) for q in QUALITY_LIST]
+    tokens += [re.escape(s).replace(r'\ ', r'[\s.\-]*') for s in SOURCE_LIST]
+    tokens += [re.escape(c) for c in VIDEO_CODEC_LIST]
+    tokens += [re.escape(c) for c in AUDIO_CODEC_LIST]
+    tokens += [re.escape(l.lower()) for l in LANG_LIST]
+    tokens += [
+        r'e\.?subs?', r'h\.?subs?', r'm\.?subs?', r'subs?', r'subtitles?',
+        r'dual[\s]?audio', r'multi[\s]?audio', r'multi',
+        r'uncut', r're[\s\-]?master(?:ed)?',
+        r'south', r'bollywood', r'hollywood',
+        r'hdr10\+', r'hdr10', r'hdr', r'dolby[\s]?vision',
+        r'\d{2,4}[\s\-]?kbps',
+        r'complete(?:d)?', r'full\s*hd', r'\bhd\b', r'\bfhd\b',
+    ]
+    return '|'.join(tokens)
+
+_NOISE = _build_noise_pattern()
 
 # ── Internal helpers ──────────────────────────────────────────────
 def _norm(text: str) -> str:
@@ -1189,19 +1359,34 @@ def _clean_raw(text: str) -> str:
     """Replace dots/underscores with spaces for easier token-level parsing."""
     return re.sub(r'[._]', ' ', text)
 
-# ── IMDB enrichment (best-effort, silent on any error) ───────────
+# ── IMDB enrichment ────────────────────────────────────────────────
+# Disabled on the hot path by default: a live network lookup per file
+# would serialize/stall the whole event loop and tank throughput on
+# large (100k+ file) batches. The title cleanup below is already
+# strong enough without it. Kept here (unused) in case a future
+# background/cached enrichment pass is wanted.
+ENABLE_IMDB_TITLE_ENRICH = False
+_imdb_title_cache: dict = {}
+
 def imdb_enrich_title(title: str, year: str):
+    if not ENABLE_IMDB_TITLE_ENRICH:
+        return title, year
     if not title or not year or len(title) < 3:
         return title, year
+    cache_key = (title.lower(), year)
+    if cache_key in _imdb_title_cache:
+        return _imdb_title_cache[cache_key], year
     try:
         results = _get_ia().search_movie(title)
         for r in results[:5]:
             if str(r.get("year", "")) == year:
                 clean = r.get("title", title)
                 if clean:
+                    _imdb_title_cache[cache_key] = clean
                     return clean, year
     except Exception:
         pass
+    _imdb_title_cache[cache_key] = title
     return title, year
 
 # ── Title + Year extractor ────────────────────────────────────────
@@ -1213,8 +1398,8 @@ def extract_title_year(raw: str):
       1. Normalise separators (dots, underscores → spaces).
       2. Find the first 4-digit year (1900–2099) — everything before it
          is a candidate title.
-      3. Strip season/episode markers, codec/quality noise, language names
-         and bracketed alt-title junk from the candidate.
+      3. Strip season/episode markers, codec/quality/source/language
+         noise and bracketed alt-title junk from the candidate.
       4. Title-case the result.
 
     Handles all common naming conventions:
@@ -1237,30 +1422,7 @@ def extract_title_year(raw: str):
     title_raw = re.sub(r'\s*\bS(?:eason)?\s*\d{1,3}\b.*$', '', title_raw, flags=re.I)
     title_raw = re.sub(r'\s*\bEp?(?:isode)?\.?\s*\d{1,3}\b.*$', '', title_raw, flags=re.I)
 
-    # Step 3: strip known noise tokens
-    _NOISE = (
-        # Quality / resolution
-        r'2160p|4k\s*uhd|4k|uhd|1080p|720p|480p|360p|240p|'
-        # Source / rip
-        r'web[\s\-]?dl|webrip|web|bluray|blu[\s\-]ray|bdrip|bdremux|'
-        r'hdrip|dvdrip|dvd|hdtv|hdcam|dvdscr|cam|'
-        r'amzn|dsnp|nf|hmax|atvp|pcok|sonyliv|zee5|hotstar|jiocinemma|'
-        # Video codecs
-        r'hevc|x265|h\.265|x264|h\.264|avc|av1|vp9|'
-        # Audio codecs
-        r'truehd|dts[\s\-]hd|dts[\s\-]x|dts|dd\+?5\.1|ddp5\.1|dd\+|ddp|'
-        r'atmos|aac5\.1|aac|ac3|eac3|mp3|flac|opus|'
-        # Subtitle markers
-        r'e\.?subs?|h\.?subs?|m\.?subs?|subs?|subtitles?|'
-        # Audio descriptors
-        r'dual[\s]?audio|multi[\s]?audio|multi|'
-        # Content flags
-        r'uncut|south|bollywood|hollywood|'
-        # HDR
-        r'hdr10\+|hdr10|hdr|dolby[\s]?vision|'
-        # Languages – every name in LANG_LIST lowercased
-        r'|'.join(re.escape(l.lower()) for l in LANG_LIST)
-    )
+    # Step 3: strip known noise tokens (dynamically built from all tables)
     title_raw = re.sub(rf'\b(?:{_NOISE})\b', '', title_raw, flags=re.I)
 
     # Step 4: remove bracketed junk – "(Poojai)", "[Clear]", "{hin}"
@@ -1279,90 +1441,151 @@ def extract_title_year(raw: str):
 # ── Season / Episode extractor ───────────────────────────────────
 def extract_season_episode(text: str):
     """
-    Returns (season_str, episode_str) as clean display strings.
+    Returns (season_str, episode_str, season_tag) as clean display strings.
 
     Patterns handled (all case-insensitive):
-      S01E07          →  S01, E07
-      S01 E07         →  S01, E07
-      S01E07E08       →  S01, E07-E08   (multi-episode file)
-      Season 2 Ep 5   →  S02, E05
-      S01 (Ep.01-09)  →  S01, Ep.01-09  (batch)
-      Ep.01-05        →  "",  Ep.01-05   (no season)
-      EP05 / Ep 5     →  "",  E05
+      S01E07          →  S01, E07,        ""
+      S01 E07         →  S01, E07,        ""
+      S01E07E08       →  S01, E07-E08,    ""
+      Season 2 Ep 5   →  S02, E05,        ""
+      S01 (Ep.01-09)  →  S01, Ep.01-09,   "Combined Episodes"
+      Ep.01-05        →  "",  Ep.01-05,   "Combined Episodes"
+      EP05 / Ep 5     →  "",  E05,        ""
+      S01 (no E##)    →  S01, "",         "Complete Season"
+
+    season_tag:
+      "Combined Episodes" — the file bundles a range of episodes
+                             (e.g. S01 E01-05, S15 E06-15).
+      "Complete Season"   — only a season number is present with no
+                             episode marker at all → whole season.
+      ""                  — a normal single-episode file (or a movie).
     """
     t = re.sub(r'[._]', ' ', text)
     season  = ""
     episode = ""
 
-    # ── Season ───────────────────────────────────────────────────
-    s_m = re.search(r'\bS(?:eason)?\s*0*(\d{1,3})\b', t, re.I)
-    if s_m:
-        season = f"S{int(s_m.group(1)):02d}"
+    # ── 1. Season + Episode RANGE together ────────────────────────
+    # Matches: S01E01-E05 / S01 E01-05 / S15E06-15 / Season 1 Ep 1-9
+    # (season and episode are captured from the SAME match, so this
+    #  works even when there's no space/dot between "S01" and "E01" —
+    #  a plain \bS..\b season regex can't see across that boundary).
+    m = re.search(
+        r'\bS(?:eason)?\s*0*(\d{1,3})\s*'
+        r'E(?:p(?:isode)?)?\.?\s*0*(\d{1,3})\s*[-–to]+\s*'
+        r'(?:E(?:p(?:isode)?)?\.?\s*)?0*(\d{1,3})\b',
+        t, re.I
+    )
+    if m:
+        season  = f"S{int(m.group(1)):02d}"
+        episode = f"Ep.{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        return season, episode, "Combined Episodes"
 
-    # ── Episode range (batch files) ──────────────────────────────
+    # ── 2. Season + double-episode contiguous: S01E07E08 ─────────
+    m = re.search(r'\bS(?:eason)?\s*0*(\d{1,3})\s*E(\d{1,3})E(\d{1,3})\b', t, re.I)
+    if m:
+        season  = f"S{int(m.group(1)):02d}"
+        episode = f"E{int(m.group(2)):02d}-E{int(m.group(3)):02d}"
+        return season, episode, "Combined Episodes"
+
+    # ── 3. Season + single Episode together ───────────────────────
+    # Handles contiguous "S01E02", spaced "S01 E02" and keyword form
+    # "Season 2 Episode 5" in one shot.
+    m = re.search(
+        r'\bS(?:eason)?\s*0*(\d{1,3})\s*E(?:p(?:isode)?)?\.?\s*0*(\d{1,3})\b',
+        t, re.I
+    )
+    if m:
+        season  = f"S{int(m.group(1)):02d}"
+        episode = f"E{int(m.group(2)):02d}"
+        return season, episode, ""
+
+    # ── 4. Episode-only RANGE (no season number at all) ───────────
     # Matches: Ep.01-09 / (Ep 1-9) / E01-09 / E01-E09
-    r_m = re.search(
+    m = re.search(
         r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\s*[-–to]+\s*(?:Ep?(?:isode)?\.?\s*)?0*(\d{1,3})\b',
         t, re.I
     )
-    if r_m:
-        episode = f"Ep.{int(r_m.group(1)):02d}-{int(r_m.group(2)):02d}"
-        return season, episode
+    if m:
+        episode = f"Ep.{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+        return season, episode, "Combined Episodes"
 
-    # ── Multi-episode in one file: S01E07E08 ─────────────────────
-    me_m = re.search(r'\bS\d{1,3}(E\d{1,3})(E\d{1,3})\b', t, re.I)
-    if me_m:
-        ep1 = int(me_m.group(1)[1:])
-        ep2 = int(me_m.group(2)[1:])
-        episode = f"E{ep1:02d}-E{ep2:02d}"
-        return season, episode
+    # ── 5. Episode-only single (no season number at all) ──────────
+    m = re.search(r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\b', t, re.I)
+    if m:
+        episode = f"E{int(m.group(1)):02d}"
+        return season, episode, ""
 
-    # ── Single episode ────────────────────────────────────────────
-    e_m = re.search(r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\b', t, re.I)
-    if e_m:
-        episode = f"E{int(e_m.group(1)):02d}"
+    # ── 6. Season present alone, no episode marker anywhere ───────
+    # e.g. "Show.Name.S03.Complete.1080p" → whole season file.
+    m = re.search(r'\bS(?:eason)?\s*0*(\d{1,3})\b', t, re.I)
+    if m:
+        season = f"S{int(m.group(1)):02d}"
+        return season, "", "Complete Season"
 
-    return season, episode
+    return season, episode, ""
 
 # ── Subtitle-language context ─────────────────────────────────────
+def _subtitle_context_spans(text: str):
+    """
+    Return character spans (start, end) of the LANGUAGE portion of any
+    subtitle-language relationship found by `_scan_subtitle_context`.
+    Any language match whose position falls inside one of these spans
+    is treated as a subtitle language, not an audio language.
+
+    NOTE: spans are relative to the dot/underscore-normalized text
+    (see `_clean_raw`) — the caller must run language matching against
+    that SAME normalized string for the offsets to line up correctly.
+    """
+    spans, _ = _scan_subtitle_context(text)
+    return spans
+
 def _get_subtitle_languages(text: str) -> set:
     """
-    Returns set of language names that are explicitly paired with
-    subtitle references (e.g. "subtitle english", "hindi sub").
-    Used only by extract_subtitle_tag to decide tag type – languages
-    are NOT excluded from the audio list.
+    Returns the set of language names explicitly paired with a subtitle
+    reference (e.g. "English Subtitle", "Subtitle: Hindi, Punjabi").
+    Used by extract_subtitle_tag to pick ESub/HSub/MSub, and by
+    extract_audio_languages to make sure those mentions are NOT counted
+    as audio languages.
     """
-    sub_langs: set = set()
-    for m in _SUB_LANG_RE.finditer(text):
-        sub_langs.add(m.group(1).title())
-    for m in _LANG_SUB_RE.finditer(text):
-        sub_langs.add(m.group(1).title())
-    return sub_langs
+    _, langs = _scan_subtitle_context(text)
+    return langs
 
 # ── Language extractor ────────────────────────────────────────────
 def extract_audio_languages(text: str) -> list:
     """
-    Extract ALL languages present in the filename + caption.
+    Extract the AUDIO languages present in the filename + caption.
 
-    • Returns every language found, regardless of whether it also
-      appears in a subtitle context (subtitle info is handled
-      separately by extract_subtitle_tag).
+    • Context-aware: a language mention that only ever appears as part
+      of a "<lang> Subtitle" / "Subtitle: <lang>" phrase (spelled out
+      in full, not just ESub/HSub) is treated as a SUBTITLE language
+      and excluded here — even while other real audio languages
+      (Hindi, Punjabi, etc.) in the same text are still picked up.
+    • If the same language ALSO appears elsewhere outside a subtitle
+      context, it's still counted as audio (that occurrence wins).
     • Languages are returned IN THE ORDER THEY APPEAR in the text,
       so "Hindi + Telugu" always stays "Hindi + Telugu".
     • Full names are tried first; 3-letter ISO codes only as fallback.
     """
+    text = _clean_raw(text)  # keep positions consistent with sub-span offsets
+    sub_spans = _subtitle_context_spans(text)
+
+    def _in_sub_span(pos: int) -> bool:
+        return any(s <= pos < e for s, e in sub_spans)
+
     found_with_pos: list = []
 
     for lang in LANG_LIST:
-        m = re.search(rf'\b{re.escape(lang)}\b', text, re.I)
-        if m:
+        for m in re.finditer(rf'\b{re.escape(lang)}\b', text, re.I):
+            if _in_sub_span(m.start()):
+                continue
             found_with_pos.append((m.start(), lang))
+            break  # first non-subtitle occurrence is enough for this language
 
     # Fallback: 3-letter codes (only if zero full names found)
     if not found_with_pos:
         for code, lang in LANG_CODE_MAP.items():
             m = re.search(rf'\b{re.escape(code)}\b', text, re.I)
-            if m and lang not in [l for _, l in found_with_pos]:
+            if m and not _in_sub_span(m.start()) and lang not in [l for _, l in found_with_pos]:
                 found_with_pos.append((m.start(), lang))
 
     # Sort by position of first appearance → preserves source order
@@ -1383,7 +1606,10 @@ def extract_subtitle_tag(text: str) -> str:
     Returns the subtitle presence tag.
     Priority: ESub > HSub > MSub > Sub
 
-    Also promotes generic "sub/subtitle english" → ESub.
+    Also promotes a spelled-out "<lang> Subtitle" mention:
+      English  → ESub
+      Hindi    → HSub
+      2+ langs → MSub
     """
     if ESUB_RE.search(text):
         return "ESub"
@@ -1391,9 +1617,15 @@ def extract_subtitle_tag(text: str) -> str:
         return "HSub"
     if MSUB_RE.search(text):
         return "MSub"
-    # Explicit language+subtitle pairing counts as ESub
-    if _get_subtitle_languages(text):
-        return "ESub"
+    sub_langs = _get_subtitle_languages(text)
+    if sub_langs:
+        if len(sub_langs) > 1:
+            return "MSub"
+        if "English" in sub_langs:
+            return "ESub"
+        if "Hindi" in sub_langs:
+            return "HSub"
+        return "MSub"
     if SUB_RE.search(text):
         return "MSub"
     return ""
@@ -1413,10 +1645,11 @@ def extract_resolution(text: str) -> str:
 def extract_source(text: str) -> str:
     """
     Returns the rip/source tag.
-    Examples: WEB-DL, BluRay, HDRip, AMZN, NF, SonyLIV …
+    Examples: WEB-DL, BluRay, HDRip, Theater Print, AMZN, NF …
     """
     for s in SOURCE_LIST:
-        if re.search(rf'\b{re.escape(s)}\b', text, re.I):
+        pattern = re.escape(s).replace(r'\ ', r'[\s.\-]*')
+        if re.search(rf'\b{pattern}\b', text, re.I):
             return s
     return ""
 
@@ -1433,7 +1666,6 @@ def extract_audio_codec(text: str) -> str:
     Examples:  DD5.1-224Kbps → DD5.1   |   DDP5.1 → DDP5.1
                TrueHD Atmos  → TrueHD Atmos
     """
-    # Try full codec list first (most specific first)
     for codec in AUDIO_CODEC_LIST:
         pattern = re.escape(codec)
         m = re.search(
@@ -1443,6 +1675,11 @@ def extract_audio_codec(text: str) -> str:
         if m:
             return codec  # return canonical casing from list
     return ""
+
+def extract_bitrate(text: str) -> str:
+    """Returns standalone audio bitrate tag, e.g. '224Kbps'."""
+    m = _BITRATE_RE.search(text)
+    return f"{m.group(1)}Kbps" if m else ""
 
 def extract_extension(text: str) -> str:
     """Returns lowercase file extension: mkv, mp4, avi …"""
@@ -1460,22 +1697,24 @@ def extract_extension(text: str) -> str:
 def _format_audio_label(langs: list, text: str) -> str:
     """
     Formats the audio language block, preserving codec+bitrate annotation
-    on the first (primary) language.
+    on the first (primary) language. Falls back to a bare bitrate tag
+    (e.g. "224Kbps") when a bitrate is present but no codec name is.
 
     Examples:
       ["Hindi", "Telugu"]  + "DD5.1-224Kbps" → "Hindi DD5.1-224Kbps + Telugu"
       ["Hindi", "Tamil"]   + no codec         → "Hindi + Tamil"
       ["Hindi"]            + "DDP5.1"         → "Hindi DDP5.1"
+      ["Hindi"]            + "224Kbps" only    → "Hindi 224Kbps"
     """
     if not langs:
         return ""
 
     # Look for bitrate-annotated audio codec in raw text
     m = re.search(
-        r'\b(TrueHD\s+Atmos|DTS[\s\-]HD(?:\s+MA)?|DTS[\s\-]X|DTS|'
-        r'DD\+?5\.1|DDP5\.1|DD\+|DDP|Atmos|TrueHD|'
-        r'AAC5\.1|AAC|AC3|EAC3|MP3|FLAC|OPUS)'
-        r'(?:[- ](\d+[Kk]bps))?\b',
+        r'\b(TrueHD\s+Atmos|Dolby\s+Atmos|DTS[\s\-]HD(?:\s+MA)?|DTS[\s\-]X|DTS|'
+        r'DD\+?5\.1|DDP5\.1|DD\+?2\.0|DDP2\.0|DD\+|DDP|Atmos|TrueHD|'
+        r'AAC5\.1|AAC2\.0|AAC|AC3|EAC3|MP3|FLAC|OPUS)'
+        r'(?:[- ](\d{2,4}[Kk]bps))?\b',
         text, re.I
     )
     acodec_str = ""
@@ -1483,6 +1722,10 @@ def _format_audio_label(langs: list, text: str) -> str:
         codec_part   = m.group(1)
         bitrate_part = m.group(2)
         acodec_str   = f" {codec_part}-{bitrate_part}" if bitrate_part else f" {codec_part}"
+    else:
+        br_m = _BITRATE_RE.search(text)
+        if br_m:
+            acodec_str = f" {br_m.group(1)}Kbps"
 
     if len(langs) == 1:
         return f"{langs[0]}{acodec_str}"
@@ -1497,9 +1740,17 @@ def detect_media_type(text: str) -> str:
     Detects content type: 'series', 'anime', or 'movie'.
 
     Series signals: S01E02, S01 E02, Season 1 Episode 2,
-                    Ep.01-09 (batch), EP07, Web Series label
-    Anime signals:  'Anime' keyword
+                    Ep.01-09 (batch), EP07, Web Series label,
+                    or a bare season marker with no episode at all
+                    (S03.Complete style batch dumps)
+    Anime signals:  'Anime' keyword — checked FIRST, since anime also
+                    commonly uses S01E07-style numbering and would
+                    otherwise get misread as a generic "series".
     """
+    # Explicit "Anime" keyword wins immediately — stronger, more
+    # specific signal than the generic S/E numbering heuristics below.
+    if _ANIME_RE.search(text):
+        return "anime"
     # Explicit series label wins immediately
     if _SERIES_RE.search(text):
         return "series"
@@ -1514,43 +1765,50 @@ def detect_media_type(text: str) -> str:
     # Season keyword without S-prefix
     if re.search(r'\bSeason\s*\d{1,3}\b', text, re.I):
         return "series"
-    if _ANIME_RE.search(text):
-        return "anime"
+    # Bare season marker only, no episode marker anywhere (e.g.
+    # "Show.Name.S03.Complete.1080p") — still a series, whole season.
+    if re.search(r'\bS\d{1,3}\b', text, re.I):
+        return "series"
     return "movie"
 
 # ── Master metadata parser ────────────────────────────────────────
 def parse_file_info(filename: str, caption: str) -> dict:
     """
-    Parse all metadata from filename + caption combined.
-    Returns a flat dict used directly by the {placeholder} template engine.
+    Parse all metadata from filename + caption combined (with promo/ad
+    noise stripped first). Returns a flat dict used directly by the
+    {placeholder} template engine.
     """
-    raw = f"{filename} {caption}"
+    raw = _build_clean_raw(filename, caption)
 
-    title, year     = extract_title_year(raw)
-    title, year     = imdb_enrich_title(title, year)
-    season, episode = extract_season_episode(raw)
-    audio_langs     = extract_audio_languages(raw)
-    subtitle        = extract_subtitle_tag(raw)
-    quality         = extract_quality(raw)
-    source          = extract_source(raw)
-    vcodec          = extract_video_codec(raw)
-    acodec          = extract_audio_codec(raw)
-    ext             = extract_extension(raw)
-    audio_str       = _format_audio_label(audio_langs, raw) if audio_langs else ""
+    title, year          = extract_title_year(raw)
+    title, year          = imdb_enrich_title(title, year)  # no-op unless explicitly enabled
+    season, episode, stag = extract_season_episode(raw)
+    audio_langs          = extract_audio_languages(raw)
+    subtitle             = extract_subtitle_tag(raw)
+    quality              = extract_quality(raw)
+    source                = extract_source(raw)
+    vcodec                = extract_video_codec(raw)
+    acodec                = extract_audio_codec(raw)
+    bitrate               = extract_bitrate(raw)
+    ext                   = extract_extension(raw)
+    audio_str             = _format_audio_label(audio_langs, raw) if audio_langs else ""
 
     return {
-        "title":      title,
-        "year":       year,
-        "season":     season,
-        "episode":    episode,
-        "audio":      audio_str,
-        "subtitle":   subtitle,
-        "quality":    quality,
-        "resolution": quality,   # alias
-        "source":     source,
-        "vcodec":     vcodec,
-        "acodec":     acodec,
-        "extension":  ext,
+        "title":       title,
+        "year":        year,
+        "season":      season,
+        "episode":     episode,
+        "season_tag":  stag,          # "Combined Episodes" | "Complete Season" | ""
+        "audio":       audio_str,
+        "audio_langs": audio_langs,
+        "subtitle":    subtitle,
+        "quality":     quality,
+        "resolution":  quality,       # alias
+        "source":      source,
+        "vcodec":      vcodec,
+        "acodec":      acodec,
+        "bitrate":     bitrate,
+        "extension":   ext,
     }
 
 # ── Smart caption builder ─────────────────────────────────────────
@@ -1559,23 +1817,24 @@ def build_smart_filename(filename: str, caption: str) -> str:
     Build a professional, fully structured media caption from filename + caption.
 
     Output order:
-      Title  [S## E##/Ep.##-##]  (Year)
+      Title  [S## E##/Ep.##-##]  [Combined Episodes / Complete Season]  (Year)
       (Lang1 [Codec-Bitrate] + Lang2)  [Dual/Multi Audio]
-      [UnCut]  [South / Bollywood / Hollywood]  [MediaLabel]
+      [UnCut]  [Remastered]  [South / Bollywood / Hollywood]  [MediaLabel]
       [HD/FHD]  [HDR]  [Source]  [VCodec]  Quality
       [ESub/HSub/MSub]  [.ext]
 
     Examples:
       Court - State Vs A Nobody (2025) (Hindi DD5.1-224Kbps + Telugu) Dual Audio UnCut South Movie HD 1080p ESub.mkv
-      Sapne Vs Everyone S01 (Ep.01-05) (2023) Hindi Completed Web Series HEVC 480p ESub.mkv
+      Sapne Vs Everyone S01 (Ep.01-05) (Combined Episodes) (2023) Hindi Web Series HEVC 480p ESub.mkv
       Loki S01 E02 Hindi Web Series HEVC 480p ESub.mkv
       Salaar Part 1 Ceasefire (2024) (Hindi + Telugu) Dual Audio UnCut South Movie HEVC 720p ESub.mkv
       My Hero Academia S06 E07 (2023) Japanese + English Anime HEVC 1080p ESub.mkv
+      Panchayat S03 (Complete Season) (2024) Hindi Web Series WEB-DL 1080p ESub.mkv
     """
-    raw        = f"{filename} {caption}"
-    info       = parse_file_info(filename, caption)
-    media_type = detect_media_type(raw)
-    audio_langs = extract_audio_languages(raw)
+    raw         = _build_clean_raw(filename, caption)
+    info        = parse_file_info(filename, caption)
+    media_type  = detect_media_type(raw)
+    audio_langs = info.get("audio_langs") or extract_audio_languages(raw)
     parts: list = []
 
     # ── 1. Title ─────────────────────────────────────────────────
@@ -1587,11 +1846,15 @@ def build_smart_filename(filename: str, caption: str) -> str:
         se = f"{info['season']} {info['episode']}".strip()
         parts.append(se)
 
-    # ── 3. Year ──────────────────────────────────────────────────
+    # ── 3. Combined-episode / Complete-season tag ────────────────
+    if info["season_tag"] and media_type != "movie":
+        parts.append(f"({info['season_tag']})")
+
+    # ── 4. Year ──────────────────────────────────────────────────
     if info["year"]:
         parts.append(f"({info['year']})")
 
-    # ── 4. Audio / Language block ────────────────────────────────
+    # ── 5. Audio / Language block ────────────────────────────────
     if audio_langs:
         audio_label = _format_audio_label(audio_langs, raw)
         # Wrap multi-language in parentheses (matches real-world conventions)
@@ -1600,17 +1863,26 @@ def build_smart_filename(filename: str, caption: str) -> str:
         else:
             parts.append(audio_label)
 
-    # ── 5. Dual / Multi Audio label ──────────────────────────────
-    if _DUAL_RE.search(raw) and len(audio_langs) >= 2:
-        parts.append("Dual Audio")
-    elif _MULTI_RE.search(raw) and len(audio_langs) >= 3:
+    # ── 6. Dual / Multi Audio label ──────────────────────────────
+    # Automatic — based on how many languages were actually detected —
+    # with the explicit "Dual/Multi Audio" text in the source treated
+    # as an additional (not required) signal.
+    explicit_dual  = bool(_DUAL_RE.search(raw))
+    explicit_multi = bool(_MULTI_RE.search(raw))
+    if len(audio_langs) >= 3 or explicit_multi:
         parts.append("Multi Audio")
+    elif len(audio_langs) == 2 or explicit_dual:
+        parts.append("Dual Audio")
 
-    # ── 6. UnCut ─────────────────────────────────────────────────
+    # ── 7. UnCut ─────────────────────────────────────────────────
     if _UNCUT_RE.search(raw):
         parts.append("UnCut")
 
-    # ── 7. Regional / industry label ─────────────────────────────
+    # ── 8. Remastered ────────────────────────────────────────────
+    if _REMASTER_RE.search(raw):
+        parts.append("Remastered")
+
+    # ── 9. Regional / industry label ─────────────────────────────
     if media_type == "movie":
         if _SOUTH_RE.search(raw):
             parts.append("South")
@@ -1619,16 +1891,16 @@ def build_smart_filename(filename: str, caption: str) -> str:
         elif _HOLLYWOOD_RE.search(raw):
             parts.append("Hollywood")
 
-    # ── 8. Completed (for finished series) ───────────────────────
+    # ── 10. Completed (for finished series) ───────────────────────
     completed = bool(_COMPLETED_RE.search(raw))
 
-    # ── 9. Media-type label ──────────────────────────────────────
+    # ── 11. Media-type label ──────────────────────────────────────
     if media_type == "series":
         series_label = "Web Series"
         s_m = _SERIES_RE.search(raw)
         if s_m:
             # Preserve the exact label from the source text
-            series_label = re.sub(r'\s+', ' ', s_m.group(0).strip().title())
+            series_label = re.sub(r'[\s.]+', ' ', s_m.group(0).strip()).title()
         if completed:
             parts.append(f"Completed {series_label}")
         else:
@@ -1642,33 +1914,40 @@ def build_smart_filename(filename: str, caption: str) -> str:
         elif re.search(r'\bMovie\b', raw, re.I):
             parts.append("Movie")
 
-    # ── 10. HD / FHD flag ────────────────────────────────────────
-    if _HD_RE.search(raw):
-        m = _HD_RE.search(raw)
-        parts.append(re.sub(r'\s+', ' ', m.group(0).strip()))
+    # ── 12. HD / FHD flag ────────────────────────────────────────
+    hd_m = _HD_RE.search(raw)
+    if hd_m:
+        parts.append(re.sub(r'[\s.]+', ' ', hd_m.group(0).strip()))
 
-    # ── 11. HDR flag ─────────────────────────────────────────────
-    if _HDR_RE.search(raw):
-        hdr_m = _HDR_RE.search(raw)
-        parts.append(re.sub(r'\s+', ' ', hdr_m.group(0).strip()))
+    # ── 13. HDR flag(s) ───────────────────────────────────────────
+    # A file can legitimately mention more than one HDR-type format
+    # separately (e.g. "HDR10 ... Dolby Vision") — collect all distinct
+    # mentions instead of keeping only the first.
+    hdr_labels: list = []
+    for hdr_m in _HDR_RE.finditer(raw):
+        label = re.sub(r'[\s.]+', ' ', hdr_m.group(0).strip())
+        if label.upper() not in [l.upper() for l in hdr_labels]:
+            hdr_labels.append(label)
+    if hdr_labels:
+        parts.append(" ".join(hdr_labels))
 
-    # ── 12. Source / Rip type ────────────────────────────────────
+    # ── 14. Source / Rip type ────────────────────────────────────
     if info["source"]:
         parts.append(info["source"])
 
-    # ── 13. Video codec ──────────────────────────────────────────
+    # ── 15. Video codec ──────────────────────────────────────────
     if info["vcodec"]:
         parts.append(info["vcodec"])
 
-    # ── 14. Resolution / Quality ─────────────────────────────────
+    # ── 16. Resolution / Quality ─────────────────────────────────
     if info["quality"]:
         parts.append(info["quality"])
 
-    # ── 15. Subtitle tag ─────────────────────────────────────────
+    # ── 17. Subtitle tag ─────────────────────────────────────────
     if info["subtitle"]:
         parts.append(info["subtitle"])
 
-    # ── 16. Extension (glued with dot, no space) ─────────────────
+    # ── 18. Extension (glued with dot, no space) ─────────────────
     if info["extension"]:
         parts.append(f".{info['extension']}")
 
@@ -1681,7 +1960,6 @@ def build_smart_filename(filename: str, caption: str) -> str:
             result = f"{result} {p}" if result else p
 
     return result.strip()
-
 
 # ---------------- Helper functions ----------------
 def _status_name(member_obj):
@@ -1876,8 +2154,166 @@ def apply_replacements(text: str, pairs: List[Tuple[str, str]]) -> str:
     new_text = re.sub(r'[ 	]+', ' ', new_text).strip()
     return new_text
 
-# ---------------- Function Handler ----------------
-# NOTE: must NOT match commands (anything starting with "/"). This handler
+# ═══════════════════════════════════════════════════════════════════
+#  Append / Delete-specific engine for: Block Words · Replace Words ·
+#  Prefix · Suffix
+#
+#  All four settings share ONE canonical storage format: a comma
+#  (or newline) separated list of items, e.g. "spam, fake, scam" or
+#  "old1 new1, old2 new2" for replace pairs. This lets all four reuse
+#  the exact same append / de-dupe / delete-specific machinery instead
+#  of four separate hand-rolled implementations.
+#
+#  Behaviour change from before: sending new words/phrases now ADDS to
+#  whatever is already saved (case-insensitive de-duplicated) instead
+#  of silently overwriting it. The existing "Delete ALL" button still
+#  wipes everything; a new "Delete Specific" flow lets the user paste
+#  back one or more existing items (shown to them in a copy-pasteable,
+#  comma-separated list) to remove just those.
+# ═══════════════════════════════════════════════════════════════════
+
+WORD_KIND_LABELS = {
+    "block":   "blocked word(s)",
+    "replace": "replace-word pair(s)",
+    "prefix":  "prefix entrie(s)",
+    "suffix":  "suffix entrie(s)",
+}
+
+def _split_items(raw) -> List[str]:
+    """Split a stored/typed block into individual items on commas or newlines."""
+    if not raw:
+        return []
+    if not isinstance(raw, str):
+        raw = str(raw)
+    return [item.strip() for item in re.split(r'[,\n]+', raw) if item.strip()]
+
+def format_items_preview(raw) -> str:
+    """
+    Comma-joined, copy-paste-friendly preview of stored items.
+    Used in every settings menu AND the delete-specific picker so the
+    user always sees (and can copy from) the exact same canonical form
+    — commas, not bullet points.
+    """
+    return ", ".join(_split_items(raw))
+
+def merge_items(old_raw: str, new_raw: str) -> Tuple[str, List[str], List[str]]:
+    """
+    Append items from new_raw onto old_raw, case-insensitively
+    de-duplicated, preserving the original order and NEVER dropping
+    existing items.
+
+    Returns (merged_raw, added_items, duplicate_items).
+    """
+    old_items = _split_items(old_raw)
+    new_items = _split_items(new_raw)
+    seen = {i.lower() for i in old_items}
+    merged = list(old_items)
+    added, duplicates = [], []
+    for item in new_items:
+        key = item.lower()
+        if key in seen:
+            duplicates.append(item)
+            continue
+        merged.append(item)
+        seen.add(key)
+        added.append(item)
+    return ", ".join(merged), added, duplicates
+
+def remove_items(old_raw: str, remove_raw: str) -> Tuple[str, List[str], List[str]]:
+    """
+    Remove the specific item(s) the user pasted back from the stored
+    list (case-insensitive exact-item match).
+
+    Returns (new_raw, removed_items, not_found_items).
+    """
+    old_items    = _split_items(old_raw)
+    remove_items_ = _split_items(remove_raw)
+    remove_lower = {i.lower() for i in remove_items_}
+    old_lower    = {i.lower() for i in old_items}
+
+    kept, removed = [], []
+    for item in old_items:
+        if item.lower() in remove_lower:
+            removed.append(item)
+        else:
+            kept.append(item)
+    not_found = [r for r in remove_items_ if r.lower() not in old_lower]
+    return ", ".join(kept), removed, not_found
+
+def validate_word_input(kind: str, raw: str) -> Tuple[bool, Optional[str], str]:
+    """
+    Validates and normalizes user-submitted text BEFORE it's merged and
+    saved as a caption setting.
+
+    kind: 'block' | 'replace' | 'prefix' | 'suffix'
+    Returns (is_valid, warning_message_or_None, cleaned_raw)
+      - is_valid=False  → nothing should be saved; warning_message
+        explains why and the caller should let the user try again.
+      - is_valid=True with a warning_message → saved, but some entries
+        were skipped/invalid and the user should be told which.
+    """
+    items = _split_items(raw)
+    if not items:
+        return False, "❌ Empty input. Please send at least one word/phrase.", ""
+
+    too_long = [i for i in items if len(i) > 300]
+    if too_long:
+        return False, (
+            "❌ One of the entries is too long (max 300 characters). "
+            "Please shorten it and try again."
+        ), ""
+
+    if kind == "replace":
+        valid, invalid = [], []
+        for item in items:
+            parts = item.split(None, 1)
+            if len(parts) == 2:
+                valid.append(item)
+            else:
+                invalid.append(item)
+        if not valid:
+            return False, (
+                "❌ Invalid format. Each entry must be:\n"
+                "<code>old_word new_word</code>\n\n"
+                "Separate multiple entries with a comma or a new line."
+            ), ""
+        warning = None
+        if invalid:
+            warning = (
+                f"⚠️ Skipped {len(invalid)} invalid entr{'y' if len(invalid) == 1 else 'ies'} "
+                f"(missing the replacement word): {', '.join(invalid)}"
+            )
+        return True, warning, ", ".join(valid)
+
+    # block / prefix / suffix — any non-empty item is acceptable
+    return True, None, ", ".join(items)
+
+async def _get_kind_raw(channel_id: int, kind: str) -> str:
+    """Fetch the currently-saved raw value for a given setting kind."""
+    if kind == "block":
+        return await get_block_words(channel_id)
+    if kind == "replace":
+        return await get_replace_words(channel_id) or ""
+    if kind == "prefix":
+        _, prefix = await get_suffix_prefix(channel_id)
+        return prefix or ""
+    if kind == "suffix":
+        suffix, _ = await get_suffix_prefix(channel_id)
+        return suffix or ""
+    return ""
+
+async def _save_kind_raw(channel_id: int, kind: str, raw: str):
+    """Persist the raw value for a given setting kind."""
+    if kind == "block":
+        await set_block_words(channel_id, raw)
+    elif kind == "replace":
+        await set_replace_words(channel_id, raw)
+    elif kind == "prefix":
+        await set_prefix(channel_id, raw)
+    elif kind == "suffix":
+        await set_suffix(channel_id, raw)
+
+
 # is a catch-all for plain-text session input (captions, block words,
 # suffixes, etc.). Pyrogram stops checking further handlers in the same
 # group once one handler's filter matches -- so if this matched commands
@@ -1898,8 +2334,11 @@ async def capture_user_input(client, message):
     BUG FIXES:
     1. Each session type is checked independently using its OWN key so a stale
        caption_set entry never intercepts a block_words_set input.
-    2. block_words now REPLACES (not appends) so re-sending words doesn't
-       accidentally treat them as a caption.
+    2. block_words / replace_words / prefix / suffix now APPEND to whatever
+       is already saved (case-insensitive de-duplicated) instead of silently
+       overwriting it. A "Delete Specific" flow (word_delete_set) lets the
+       user remove just one or more existing items; "Delete All" still wipes
+       everything.
     3. Only the session that the user is ACTIVELY in is consumed — all other
        session keys for this user are cleared when any session starts
        (done in CallbackQuery.py) so cross-bleed is impossible.
@@ -1909,7 +2348,7 @@ async def capture_user_input(client, message):
     # Build the set of users who have an active session
     active_users = set()
     for key in ("caption_set", "block_words_set", "replace_words_set",
-                "prefix_set", "suffix_set", "url_set"):
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         active_users.update(bot_data.get(key, {}).keys())
     active_users.update(FF_SESSIONS.keys())
     if user_id not in active_users:
@@ -1952,16 +2391,33 @@ async def capture_user_input(client, message):
         session      = bot_data["block_words_set"].pop(user_id)
         channel_id   = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
-        # REPLACE — not append — so re-sending words doesn't stack
-        await set_block_words(channel_id, text.strip())
+
+        ok, warn, cleaned = validate_word_input("block", text.strip())
+        if not ok:
+            bot_data.setdefault("block_words_set", {})[user_id] = session
+            await message.reply_text(warn)
+            return
+
+        old_raw = await get_block_words(channel_id)
+        merged, added, dupes = merge_items(old_raw, cleaned)
+        await set_block_words(channel_id, merged)
+
         try:
             await client.delete_messages(user_id, message.id)
         except Exception:
             pass
+
+        lines = ["✅ <b>Blocked words updated!</b>"]
+        if added:
+            lines.append(f"➕ Added: {', '.join(added)}")
+        if dupes:
+            lines.append(f"ℹ️ Already set (skipped): {', '.join(dupes)}")
+        if warn:
+            lines.append(warn)
         await client.edit_message_text(
             chat_id=user_id,
             message_id=instr_msg_id,
-            text="✅ Blocked words updated!",
+            text="\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("↩ Back", callback_data=f"back_to_blockwords_{channel_id}")]]
             ),
@@ -1975,16 +2431,33 @@ async def capture_user_input(client, message):
         session      = bot_data["replace_words_set"].pop(user_id)
         channel_id   = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
-        # REPLACE — not append
-        await set_replace_words(channel_id, text.strip())
+
+        ok, warn, cleaned = validate_word_input("replace", text.strip())
+        if not ok:
+            bot_data.setdefault("replace_words_set", {})[user_id] = session
+            await message.reply_text(warn)
+            return
+
+        old_raw = await get_replace_words(channel_id)
+        merged, added, dupes = merge_items(old_raw, cleaned)
+        await set_replace_words(channel_id, merged)
+
         try:
             await client.delete_messages(user_id, message.id)
         except Exception:
             pass
+
+        lines = ["✅ <b>Replace words updated!</b>"]
+        if added:
+            lines.append(f"➕ Added: {', '.join(added)}")
+        if dupes:
+            lines.append(f"ℹ️ Already set (skipped): {', '.join(dupes)}")
+        if warn:
+            lines.append(warn)
         await client.edit_message_text(
             chat_id=user_id,
             message_id=instr_msg_id,
-            text="✅ Replace words updated!",
+            text="\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("↩ Back", callback_data=f"back_to_replace_{channel_id}")]]
             ),
@@ -1998,16 +2471,31 @@ async def capture_user_input(client, message):
         session      = bot_data["prefix_set"].pop(user_id)
         channel_id   = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
-        # REPLACE — not append
-        await set_prefix(channel_id, text.strip())
+
+        ok, warn, cleaned = validate_word_input("prefix", text.strip())
+        if not ok:
+            bot_data.setdefault("prefix_set", {})[user_id] = session
+            await message.reply_text(warn)
+            return
+
+        _, old_raw = await get_suffix_prefix(channel_id)
+        merged, added, dupes = merge_items(old_raw, cleaned)
+        await set_prefix(channel_id, merged)
+
         try:
             await client.delete_messages(user_id, message.id)
         except Exception:
             pass
+
+        lines = ["✅ <b>Prefix updated!</b>"]
+        if added:
+            lines.append(f"➕ Added: {', '.join(added)}")
+        if dupes:
+            lines.append(f"ℹ️ Already set (skipped): {', '.join(dupes)}")
         await client.edit_message_text(
             chat_id=user_id,
             message_id=instr_msg_id,
-            text="✅ Prefix updated!",
+            text="\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("↩ Back", callback_data=f"back_to_suffixprefix_{channel_id}")]]
             ),
@@ -2021,18 +2509,80 @@ async def capture_user_input(client, message):
         session      = bot_data["suffix_set"].pop(user_id)
         channel_id   = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
-        # REPLACE — not append
-        await set_suffix(channel_id, text.strip())
+
+        ok, warn, cleaned = validate_word_input("suffix", text.strip())
+        if not ok:
+            bot_data.setdefault("suffix_set", {})[user_id] = session
+            await message.reply_text(warn)
+            return
+
+        old_raw, _ = await get_suffix_prefix(channel_id)
+        merged, added, dupes = merge_items(old_raw, cleaned)
+        await set_suffix(channel_id, merged)
+
         try:
             await client.delete_messages(user_id, message.id)
         except Exception:
             pass
+
+        lines = ["✅ <b>Suffix updated!</b>"]
+        if added:
+            lines.append(f"➕ Added: {', '.join(added)}")
+        if dupes:
+            lines.append(f"ℹ️ Already set (skipped): {', '.join(dupes)}")
         await client.edit_message_text(
             chat_id=user_id,
             message_id=instr_msg_id,
-            text="✅ Suffix updated!",
+            text="\n".join(lines),
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("↩ Back", callback_data=f"back_to_suffixprefix_{channel_id}")]]
+            ),
+        )
+        return
+
+    # ---------- DELETE SPECIFIC (block / replace / prefix / suffix) ----------
+    # Shared by all four settings: the user was shown their current items
+    # (comma-separated, copy-pasteable) and sends back the exact word(s)/
+    # phrase(s) they want removed — multiple at once, comma-separated.
+    if user_id in bot_data.get("word_delete_set", {}):
+        if not text.strip():
+            return
+        session      = bot_data["word_delete_set"].pop(user_id)
+        channel_id   = session["channel_id"]
+        kind         = session["kind"]
+        instr_msg_id = session["instr_msg_id"]
+
+        old_raw = await _get_kind_raw(channel_id, kind)
+        new_raw, removed, not_found = remove_items(old_raw, text.strip())
+        await _save_kind_raw(channel_id, kind, new_raw)
+
+        try:
+            await client.delete_messages(user_id, message.id)
+        except Exception:
+            pass
+
+        label = WORD_KIND_LABELS.get(kind, "entries")
+        lines = [f"🗑 <b>{label.title()} — delete specific</b>"]
+        if removed:
+            lines.append(f"✅ Removed: {', '.join(removed)}")
+        if not_found:
+            lines.append(f"⚠️ Not found (skipped): {', '.join(not_found)}")
+        if not removed and not not_found:
+            lines.append("⚠️ Nothing matched — no changes made.")
+
+        back_cb = {
+            "block":   f"back_to_blockwords_{channel_id}",
+            "replace": f"back_to_replace_{channel_id}",
+            "prefix":  f"back_to_suffixprefix_{channel_id}",
+            "suffix":  f"back_to_suffixprefix_{channel_id}",
+        }.get(kind, f"chinfo_{channel_id}")
+
+        await client.edit_message_text(
+            chat_id=user_id,
+            message_id=instr_msg_id,
+            text="\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩ Back", callback_data=back_cb)]]
             ),
         )
         return
