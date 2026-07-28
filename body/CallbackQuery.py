@@ -7,6 +7,11 @@ from body.database import *
 from info import *
 from Script import script
 from body.Caption import *
+# NOTE: "import *" never pulls in underscore-prefixed names, so the two
+# internal Caption.py helpers used directly in this file need an explicit
+# import — without this, the channel-settings preview and the
+# "Delete Specific" flow raise a NameError as soon as they run.
+from body.Caption import _split_items, _get_kind_raw
 from pyrogram.errors import RPCError, ChatAdminRequired, ChatWriteForbidden
 
 FONT_TXT = script.FONT_TXT
@@ -39,12 +44,14 @@ async def _show_channel_settings(client, query, channel_id: int):
     if not caption:
         caption_preview = "❌ No caption set for this channel."
     else:
-        if prefix and suffix:
-            caption_preview = f"{prefix}\n{caption}\n{suffix}"
-        elif prefix:
-            caption_preview = f"{prefix}\n{caption}"
-        elif suffix:
-            caption_preview = f"{caption}\n{suffix}"
+        prefix_display = "\n".join(_split_items(prefix))
+        suffix_display = "\n".join(_split_items(suffix))
+        if prefix_display and suffix_display:
+            caption_preview = f"{prefix_display}\n{caption}\n{suffix_display}"
+        elif prefix_display:
+            caption_preview = f"{prefix_display}\n{caption}"
+        elif suffix_display:
+            caption_preview = f"{caption}\n{suffix_display}"
         else:
             caption_preview = caption
 
@@ -104,14 +111,7 @@ async def _show_words_menu(client, query, channel_id: int):
     cap_doc    = await get_channel_cached(channel_id)
     chat_title = cap_doc.get("_title", str(channel_id))
     blocked    = cap_doc.get("block_words", "")
-    if blocked:
-        words_text = "\n".join(
-            f"• {w.strip()}"
-            for w in re.split(r"[,\n]+", blocked)
-            if w.strip()
-        )
-    else:
-        words_text = "None set yet."
+    words_text = format_items_preview(blocked) or "None set yet."
     text = (
         f"📛 **Channel:** {chat_title}\n\n"
         f"🚫 **Blocked Words:**\n{words_text}\n\n"
@@ -120,6 +120,7 @@ async def _show_words_menu(client, query, channel_id: int):
     buttons = [
         [InlineKeyboardButton("📝 Set Block Words",    callback_data=f"addwords_{channel_id}"),
          InlineKeyboardButton("🗑️ Delete Block Words", callback_data=f"delwords_{channel_id}")],
+        [InlineKeyboardButton("🗑 Delete Specific",     callback_data=f"delspecific_words_{channel_id}")],
         [InlineKeyboardButton("↩ Back",               callback_data=f"chinfo_{channel_id}")],
     ]
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -127,15 +128,10 @@ async def _show_words_menu(client, query, channel_id: int):
 
 async def _show_replace_menu(client, query, channel_id: int):
     """Render the replace-words sub-menu for channel_id."""
-    cap_doc     = await get_channel_cached(channel_id)
-    chat_title  = cap_doc.get("_title", str(channel_id))
-    replace_raw = cap_doc.get("replace_words", "")
-    if replace_raw:
-        replace_text = "\n".join(
-            line.strip() for line in replace_raw.splitlines() if line.strip()
-        )
-    else:
-        replace_text = "None set yet."
+    cap_doc      = await get_channel_cached(channel_id)
+    chat_title   = cap_doc.get("_title", str(channel_id))
+    replace_raw  = cap_doc.get("replace_words", "")
+    replace_text = format_items_preview(replace_raw) or "None set yet."
     text = (
         f"📛 **Channel:** {chat_title}\n\n"
         f"🔤 **Replace Words:**\n{replace_text}\n\n"
@@ -144,6 +140,7 @@ async def _show_replace_menu(client, query, channel_id: int):
     buttons = [
         [InlineKeyboardButton("📝 Set Replace Words",    callback_data=f"addreplace_{channel_id}"),
          InlineKeyboardButton("🗑️ Delete Replace Words", callback_data=f"delreplace_{channel_id}")],
+        [InlineKeyboardButton("🗑 Delete Specific",       callback_data=f"delspecific_replace_{channel_id}")],
         [InlineKeyboardButton("↩ Back",                 callback_data=f"chinfo_{channel_id}")],
     ]
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
@@ -155,17 +152,21 @@ async def _show_suffixprefix_menu(client, query, channel_id: int):
     chat_title = cap_doc.get("_title", str(channel_id))
     suffix     = cap_doc.get("suffix", "")
     prefix     = cap_doc.get("prefix", "")
+    suffix_text = format_items_preview(suffix) or "None"
+    prefix_text = format_items_preview(prefix) or "None"
     buttons = [
         [InlineKeyboardButton("Set Suffix", callback_data=f"set_suf_{channel_id}"),
-         InlineKeyboardButton("Del Suffix", callback_data=f"del_suf_{channel_id}")],
+         InlineKeyboardButton("Del All Suffix", callback_data=f"del_suf_{channel_id}")],
+        [InlineKeyboardButton("🗑 Delete Specific Suffix", callback_data=f"delspecific_suffix_{channel_id}")],
         [InlineKeyboardButton("Set Prefix", callback_data=f"set_pre_{channel_id}"),
-         InlineKeyboardButton("Del Prefix", callback_data=f"del_pre_{channel_id}")],
+         InlineKeyboardButton("Del All Prefix", callback_data=f"del_pre_{channel_id}")],
+        [InlineKeyboardButton("🗑 Delete Specific Prefix", callback_data=f"delspecific_prefix_{channel_id}")],
         [InlineKeyboardButton("↩ Back",     callback_data=f"chinfo_{channel_id}")],
     ]
     text = (
         f"📌 Channel: {chat_title}\n\n"
-        f"Current Suffix: {suffix or 'None'}\n"
-        f"Current Prefix: {prefix or 'None'}"
+        f"Current Suffix: {suffix_text}\n"
+        f"Current Prefix: {prefix_text}"
     )
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -212,7 +213,7 @@ async def set_caption_message(client, query):
 
     # Clear ALL other pending sessions for this user to prevent cross-bleed
     for key in ("caption_set", "block_words_set", "replace_words_set",
-                "prefix_set", "suffix_set", "url_set"):
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         bot_data.get(key, {}).pop(user_id, None)
 
     instr = await query.message.edit_text(
@@ -311,6 +312,9 @@ async def caption_font(client, query):
 async def set_words_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
+    for key in ("caption_set", "block_words_set", "replace_words_set",
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
+        bot_data.get(key, {}).pop(query.from_user.id, None)
     await _show_words_menu(client, query, channel_id)
 
 
@@ -322,13 +326,14 @@ async def set_block_words_message(client, query):
 
     # Clear ALL other pending sessions for this user
     for key in ("caption_set", "block_words_set", "replace_words_set",
-                "prefix_set", "suffix_set", "url_set"):
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         bot_data.get(key, {}).pop(user_id, None)
 
     instr = await query.message.edit_text(
         text=(
             "🚫 Send me the **blocked words** for this channel.\n"
-            "Separate words using commas.\n\n"
+            "Separate words using commas.\n"
+            "These will be <b>added</b> to any words already set.\n\n"
             "Example:\n"
             "<code>spam, fake, scam</code>\n\n"
         ),
@@ -346,8 +351,9 @@ async def set_block_words_message(client, query):
 async def back_to_blockwords_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
-    # Clear the pending block-words session so it doesn't remain active
+    # Clear the pending block-words / delete-specific session so it doesn't remain active
     bot_data.get("block_words_set", {}).pop(query.from_user.id, None)
+    bot_data.get("word_delete_set", {}).pop(query.from_user.id, None)
     await _show_words_menu(client, query, channel_id)
 
 
@@ -373,6 +379,9 @@ async def delete_blocked_words(client, query):
 async def suffix_prefix_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
+    for key in ("caption_set", "block_words_set", "replace_words_set",
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
+        bot_data.get(key, {}).pop(query.from_user.id, None)
     await _show_suffixprefix_menu(client, query, channel_id)
 
 
@@ -382,6 +391,7 @@ async def back_to_suffixprefix_menu(client, query):
     channel_id = int(query.matches[0].group(1))
     bot_data.get("suffix_set", {}).pop(query.from_user.id, None)
     bot_data.get("prefix_set", {}).pop(query.from_user.id, None)
+    bot_data.get("word_delete_set", {}).pop(query.from_user.id, None)
     await _show_suffixprefix_menu(client, query, channel_id)
 
 
@@ -391,10 +401,14 @@ async def set_suffix_message(client, query):
     channel_id = int(query.matches[0].group(1))
     user_id    = query.from_user.id
     for key in ("caption_set", "block_words_set", "replace_words_set",
-                "prefix_set", "suffix_set", "url_set"):
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         bot_data.get(key, {}).pop(user_id, None)
     instr = await query.message.edit_text(
-        text="🖋️ Send the suffix text you want to add to your captions.",
+        text=(
+            "🖋️ Send the suffix text you want to add to your captions.\n"
+            "Separate multiple entries with a comma.\n"
+            "These will be <b>added</b> to any suffix already set."
+        ),
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("↩ Back", callback_data=f"set_suffixprefix_{channel_id}")]]
         ),
@@ -411,10 +425,14 @@ async def set_prefix_message(client, query):
     channel_id = int(query.matches[0].group(1))
     user_id    = query.from_user.id
     for key in ("caption_set", "block_words_set", "replace_words_set",
-                "prefix_set", "suffix_set", "url_set"):
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         bot_data.get(key, {}).pop(user_id, None)
     instr = await query.message.edit_text(
-        text="✍️ Send the prefix text you want to add to your captions.",
+        text=(
+            "✍️ Send the prefix text you want to add to your captions.\n"
+            "Separate multiple entries with a comma.\n"
+            "These will be <b>added</b> to any prefix already set."
+        ),
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("↩ Back", callback_data=f"set_suffixprefix_{channel_id}")]]
         ),
@@ -458,6 +476,9 @@ async def delete_prefix_cb(client, query):
 async def set_replace_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
+    for key in ("caption_set", "block_words_set", "replace_words_set",
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
+        bot_data.get(key, {}).pop(query.from_user.id, None)
     await _show_replace_menu(client, query, channel_id)
 
 
@@ -467,12 +488,13 @@ async def set_replace_words_message(client, query):
     channel_id = int(query.matches[0].group(1))
     user_id    = query.from_user.id
     for key in ("caption_set", "block_words_set", "replace_words_set",
-                "prefix_set", "suffix_set", "url_set"):
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         bot_data.get(key, {}).pop(user_id, None)
     instr = await query.message.edit_text(
         text=(
             "🔤 Send me the **replace words** for this channel.\n"
-            "Use format: `old new, another_old another_new`\n\n"
+            "Use format: `old new, another_old another_new`\n"
+            "These will be <b>added</b> to any replace-words already set.\n\n"
             "Example:\n"
             "<code>spam scam, fake real</code>\n\n"
         ),
@@ -491,6 +513,7 @@ async def back_to_replace_menu(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
     bot_data.get("replace_words_set", {}).pop(query.from_user.id, None)
+    bot_data.get("word_delete_set", {}).pop(query.from_user.id, None)
     await _show_replace_menu(client, query, channel_id)
 
 
@@ -550,7 +573,7 @@ async def set_url_message(client, query):
     channel_id = int(query.matches[0].group(1))
     user_id    = query.from_user.id
     for key in ("caption_set", "block_words_set", "replace_words_set",
-                "prefix_set", "suffix_set", "url_set"):
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         bot_data.get(key, {}).pop(user_id, None)
     instr = await query.message.edit_text(
         text=(
@@ -612,6 +635,86 @@ async def toggle_emoji_remover(client, query):
     current    = await get_emoji_remover_status(channel_id)
     await set_emoji_remover_status(channel_id, not current)
     await _show_channel_settings(client, query, channel_id)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  DELETE SPECIFIC ITEM  (block words / replace words / prefix / suffix)
+#
+#  Shows the user their currently-saved items in a copy-pasteable,
+#  comma-separated <code> block and waits for them to send back the
+#  exact word(s)/phrase(s) to remove — handled by capture_user_input's
+#  "word_delete_set" branch in Caption.py.
+# ══════════════════════════════════════════════════════════════════
+_DELETE_SPECIFIC_BACK_CB = {
+    "block":   lambda cid: f"setwords_{cid}",
+    "replace": lambda cid: f"setreplace_{cid}",
+    "prefix":  lambda cid: f"set_suffixprefix_{cid}",
+    "suffix":  lambda cid: f"set_suffixprefix_{cid}",
+}
+
+async def _start_delete_specific(client, query, channel_id: int, kind: str):
+    user_id = query.from_user.id
+    for key in ("caption_set", "block_words_set", "replace_words_set",
+                "prefix_set", "suffix_set", "url_set", "word_delete_set"):
+        bot_data.get(key, {}).pop(user_id, None)
+
+    back_cb = _DELETE_SPECIFIC_BACK_CB[kind](channel_id)
+    raw     = await _get_kind_raw(channel_id, kind)
+    preview = format_items_preview(raw)
+
+    if not preview:
+        await query.message.edit_text(
+            f"ℹ️ No {WORD_KIND_LABELS[kind]} set yet — nothing to delete.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩ Back", callback_data=back_cb)]]
+            ),
+        )
+        return
+
+    instr = await query.message.edit_text(
+        text=(
+            f"🗑 <b>Delete specific {WORD_KIND_LABELS[kind]}</b>\n\n"
+            f"Current:\n<code>{preview}</code>\n\n"
+            f"Copy the exact word/phrase you want to remove and send it back.\n"
+            f"You can delete multiple at once — separate them with commas."
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("↩ Back", callback_data=back_cb)]]
+        ),
+    )
+    bot_data.setdefault("word_delete_set", {})[user_id] = {
+        "channel_id":   channel_id,
+        "kind":         kind,
+        "instr_msg_id": instr.id,
+    }
+
+
+@Client.on_callback_query(filters.regex(r"^delspecific_words_(-?\d+)$"))
+async def delete_specific_block_words(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    await _start_delete_specific(client, query, channel_id, "block")
+
+
+@Client.on_callback_query(filters.regex(r"^delspecific_replace_(-?\d+)$"))
+async def delete_specific_replace_words(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    await _start_delete_specific(client, query, channel_id, "replace")
+
+
+@Client.on_callback_query(filters.regex(r"^delspecific_prefix_(-?\d+)$"))
+async def delete_specific_prefix(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    await _start_delete_specific(client, query, channel_id, "prefix")
+
+
+@Client.on_callback_query(filters.regex(r"^delspecific_suffix_(-?\d+)$"))
+async def delete_specific_suffix(client, query):
+    await query.answer()
+    channel_id = int(query.matches[0].group(1))
+    await _start_delete_specific(client, query, channel_id, "suffix")
 
 
 # ══════════════════════════════════════════════════════════════════
