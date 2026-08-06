@@ -968,115 +968,130 @@ async def reCap(client, msg):
     if msg.edit_date or not msg.media:
         return
     chnl_id = msg.chat.id
-    default_caption = msg.caption or ""
-    file_name = None
-    file_size = None
-    for file_type in ("video", "audio", "document", "voice"):
-        obj = getattr(msg, file_type, None)
-        if obj:
-            file_name = getattr(obj, "file_name", None)
-            if not file_name and file_type == "voice":
-                file_name = "Voice Message"
-            elif not file_name:
-                file_name = "File"
-            file_name = file_name.replace("_", " ").replace(".", " ")
-            file_size = get_size(getattr(obj, "file_size", 0))
-            break
-    if not file_name:
-        return
-    cap_doc = await get_channel_cached(chnl_id)
-    # Fetch channel settings
-    cap_template = cap_doc.get("caption")
-    if not cap_template:
-        return
-    link_remover_on = bool(cap_doc.get("link_remover", False))
-    emoji_remover_on = bool(cap_doc.get("emoji_remover", False))
-    blocked_words_raw = cap_doc.get("block_words", "")
-    suffix = cap_doc.get("suffix", "") or ""
-    prefix = cap_doc.get("prefix", "") or ""
-    replace_raw = cap_doc.get("replace_words", None)
-    url_buttons = cap_doc.get("url_buttons", [])
-    # Keep original filename (with extension/dots) for smart metadata extraction
-    original_file_name = ""
-    for file_type in ("video", "audio", "document", "voice"):
-        obj = getattr(msg, file_type, None)
-        if obj:
-            original_file_name = getattr(obj, "file_name", None) or ""
-            break
-
-    # Extract info from caption + filename (use original for better metadata extraction)
-    combined_raw = f"{original_file_name} {default_caption}"
-    audio_lang_list = extract_audio_languages(combined_raw)
-    language = " + ".join(audio_lang_list) if audio_lang_list else ""
-    year = extract_year(default_caption) or extract_year(original_file_name) or ""
-    # Build caption
     try:
-        raw_file_name = normalize_series_name(file_name)
-        # Parse all metadata once – use original filename to preserve extension dots
-        file_info = parse_file_info(original_file_name or raw_file_name, default_caption)
-        smart_file_name = ""
-        if "{smart_file_name}" in cap_template:
-            smart_file_name = build_smart_filename(original_file_name or raw_file_name, default_caption)
-        new_caption = cap_template.format(
-            file_name=raw_file_name,
-            smart_file_name=smart_file_name,
-            file_size=file_size,
-            default_caption=default_caption,
-            language=language or file_info.get("audio", ""),
-            year=year or file_info.get("year", ""),
-            title=file_info.get("title", ""),
-            season=file_info.get("season", ""),
-            episode=file_info.get("episode", ""),
-            audio=file_info.get("audio", ""),
-            subtitle=file_info.get("subtitle", ""),
-            quality=file_info.get("quality", ""),
-            resolution=file_info.get("resolution", ""),
-            source=file_info.get("source", ""),
-            vcodec=file_info.get("vcodec", ""),
-            acodec=file_info.get("acodec", ""),
-            extension=file_info.get("extension", ""),
-            duration="",
-            empty="",
-        )
+        default_caption = msg.caption or ""
+        file_name = None
+        file_size = None
+        for file_type in ("video", "audio", "document", "voice"):
+            obj = getattr(msg, file_type, None)
+            if obj:
+                file_name = getattr(obj, "file_name", None)
+                if not file_name and file_type == "voice":
+                    file_name = "Voice Message"
+                elif not file_name:
+                    file_name = "File"
+                file_name = file_name.replace("_", " ").replace(".", " ")
+                file_size = get_size(getattr(obj, "file_size", 0))
+                break
+        if not file_name:
+            return
+        cap_doc = await get_channel_cached(chnl_id)
+        # Fetch channel settings
+        cap_template = cap_doc.get("caption")
+        if not cap_template:
+            return
+        link_remover_on = bool(cap_doc.get("link_remover", False))
+        emoji_remover_on = bool(cap_doc.get("emoji_remover", False))
+        blocked_words_raw = cap_doc.get("block_words", "")
+        suffix = cap_doc.get("suffix", "") or ""
+        prefix = cap_doc.get("prefix", "") or ""
+        replace_raw = cap_doc.get("replace_words", None)
+        url_buttons = cap_doc.get("url_buttons", [])
+        # Keep original filename (with extension/dots) for smart metadata extraction
+        original_file_name = ""
+        for file_type in ("video", "audio", "document", "voice"):
+            obj = getattr(msg, file_type, None)
+            if obj:
+                original_file_name = getattr(obj, "file_name", None) or ""
+                break
+
+        # Extract info from caption + filename (use original for better metadata extraction)
+        combined_raw = f"{original_file_name} {default_caption}"
+        audio_lang_list = extract_audio_languages(combined_raw)
+        language = " + ".join(audio_lang_list) if audio_lang_list else ""
+        year = extract_year(default_caption) or extract_year(original_file_name) or ""
+        # Build caption
+        try:
+            raw_file_name = normalize_series_name(file_name)
+            # Parse all metadata once – use original filename to preserve extension dots
+            file_info = parse_file_info(original_file_name or raw_file_name, default_caption)
+            smart_file_name = ""
+            if "{smart_file_name}" in cap_template:
+                smart_file_name = build_smart_filename(original_file_name or raw_file_name, default_caption)
+            new_caption = cap_template.format(
+                file_name=raw_file_name,
+                smart_file_name=smart_file_name,
+                file_size=file_size,
+                default_caption=default_caption,
+                language=language or file_info.get("audio", ""),
+                year=year or file_info.get("year", ""),
+                title=file_info.get("title", ""),
+                season=file_info.get("season", ""),
+                episode=file_info.get("episode", ""),
+                audio=file_info.get("audio", ""),
+                subtitle=file_info.get("subtitle", ""),
+                quality=file_info.get("quality", ""),
+                resolution=file_info.get("resolution", ""),
+                source=file_info.get("source", ""),
+                vcodec=file_info.get("vcodec", ""),
+                acodec=file_info.get("acodec", ""),
+                extension=file_info.get("extension", ""),
+                duration="",
+                empty="",
+            )
+        except Exception as e:
+            logger.warning("reCap: caption template formatting failed for chat=%s msg=%s: %s", chnl_id, msg.id, e)
+            new_caption = cap_template
+        if blocked_words_raw:
+            new_caption = apply_block_words(new_caption, blocked_words_raw)
+        if replace_raw:
+            replace_pairs = parse_replace_pairs(replace_raw)
+            if replace_pairs:
+                new_caption = apply_replacements(new_caption, replace_pairs)
+        if link_remover_on:
+            new_caption = strip_links_only(new_caption)
+        if prefix:
+            new_caption = f"{prefix}\n{new_caption}".strip()
+        if suffix:
+            new_caption = f"{new_caption}\n{suffix}".strip()
+        if emoji_remover_on:
+            new_caption = remove_emojis(new_caption)
+        new_caption = new_caption.strip()
+        if "<" in new_caption and ">" in new_caption:
+            new_caption = sanitize_caption_html(new_caption)
+
+        job = {
+            "chat_id": msg.chat.id,
+            "message_id": msg.id,
+            "caption": new_caption,
+            "default_caption": default_caption,
+            "url_buttons": url_buttons or [],
+            "user_id": msg.from_user.id if msg.from_user else None
+        }
+
+        # enqueue_caption is the ONE step that must never be silently
+        # lost — a transient Mongo hiccup during a burst of 100+ files
+        # used to mean this file's job was simply never created, with
+        # zero retry and zero trace, so the bot appeared to "skip"
+        # files at random. Retry with a short backoff before giving up.
+        last_err = None
+        for attempt in range(3):
+            try:
+                await enqueue_caption(job)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(0.5 * (attempt + 1))
+        if last_err is not None:
+            logger.error(
+                "reCap: FAILED to enqueue caption job for chat=%s msg=%s after retries: %s",
+                chnl_id, msg.id, last_err
+            )
     except Exception as e:
-        new_caption = cap_template
-    if blocked_words_raw:
-        new_caption = apply_block_words(new_caption, blocked_words_raw)
-    if replace_raw:
-        replace_pairs = parse_replace_pairs(replace_raw)
-        if replace_pairs:
-            new_caption = apply_replacements(new_caption, replace_pairs)
-    if link_remover_on:
-        new_caption = strip_links_only(new_caption)
-    if prefix:
-        # prefix/suffix are stored as a comma/newline-separated list of
-        # entries (same canonical format as block/replace words) — render
-        # each entry on its own line in the real caption rather than
-        # showing the raw comma-joined storage string.
-        prefix_display = "\n".join(_split_items(prefix))
-        new_caption = f"{prefix_display}\n{new_caption}".strip()
-    if suffix:
-        suffix_display = "\n".join(_split_items(suffix))
-        new_caption = f"{new_caption}\n{suffix_display}".strip()
-    if emoji_remover_on:
-        new_caption = remove_emojis(new_caption)
-    new_caption = new_caption.strip()
-    if "<" in new_caption and ">" in new_caption:
-        new_caption = sanitize_caption_html(new_caption)
-    reply_markup = None
-    if url_buttons:
-        reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row]
-            for row in url_buttons
-        ])
-    await enqueue_caption({
-        "chat_id": msg.chat.id,
-        "message_id": msg.id,
-        "caption": new_caption,
-        "default_caption": default_caption,
-        "url_buttons": url_buttons or [],
-        "user_id": msg.from_user.id if msg.from_user else None
-    })
+        # Never let one bad file silently kill the update — log it and
+        # move on so the rest of a large batch still gets processed.
+        logger.error("reCap: unhandled error for chat=%s msg=%s: %s", chnl_id, msg.id, e)
 
 # ═══════════════════════════════════════════════════════════════════
 #  Smart File Name Engine  –  professional media caption builder
@@ -1138,16 +1153,19 @@ LANG_CODE_MAP = {
 
 # ── Quality / Resolution ─────────────────────────────────────────
 # Listed longest-first so "2160p" is matched before "1080p" etc.
-QUALITY_LIST = [
+# ── Resolution (pure pixel resolution) ───────────────────────────
+# {resolution} placeholder — e.g. 720p, 1080p, 2160p, 4K, 8K …
+RESOLUTION_LIST = [
     "2160p", "1440p", "1080p", "900p", "720p",
     "576p", "540p", "480p", "360p", "240p", "216p", "144p",
     "8K", "4K UHD", "4K", "UHD",
 ]
 
-# ── Source / Rip type ────────────────────────────────────────────
+# ── Quality / Print-Rip type ──────────────────────────────────────
+# {quality} placeholder — e.g. WEB-DL, BluRay, HDCAM, Theater Print …
 # Ordered: more specific first so e.g. "WEB-DL" wins over bare "WEB",
 # "UHD BluRay" wins over "BluRay", etc.
-SOURCE_LIST = [
+QUALITY_LIST = [
     "UHD BluRay", "BluRay REMUX", "BDRemux", "Remux",
     "WEB-DL", "WEBRip", "WEB",
     "BluRay", "Blu-Ray", "BRRip", "BDRip",
@@ -1156,9 +1174,35 @@ SOURCE_LIST = [
     "Theater Print", "Theatrical Print", "TC Print",
     "PreDVD", "Pre-DVD", "PDVD",
     "R5", "TS", "TC", "SCR", "CAM",
-    "AMZN", "DSNP", "NF", "HMAX", "ATVP", "PCOK",
-    "SonyLIV", "ZEE5", "Hotstar", "JioCinema", "Voot", "ALTBalaji",
-    "MXPlayer", "ErosNow",
+]
+
+# ── Source (OTT / streaming platform origin) ──────────────────────
+# {source} placeholder — e.g. Amazon Prime, Netflix, Disney+ …
+# List of (pattern-to-match, display-name-to-show), longest/most
+# specific pattern first so e.g. "Disney+ Hotstar" wins over the bare
+# "Hotstar"/"Disney+" it also contains.
+SOURCE_LIST = [
+    ("Disney+ Hotstar", "Disney+ Hotstar"),
+    ("Amazon Prime", "Amazon Prime"), ("AmazonPrime", "Amazon Prime"),
+    ("Amazon", "Amazon Prime"), ("AMZN", "Amazon Prime"),
+    ("Netflix", "Netflix"), ("NF", "Netflix"),
+    ("DisneyPlus", "Disney+"), ("Disney+", "Disney+"), ("DSNP", "Disney+"),
+    ("Hotstar", "Hotstar"),
+    ("HBO Max", "HBO Max"), ("HBOMax", "HBO Max"), ("HMAX", "HBO Max"),
+    ("Apple TV+", "Apple TV+"), ("AppleTV+", "Apple TV+"), ("ATVP", "Apple TV+"),
+    ("Peacock", "Peacock"), ("PCOK", "Peacock"),
+    ("SonyLIV", "SonyLIV"),
+    ("ZEE5", "ZEE5"),
+    ("JioCinema", "JioCinema"),
+    ("Voot", "Voot"),
+    ("ALTBalaji", "ALTBalaji"), ("ALT Balaji", "ALTBalaji"),
+    ("MX Player", "MX Player"), ("MXPlayer", "MX Player"),
+    ("Eros Now", "Eros Now"), ("ErosNow", "Eros Now"),
+    ("Crunchyroll", "Crunchyroll"),
+    ("Paramount+", "Paramount+"), ("PMTP", "Paramount+"),
+    ("iTunes", "iTunes"),
+    ("Google Play", "Google Play"),
+    ("YouTube", "YouTube"),
 ]
 
 # ── Video codecs ─────────────────────────────────────────────────
@@ -1211,7 +1255,7 @@ _SUB_KEYWORD_RE = re.compile(rf'\b{_SUB_KEYWORD}\b', re.I)
 
 # Language chain immediately AFTER the keyword: "Subtitle[:-] <lang> [<sep> <lang> ...]"
 _LANG_CHAIN_AFTER_RE = re.compile(
-    rf'\A\s*[:\-]?\s*((?:{_LANG_ALT})(?:{_SEP}(?:{_LANG_ALT})){{0,3}})',
+    rf'\s*[:\-]?\s*((?:{_LANG_ALT})(?:{_SEP}(?:{_LANG_ALT})){{0,3}})',
     re.I
 )
 # Language chain immediately BEFORE the keyword: "<lang> [<sep> <lang> ...] Subtitle"
@@ -1287,6 +1331,7 @@ _COMPLETED_RE = re.compile(r'\bCompleted\b', re.I)
 _HD_RE        = re.compile(r'\b(?:HD|FHD|Full[\s.]*HD)\b', re.I)
 _HDR_RE       = re.compile(r'\b(?:HDR10\+|HDR10|HDR|Dolby[\s.]*Vision|DV)\b', re.I)
 _REMASTER_RE  = re.compile(r'\bRe[\s.\-]?master(?:ed)?\b', re.I)
+_EXTENDED_RE  = re.compile(r'\bExtended(?:[\s.\-]?(?:Cut|Edition|Version))?\b', re.I)
 _BITRATE_RE   = re.compile(r'\b(\d{2,4})[\s\-]?[Kk]bps\b')
 
 # ── Promotional / junk-noise stripper ─────────────────────────────
@@ -1333,15 +1378,16 @@ def _build_clean_raw(filename: str, caption: str) -> str:
 # no more manually duplicated noise lists to keep updated by hand.
 def _build_noise_pattern() -> str:
     tokens = []
-    tokens += [re.escape(q) for q in QUALITY_LIST]
-    tokens += [re.escape(s).replace(r'\ ', r'[\s.\-]*') for s in SOURCE_LIST]
+    tokens += [re.escape(r) for r in RESOLUTION_LIST]
+    tokens += [re.escape(q).replace(r'\ ', r'[\s.\-]*') for q in QUALITY_LIST]
+    tokens += [re.escape(pattern).replace(r'\ ', r'[\s.\-]*') for pattern, _ in SOURCE_LIST]
     tokens += [re.escape(c) for c in VIDEO_CODEC_LIST]
     tokens += [re.escape(c) for c in AUDIO_CODEC_LIST]
     tokens += [re.escape(l.lower()) for l in LANG_LIST]
     tokens += [
         r'e\.?subs?', r'h\.?subs?', r'm\.?subs?', r'subs?', r'subtitles?',
         r'dual[\s]?audio', r'multi[\s]?audio', r'multi',
-        r'uncut', r're[\s\-]?master(?:ed)?',
+        r'uncut', r're[\s\-]?master(?:ed)?', r'extended(?:[\s.\-]?(?:cut|edition|version))?',
         r'south', r'bollywood', r'hollywood',
         r'hdr10\+', r'hdr10', r'hdr', r'dolby[\s]?vision',
         r'\d{2,4}[\s\-]?kbps',
@@ -1631,26 +1677,35 @@ def extract_subtitle_tag(text: str) -> str:
     return ""
 
 # ── Individual placeholder extractors ────────────────────────────
+def extract_resolution(text: str) -> str:
+    """Returns the pixel resolution tag: 2160p, 1080p, 720p, 480p, 4K …"""
+    for r in RESOLUTION_LIST:
+        if re.search(rf'\b{re.escape(r)}\b', text, re.I):
+            return r
+    return ""
+
 def extract_quality(text: str) -> str:
-    """Returns resolution tag: 2160p, 1080p, 720p, 480p, 4K …"""
+    """
+    Returns the print/rip-quality tag — e.g. WEB-DL, BluRay, HDRip,
+    Theater Print, HDCAM … (NOT the pixel resolution — see
+    extract_resolution for that).
+    """
     for q in QUALITY_LIST:
-        if re.search(rf'\b{re.escape(q)}\b', text, re.I):
+        pattern = re.escape(q).replace(r'\ ', r'[\s.\-]*')
+        if re.search(rf'\b{pattern}\b', text, re.I):
             return q
     return ""
 
-def extract_resolution(text: str) -> str:
-    """Alias of extract_quality (for {resolution} placeholder)."""
-    return extract_quality(text)
-
 def extract_source(text: str) -> str:
     """
-    Returns the rip/source tag.
-    Examples: WEB-DL, BluRay, HDRip, Theater Print, AMZN, NF …
+    Returns the OTT/streaming-platform origin with a clean display name
+    — e.g. Amazon Prime, Netflix, Disney+, HBO Max … (NOT the rip/print
+    type — see extract_quality for that).
     """
-    for s in SOURCE_LIST:
-        pattern = re.escape(s).replace(r'\ ', r'[\s.\-]*')
-        if re.search(rf'\b{pattern}\b', text, re.I):
-            return s
+    for pattern, display in SOURCE_LIST:
+        esc = re.escape(pattern).replace(r'\ ', r'[\s.\-]*')
+        if re.search(rf'\b{esc}\b', text, re.I):
+            return display
     return ""
 
 def extract_video_codec(text: str) -> str:
@@ -1746,28 +1801,24 @@ def detect_media_type(text: str) -> str:
     Anime signals:  'Anime' keyword — checked FIRST, since anime also
                     commonly uses S01E07-style numbering and would
                     otherwise get misread as a generic "series".
+
+    NOTE: season/episode detection here delegates to
+    extract_season_episode() rather than re-implementing its own regex
+    checks — that function already correctly handles every real-world
+    form (contiguous "S01E02", spaced "S01 E02", multi-episode
+    "S01E07E08", "Season 4 Episode 5", Ep-only, bare season-only …).
+    A previous, separate set of checks here used \\b word-boundary
+    assertions that silently failed on the most common contiguous
+    "S01E02" filenames (no boundary exists between two word
+    characters like "1" and "E"), causing those files to be
+    misclassified as "movie" and lose their season/episode tags.
     """
-    # Explicit "Anime" keyword wins immediately — stronger, more
-    # specific signal than the generic S/E numbering heuristics below.
     if _ANIME_RE.search(text):
         return "anime"
-    # Explicit series label wins immediately
     if _SERIES_RE.search(text):
         return "series"
-    # Standard SxxExx or S01 E02 patterns
-    if re.search(r'\bS\d{1,3}\s*E\d{1,3}\b', text, re.I):
-        return "series"
-    if re.search(r'\bS\d{1,3}\b', text, re.I) and re.search(r'\bE\d{1,3}\b', text, re.I):
-        return "series"
-    # Ep-only (no season number) – batch or standalone episode
-    if re.search(r'\bEp?(?:isode)?\.?\s*\d{1,3}\b', text, re.I):
-        return "series"
-    # Season keyword without S-prefix
-    if re.search(r'\bSeason\s*\d{1,3}\b', text, re.I):
-        return "series"
-    # Bare season marker only, no episode marker anywhere (e.g.
-    # "Show.Name.S03.Complete.1080p") — still a series, whole season.
-    if re.search(r'\bS\d{1,3}\b', text, re.I):
+    season, episode, _season_tag = extract_season_episode(text)
+    if season or episode:
         return "series"
     return "movie"
 
@@ -1785,7 +1836,8 @@ def parse_file_info(filename: str, caption: str) -> dict:
     season, episode, stag = extract_season_episode(raw)
     audio_langs          = extract_audio_languages(raw)
     subtitle             = extract_subtitle_tag(raw)
-    quality              = extract_quality(raw)
+    resolution            = extract_resolution(raw)
+    quality               = extract_quality(raw)
     source                = extract_source(raw)
     vcodec                = extract_video_codec(raw)
     acodec                = extract_audio_codec(raw)
@@ -1802,9 +1854,9 @@ def parse_file_info(filename: str, caption: str) -> dict:
         "audio":       audio_str,
         "audio_langs": audio_langs,
         "subtitle":    subtitle,
-        "quality":     quality,
-        "resolution":  quality,       # alias
-        "source":      source,
+        "quality":     quality,        # print/rip type   e.g. WEB-DL, BluRay, HDCAM
+        "resolution":  resolution,     # pixel resolution e.g. 720p, 1080p, 4K
+        "source":      source,         # OTT platform     e.g. Amazon Prime, Netflix
         "vcodec":      vcodec,
         "acodec":      acodec,
         "bitrate":     bitrate,
@@ -1819,17 +1871,22 @@ def build_smart_filename(filename: str, caption: str) -> str:
     Output order:
       Title  [S## E##/Ep.##-##]  [Combined Episodes / Complete Season]  (Year)
       (Lang1 [Codec-Bitrate] + Lang2)  [Dual/Multi Audio]
-      [UnCut]  [Remastered]  [South / Bollywood / Hollywood]  [MediaLabel]
-      [HD/FHD]  [HDR]  [Source]  [VCodec]  Quality
+      [UnCut]  [Remastered]  [Extended]  [South / Bollywood / Hollywood]  [MediaLabel]
+      [HD/FHD]  [HDR]  [Source]  [VCodec]  [Quality]  [Resolution]
       [ESub/HSub/MSub]  [.ext]
 
+    NOTE the three distinct tags:
+      quality    = print/rip type   e.g. WEB-DL, BluRay, HDCAM, Theater Print
+      resolution = pixel resolution e.g. 480p, 720p, 1080p, 4K
+      source     = OTT/streaming platform e.g. Amazon Prime, Netflix, Disney+
+
     Examples:
-      Court - State Vs A Nobody (2025) (Hindi DD5.1-224Kbps + Telugu) Dual Audio UnCut South Movie HD 1080p ESub.mkv
+      Court - State Vs A Nobody (2025) (Hindi DD5.1-224Kbps + Telugu) Dual Audio UnCut South Movie HD WEB-DL 1080p ESub.mkv
       Sapne Vs Everyone S01 (Ep.01-05) (Combined Episodes) (2023) Hindi Web Series HEVC 480p ESub.mkv
       Loki S01 E02 Hindi Web Series HEVC 480p ESub.mkv
       Salaar Part 1 Ceasefire (2024) (Hindi + Telugu) Dual Audio UnCut South Movie HEVC 720p ESub.mkv
       My Hero Academia S06 E07 (2023) Japanese + English Anime HEVC 1080p ESub.mkv
-      Panchayat S03 (Complete Season) (2024) Hindi Web Series WEB-DL 1080p ESub.mkv
+      Panchayat S03 (Complete Season) (2024) Hindi Web Series Netflix WEB-DL 1080p ESub.mkv
     """
     raw         = _build_clean_raw(filename, caption)
     info        = parse_file_info(filename, caption)
@@ -1882,6 +1939,11 @@ def build_smart_filename(filename: str, caption: str) -> str:
     if _REMASTER_RE.search(raw):
         parts.append("Remastered")
 
+    # ── 8b. Extended Cut/Edition ───────────────────────────────────
+    ext_m = _EXTENDED_RE.search(raw)
+    if ext_m:
+        parts.append(re.sub(r'[\s.\-]+', ' ', ext_m.group(0).strip()))
+
     # ── 9. Regional / industry label ─────────────────────────────
     if media_type == "movie":
         if _SOUTH_RE.search(raw):
@@ -1899,8 +1961,16 @@ def build_smart_filename(filename: str, caption: str) -> str:
         series_label = "Web Series"
         s_m = _SERIES_RE.search(raw)
         if s_m:
-            # Preserve the exact label from the source text
-            series_label = re.sub(r'[\s.]+', ' ', s_m.group(0).strip()).title()
+            # Preserve the exact label from the source text, but make sure
+            # a contiguous form like "WebSeries" (no space/dot in the
+            # original) still renders with a space — otherwise .title()
+            # would mangle it into "Webseries" (lowercasing the inner "S").
+            label = re.sub(r'[\s.]+', ' ', s_m.group(0).strip())
+            label = re.sub(
+                r'\b(Web|TV|Mini|OTT|Limited|Drama|Short)(Series)\b',
+                r'\1 \2', label, flags=re.I
+            )
+            series_label = label.title()
         if completed:
             parts.append(f"Completed {series_label}")
         else:
@@ -1931,7 +2001,7 @@ def build_smart_filename(filename: str, caption: str) -> str:
     if hdr_labels:
         parts.append(" ".join(hdr_labels))
 
-    # ── 14. Source / Rip type ────────────────────────────────────
+    # ── 14. Source (OTT / streaming platform) ─────────────────────
     if info["source"]:
         parts.append(info["source"])
 
@@ -1939,9 +2009,13 @@ def build_smart_filename(filename: str, caption: str) -> str:
     if info["vcodec"]:
         parts.append(info["vcodec"])
 
-    # ── 16. Resolution / Quality ─────────────────────────────────
+    # ── 16. Quality (print / rip type, e.g. WEB-DL, BluRay) ───────
     if info["quality"]:
         parts.append(info["quality"])
+
+    # ── 16b. Resolution (pixel resolution, e.g. 1080p, 4K) ────────
+    if info["resolution"]:
+        parts.append(info["resolution"])
 
     # ── 17. Subtitle tag ─────────────────────────────────────────
     if info["subtitle"]:
@@ -2105,6 +2179,15 @@ def sanitize_dump_caption(text: str) -> str:
     return text.strip()
 
 def apply_block_words(caption_html: str, raw_blocked: str) -> str:
+    """
+    Remove each blocked word/phrase from the caption.
+
+    Only the word itself — plus at most ONE directly-adjacent space, so
+    removing a mid-sentence word doesn't leave a double space right at
+    that spot — is touched. Line breaks, blank lines, and spacing
+    everywhere else in the caption are left exactly as the admin wrote
+    them; this function never reformats the caption as a whole.
+    """
     if not caption_html or not raw_blocked:
         return caption_html
     plain = caption_html
@@ -2114,11 +2197,15 @@ def apply_block_words(caption_html: str, raw_blocked: str) -> str:
         if item.strip()
     ]
     for item in blocked_items:
-        plain = plain.replace(item, "")
-    plain = "\n".join(line.rstrip() for line in plain.splitlines())
-    plain = "\n".join(line for line in plain.splitlines() if line.strip())
-    plain = re.sub(r"[ \t]{2,}", " ", plain)
-    return plain.strip()
+        esc = re.escape(item)
+        # 1) word + one trailing space   2) one leading space + word
+        # 3) whatever's left over (start/end of line, punctuation-
+        #    adjacent, etc.) — each pass only touches the removed word's
+        #    own immediate neighbourhood, never text elsewhere.
+        plain = re.sub(esc + r'[ \t]', '', plain, flags=re.IGNORECASE)
+        plain = re.sub(r'[ \t]' + esc, '', plain, flags=re.IGNORECASE)
+        plain = re.sub(esc, '', plain, flags=re.IGNORECASE)
+    return plain
 
 def parse_replace_pairs(raw):
     if not raw:
@@ -2138,6 +2225,12 @@ def parse_replace_pairs(raw):
     return pairs
 
 def apply_replacements(text: str, pairs: List[Tuple[str, str]]) -> str:
+    """
+    Replace each old_word with new_word, in place, at every position it
+    occurs — the surrounding text never moves or reflows. Only the
+    matched word itself is touched; nothing else about the caption's
+    formatting, spacing, or line structure is altered.
+    """
     if not pairs or not text:
         return text
     new_text = text
@@ -2146,12 +2239,12 @@ def apply_replacements(text: str, pairs: List[Tuple[str, str]]) -> str:
             continue
         try:
             pattern = re.compile(re.escape(old), flags=re.IGNORECASE)
-            new_text = pattern.sub(new, new_text)
-            if re.search(re.escape(old), new_text, flags=re.IGNORECASE):
-                new_text = re.sub(re.escape(old), new, new_text, flags=re.IGNORECASE)
+            # lambda replacement (not a plain string) so a replacement
+            # word containing e.g. "\1" is never misread as a regex
+            # backreference.
+            new_text = pattern.sub(lambda m, _new=new: _new, new_text)
         except re.error:
             new_text = new_text.replace(old, new)
-    new_text = re.sub(r'[ 	]+', ' ', new_text).strip()
     return new_text
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2175,8 +2268,6 @@ def apply_replacements(text: str, pairs: List[Tuple[str, str]]) -> str:
 WORD_KIND_LABELS = {
     "block":   "blocked word(s)",
     "replace": "replace-word pair(s)",
-    "prefix":  "prefix entrie(s)",
-    "suffix":  "suffix entrie(s)",
 }
 
 def _split_items(raw) -> List[str]:
@@ -2294,12 +2385,6 @@ async def _get_kind_raw(channel_id: int, kind: str) -> str:
         return await get_block_words(channel_id)
     if kind == "replace":
         return await get_replace_words(channel_id) or ""
-    if kind == "prefix":
-        _, prefix = await get_suffix_prefix(channel_id)
-        return prefix or ""
-    if kind == "suffix":
-        suffix, _ = await get_suffix_prefix(channel_id)
-        return suffix or ""
     return ""
 
 async def _save_kind_raw(channel_id: int, kind: str, raw: str):
@@ -2308,10 +2393,6 @@ async def _save_kind_raw(channel_id: int, kind: str, raw: str):
         await set_block_words(channel_id, raw)
     elif kind == "replace":
         await set_replace_words(channel_id, raw)
-    elif kind == "prefix":
-        await set_prefix(channel_id, raw)
-    elif kind == "suffix":
-        await set_suffix(channel_id, raw)
 
 
 # is a catch-all for plain-text session input (captions, block words,
@@ -2465,6 +2546,9 @@ async def capture_user_input(client, message):
         return
 
     # ---------- PREFIX ----------
+    # NOTE: overwrites (does not append) — matches block/replace words'
+    # OLD behaviour intentionally, per explicit request. Use "Del Prefix"
+    # to clear it first if you want to start over.
     if user_id in bot_data.get("prefix_set", {}):
         if not text.strip():
             return
@@ -2472,30 +2556,17 @@ async def capture_user_input(client, message):
         channel_id   = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
 
-        ok, warn, cleaned = validate_word_input("prefix", text.strip())
-        if not ok:
-            bot_data.setdefault("prefix_set", {})[user_id] = session
-            await message.reply_text(warn)
-            return
-
-        _, old_raw = await get_suffix_prefix(channel_id)
-        merged, added, dupes = merge_items(old_raw, cleaned)
-        await set_prefix(channel_id, merged)
+        await set_prefix(channel_id, text.strip())
 
         try:
             await client.delete_messages(user_id, message.id)
         except Exception:
             pass
 
-        lines = ["✅ <b>Prefix updated!</b>"]
-        if added:
-            lines.append(f"➕ Added: {', '.join(added)}")
-        if dupes:
-            lines.append(f"ℹ️ Already set (skipped): {', '.join(dupes)}")
         await client.edit_message_text(
             chat_id=user_id,
             message_id=instr_msg_id,
-            text="\n".join(lines),
+            text="✅ <b>Prefix updated!</b>",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("↩ Back", callback_data=f"back_to_suffixprefix_{channel_id}")]]
             ),
@@ -2503,6 +2574,7 @@ async def capture_user_input(client, message):
         return
 
     # ---------- SUFFIX ----------
+    # NOTE: overwrites (does not append) — see PREFIX note above.
     if user_id in bot_data.get("suffix_set", {}):
         if not text.strip():
             return
@@ -2510,37 +2582,24 @@ async def capture_user_input(client, message):
         channel_id   = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
 
-        ok, warn, cleaned = validate_word_input("suffix", text.strip())
-        if not ok:
-            bot_data.setdefault("suffix_set", {})[user_id] = session
-            await message.reply_text(warn)
-            return
-
-        old_raw, _ = await get_suffix_prefix(channel_id)
-        merged, added, dupes = merge_items(old_raw, cleaned)
-        await set_suffix(channel_id, merged)
+        await set_suffix(channel_id, text.strip())
 
         try:
             await client.delete_messages(user_id, message.id)
         except Exception:
             pass
 
-        lines = ["✅ <b>Suffix updated!</b>"]
-        if added:
-            lines.append(f"➕ Added: {', '.join(added)}")
-        if dupes:
-            lines.append(f"ℹ️ Already set (skipped): {', '.join(dupes)}")
         await client.edit_message_text(
             chat_id=user_id,
             message_id=instr_msg_id,
-            text="\n".join(lines),
+            text="✅ <b>Suffix updated!</b>",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("↩ Back", callback_data=f"back_to_suffixprefix_{channel_id}")]]
             ),
         )
         return
 
-    # ---------- DELETE SPECIFIC (block / replace / prefix / suffix) ----------
+    # ---------- DELETE SPECIFIC (block / replace words only) ----------
     # Shared by all four settings: the user was shown their current items
     # (comma-separated, copy-pasteable) and sends back the exact word(s)/
     # phrase(s) they want removed — multiple at once, comma-separated.
@@ -2573,8 +2632,6 @@ async def capture_user_input(client, message):
         back_cb = {
             "block":   f"back_to_blockwords_{channel_id}",
             "replace": f"back_to_replace_{channel_id}",
-            "prefix":  f"back_to_suffixprefix_{channel_id}",
-            "suffix":  f"back_to_suffixprefix_{channel_id}",
         }.get(kind, f"chinfo_{channel_id}")
 
         await client.edit_message_text(
@@ -2595,20 +2652,41 @@ async def capture_user_input(client, message):
         channel_id   = session["channel_id"]
         instr_msg_id = session["instr_msg_id"]
         rows  = []
-        lines = text.strip().splitlines()
+        # Mobile keyboards frequently auto-substitute straight quotes (")
+        # for curly/smart ones (“ ” or ‘ ’) as you type, which silently
+        # broke the old strict `"([^"]+)"` matcher — the button would
+        # just never save with no clear explanation. Normalize both
+        # curly-quote styles back to straight quotes before parsing.
+        normalized = (
+            text.strip()
+            .replace("\u201c", '"').replace("\u201d", '"')
+            .replace("\u2018", "'").replace("\u2019", "'")
+        )
+        lines = normalized.splitlines()
         for line in lines:
             row   = []
             parts = [p.strip() for p in line.split("|") if p.strip()]
             for part in parts:
                 matched = re.findall(r'"([^"]+)"', part)
                 if len(matched) == 2:
-                    row.append({"text": matched[0], "url": matched[1]})
+                    btn_text, btn_url = matched[0].strip(), matched[1].strip()
+                    # Telegram rejects button URLs with no scheme
+                    # (e.g. "example.com") — auto-prepend https:// so a
+                    # bare domain still works instead of silently
+                    # failing to send once the caption is edited.
+                    if btn_text and btn_url:
+                        if not re.match(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://', btn_url) and not btn_url.startswith("tg://") and not btn_url.startswith("mailto:"):
+                            btn_url = f"https://{btn_url}"
+                        row.append({"text": btn_text, "url": btn_url})
             if row:
                 rows.append(row)
         if not rows:
             # Put session back so user can try again without re-navigating
             bot_data.setdefault("url_set", {})[user_id] = session
-            await message.reply_text("❌ Invalid format. Please try again.")
+            await message.reply_text(
+                "❌ Invalid format. Each button needs a text and a URL in quotes:\n"
+                '<code>"Button Text" "https://example.com"</code>'
+            )
             return
         await set_url_buttons(channel_id, rows)
         try:
