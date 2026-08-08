@@ -302,46 +302,59 @@ async def remove_dump_cmd(client, message):
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("id"))
 async def dump_origin_id_cmd(client, message):
     """
-    Reply /id to a message forwarded FROM the CP_CH dump channel (or to a
-    message inside CP_CH itself) to find out which channel that file
-    originally came from — so it can be passed straight to /dump_skip.
+    Reply /id to a message forwarded FROM a dump channel (CP_CH, or a
+    channel an admin redirected via /dump_change) -- or to a message
+    inside that dump channel itself -- to find out which channel that
+    file originally came from, so it can be passed straight to
+    /dump_skip or /dump_change.
     """
     reply = message.reply_to_message
     if not reply:
         return await message.reply_text(
-            "❌ <b>Usage:</b> Forward a file from the dump channel "
+            "❌ <b>Usage:</b> Forward a file from a dump channel "
             "(or open it inside the dump channel) and reply to it with /id.",
             parse_mode=ParseMode.HTML,
         )
 
-    cp_ch_msg_id = None
-    if reply.forward_from_chat and reply.forward_from_chat.id == CP_CH:
-        cp_ch_msg_id = reply.forward_from_message_id
-    elif reply.chat and reply.chat.id == CP_CH:
-        cp_ch_msg_id = reply.id
+    dest_chat_id = None
+    dest_msg_id = None
+    if reply.forward_from_chat:
+        dest_chat_id = reply.forward_from_chat.id
+        dest_msg_id = reply.forward_from_message_id
+    elif reply.chat:
+        dest_chat_id = reply.chat.id
+        dest_msg_id = reply.id
 
-    if not cp_ch_msg_id:
+    if not dest_chat_id or not dest_msg_id:
         return await message.reply_text(
-            "❌ That message isn't a file forwarded from the dump channel."
+            "❌ That message isn't a file forwarded from a dump channel."
         )
 
-    origin = await get_dump_origin(cp_ch_msg_id)
+    origin = await get_dump_origin(dest_chat_id, dest_msg_id)
     if not origin:
         return await message.reply_text(
             "❌ No origin info found for this file "
-            "(it may predate this tracking feature)."
+            "(it may predate this tracking feature, or came from a chat "
+            "that isn't a registered dump destination)."
         )
 
     origin_channel_id = origin["origin_channel_id"]
     title = await get_channel_title_cached(origin_channel_id)
     skipped = await is_dump_skip(origin_channel_id)
+    custom_dest = await get_dump_destination(origin_channel_id)
+    dest_text = (
+        f"{await get_channel_title_cached(custom_dest)} (<code>{custom_dest}</code>)"
+        if custom_dest else "Default (CP_CH)"
+    )
 
     await message.reply_text(
         "📡 <b>Origin Channel Found</b>\n\n"
         f"📢 <b>Channel:</b> {title}\n"
         f"🆔 <b>Channel ID:</b> <code>{origin_channel_id}</code>\n"
-        f"🗂 <b>Dump skip:</b> {'✅ Enabled' if skipped else '❌ Not enabled'}\n\n"
-        f"Use <code>/dump_skip {origin_channel_id}</code> to stop dumping files from this channel.",
+        f"🗂 <b>Dump skip:</b> {'✅ Enabled' if skipped else '❌ Not enabled'}\n"
+        f"📥 <b>Dump destination:</b> {dest_text}\n\n"
+        f"Use <code>/dump_skip {origin_channel_id}</code> to stop dumping files from this channel.\n"
+        f"Use <code>/dump_change {origin_channel_id}</code> to redirect its dump destination.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -379,7 +392,8 @@ async def admin_help(client, message):
 
         "🗃 <b>DUMP CHANNEL CONTROL</b>\n"
         "┌ /dump_skip <code>-100xxx</code> — Skip dump for a channel\n"
-        "└ /remove_dump <code>-100xxx</code> — Remove dump skip for a channel\n\n"
+        "├ /remove_dump <code>-100xxx</code> — Remove dump skip for a channel\n"
+        "└ /dump_change <code>-100xxx</code> — Redirect a channel's dump to another channel\n\n"
 
         "🗄 <b>DATABASE</b>\n"
         "└ /reset — ⚠️ Wipe ALL users, channels &amp; settings from DB\n\n"
@@ -902,14 +916,33 @@ async def caption_worker(client: Client, worker_id: int = 0):
             )
             if not await is_dump_skip(ch):
                 try:
-                    dump_caption = sanitize_dump_caption(job.get("default_caption") or "")
-                    dump_sent = await client.copy_message(
-                        chat_id=CP_CH,
-                        from_chat_id=ch,
-                        message_id=job["message_id"],
-                        caption=dump_caption,
-                    )
-                    await save_dump_origin(dump_sent.id, ch, job["message_id"])
+                    dump_dest = await get_dump_destination(ch)
+                    if dump_dest:
+                        # Admin redirected this channel's dump elsewhere via
+                        # /dump_change: mirror the actual smart-built caption
+                        # (with its URL buttons) that was just applied to the
+                        # file, instead of the sanitized default-caption copy
+                        # used for the default CP_CH dump below.
+                        dump_sent = await client.copy_message(
+                            chat_id=dump_dest,
+                            from_chat_id=ch,
+                            message_id=job["message_id"],
+                            caption=job["caption"],
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row] for row in job.get("url_buttons", [])])
+                                          if job.get("url_buttons") else None
+                                         )
+                        )
+                        await save_dump_origin(dump_dest, dump_sent.id, ch, job["message_id"])
+                    else:
+                        dump_caption = sanitize_dump_caption(job.get("default_caption") or "")
+                        dump_sent = await client.copy_message(
+                            chat_id=CP_CH,
+                            from_chat_id=ch,
+                            message_id=job["message_id"],
+                            caption=dump_caption,
+                        )
+                        await save_dump_origin(CP_CH, dump_sent.id, ch, job["message_id"])
                 except Exception as e:
                     logger.debug(f"[CAP_WORKER_{worker_id}] dump-copy skipped ch={ch} msg={job['message_id']}: {e}")
             await mark_done(job["_id"])
