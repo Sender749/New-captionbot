@@ -44,14 +44,12 @@ async def _show_channel_settings(client, query, channel_id: int):
     if not caption:
         caption_preview = "❌ No caption set for this channel."
     else:
-        prefix_display = "\n".join(_split_items(prefix))
-        suffix_display = "\n".join(_split_items(suffix))
-        if prefix_display and suffix_display:
-            caption_preview = f"{prefix_display}\n{caption}\n{suffix_display}"
-        elif prefix_display:
-            caption_preview = f"{prefix_display}\n{caption}"
-        elif suffix_display:
-            caption_preview = f"{caption}\n{suffix_display}"
+        if prefix and suffix:
+            caption_preview = f"{prefix}\n{caption}\n{suffix}"
+        elif prefix:
+            caption_preview = f"{prefix}\n{caption}"
+        elif suffix:
+            caption_preview = f"{caption}\n{suffix}"
         else:
             caption_preview = caption
 
@@ -152,21 +150,17 @@ async def _show_suffixprefix_menu(client, query, channel_id: int):
     chat_title = cap_doc.get("_title", str(channel_id))
     suffix     = cap_doc.get("suffix", "")
     prefix     = cap_doc.get("prefix", "")
-    suffix_text = format_items_preview(suffix) or "None"
-    prefix_text = format_items_preview(prefix) or "None"
     buttons = [
         [InlineKeyboardButton("Set Suffix", callback_data=f"set_suf_{channel_id}"),
-         InlineKeyboardButton("Del All Suffix", callback_data=f"del_suf_{channel_id}")],
-        [InlineKeyboardButton("🗑 Delete Specific Suffix", callback_data=f"delspecific_suffix_{channel_id}")],
+         InlineKeyboardButton("Del Suffix", callback_data=f"del_suf_{channel_id}")],
         [InlineKeyboardButton("Set Prefix", callback_data=f"set_pre_{channel_id}"),
-         InlineKeyboardButton("Del All Prefix", callback_data=f"del_pre_{channel_id}")],
-        [InlineKeyboardButton("🗑 Delete Specific Prefix", callback_data=f"delspecific_prefix_{channel_id}")],
+         InlineKeyboardButton("Del Prefix", callback_data=f"del_pre_{channel_id}")],
         [InlineKeyboardButton("↩ Back",     callback_data=f"chinfo_{channel_id}")],
     ]
     text = (
         f"📌 Channel: {chat_title}\n\n"
-        f"Current Suffix: {suffix_text}\n"
-        f"Current Prefix: {prefix_text}"
+        f"Current Suffix: {suffix or 'None'}\n"
+        f"Current Prefix: {prefix or 'None'}"
     )
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -404,11 +398,7 @@ async def set_suffix_message(client, query):
                 "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         bot_data.get(key, {}).pop(user_id, None)
     instr = await query.message.edit_text(
-        text=(
-            "🖋️ Send the suffix text you want to add to your captions.\n"
-            "Separate multiple entries with a comma.\n"
-            "These will be <b>added</b> to any suffix already set."
-        ),
+        text="🖋️ Send the suffix text you want to add to your captions.",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("↩ Back", callback_data=f"set_suffixprefix_{channel_id}")]]
         ),
@@ -428,11 +418,7 @@ async def set_prefix_message(client, query):
                 "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         bot_data.get(key, {}).pop(user_id, None)
     instr = await query.message.edit_text(
-        text=(
-            "✍️ Send the prefix text you want to add to your captions.\n"
-            "Separate multiple entries with a comma.\n"
-            "These will be <b>added</b> to any prefix already set."
-        ),
+        text="✍️ Send the prefix text you want to add to your captions.",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("↩ Back", callback_data=f"set_suffixprefix_{channel_id}")]]
         ),
@@ -638,7 +624,7 @@ async def toggle_emoji_remover(client, query):
 
 
 # ══════════════════════════════════════════════════════════════════
-#  DELETE SPECIFIC ITEM  (block words / replace words / prefix / suffix)
+#  DELETE SPECIFIC ITEM  (block words / replace words only)
 #
 #  Shows the user their currently-saved items in a copy-pasteable,
 #  comma-separated <code> block and waits for them to send back the
@@ -648,8 +634,6 @@ async def toggle_emoji_remover(client, query):
 _DELETE_SPECIFIC_BACK_CB = {
     "block":   lambda cid: f"setwords_{cid}",
     "replace": lambda cid: f"setreplace_{cid}",
-    "prefix":  lambda cid: f"set_suffixprefix_{cid}",
-    "suffix":  lambda cid: f"set_suffixprefix_{cid}",
 }
 
 async def _start_delete_specific(client, query, channel_id: int, kind: str):
@@ -701,20 +685,6 @@ async def delete_specific_replace_words(client, query):
     await query.answer()
     channel_id = int(query.matches[0].group(1))
     await _start_delete_specific(client, query, channel_id, "replace")
-
-
-@Client.on_callback_query(filters.regex(r"^delspecific_prefix_(-?\d+)$"))
-async def delete_specific_prefix(client, query):
-    await query.answer()
-    channel_id = int(query.matches[0].group(1))
-    await _start_delete_specific(client, query, channel_id, "prefix")
-
-
-@Client.on_callback_query(filters.regex(r"^delspecific_suffix_(-?\d+)$"))
-async def delete_specific_suffix(client, query):
-    await query.answer()
-    channel_id = int(query.matches[0].group(1))
-    await _start_delete_specific(client, query, channel_id, "suffix")
 
 
 # ══════════════════════════════════════════════════════════════════
