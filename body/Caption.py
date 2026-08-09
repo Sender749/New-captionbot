@@ -1001,6 +1001,7 @@ async def reCap(client, msg):
     if msg.edit_date or not msg.media:
         return
     chnl_id = msg.chat.id
+    logger.info(f"[RECAP] media received ch={chnl_id} msg={msg.id}")
     try:
         default_caption = msg.caption or ""
         file_name = None
@@ -1017,11 +1018,20 @@ async def reCap(client, msg):
                 file_size = get_size(getattr(obj, "file_size", 0))
                 break
         if not file_name:
+            logger.warning(
+                f"[RECAP] ch={chnl_id} msg={msg.id}: no video/audio/document/voice "
+                f"object found on this media message -- skipped"
+            )
             return
         cap_doc = await get_channel_cached(chnl_id)
         # Fetch channel settings
         cap_template = cap_doc.get("caption")
         if not cap_template:
+            logger.warning(
+                f"[RECAP] ch={chnl_id} msg={msg.id}: no caption template saved for "
+                f"this channel (cap_doc keys={list(cap_doc.keys())}) -- skipped. "
+                f"Set one via /settings in this channel first."
+            )
             return
         link_remover_on = bool(cap_doc.get("link_remover", False))
         emoji_remover_on = bool(cap_doc.get("emoji_remover", False))
@@ -1121,6 +1131,8 @@ async def reCap(client, msg):
                 "reCap: FAILED to enqueue caption job for chat=%s msg=%s after retries: %s",
                 chnl_id, msg.id, last_err
             )
+        else:
+            logger.info(f"[RECAP] ch={chnl_id} msg={msg.id}: enqueued for editing")
     except Exception as e:
         # Never let one bad file silently kill the update — log it and
         # move on so the rest of a large batch still gets processed.
