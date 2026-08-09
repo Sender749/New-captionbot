@@ -121,11 +121,27 @@ async def ensure_dump_origin_indexes():
     redirected to a different destination channel per source channel
     (see set_dump_destination), the same message id can legitimately show
     up in two different destination chats -- so the key must include the
-    destination chat id too. If an older deployment still has the legacy
-    single-field unique index, it's dropped first: left in place it would
-    silently break every insert after the first "cp_ch_msg_id"-less
-    document (Mongo unique indexes treat a missing field as null, and
-    only one null is allowed).
+    destination chat id too.
+
+    Two migration hazards had to be handled explicitly, both of which
+    would otherwise crash the bot on EVERY startup (index build throws ->
+    uncaught -> Bot().run() dies -> supervisord respawns -> same crash
+    forever):
+
+    1. A leftover legacy single-field unique index on cp_ch_msg_id is
+       dropped first.
+    2. Any pre-existing documents from before this feature only have
+       cp_ch_msg_id, not dest_chat_id/dest_msg_id. Building a UNIQUE
+       index on the new fields while 2+ such documents exist fails
+       immediately: Mongo treats a missing field as null, and a unique
+       index only tolerates a single null pair. Those old documents are
+       migrated (or dropped if unmigratable) to the new schema before
+       the new index is built.
+
+    The whole function is defensive on top of that: if anything here
+    still goes wrong, it's logged and swallowed rather than allowed to
+    take the entire bot down. Dump-origin tracking is a "nice to have"
+    for /id lookups, not something worth crash-looping the bot over.
     """
     try:
         existing = await dump_origin_map.index_information()
@@ -136,17 +152,49 @@ async def ensure_dump_origin_indexes():
     except Exception as e:
         logger.warning(f"[DUMP_ORIGIN] legacy index cleanup skipped: {e}")
 
-    await dump_origin_map.create_index(
-        [("dest_chat_id", 1), ("dest_msg_id", 1)],
-        unique=True,
-        background=True,
-    )
-    # Auto-expire mappings after 60 days so this collection doesn't grow forever.
-    await dump_origin_map.create_index(
-        [("ts", 1)],
-        expireAfterSeconds=60 * 24 * 3600,
-        background=True,
-    )
+    try:
+        migrated = 0
+        cursor = dump_origin_map.find(
+            {"cp_ch_msg_id": {"$exists": True}, "dest_msg_id": {"$exists": False}}
+        )
+        async for doc in cursor:
+            await dump_origin_map.update_one(
+                {"_id": doc["_id"]},
+                {
+                    "$set": {"dest_chat_id": CP_CH, "dest_msg_id": doc["cp_ch_msg_id"]},
+                    "$unset": {"cp_ch_msg_id": ""},
+                },
+            )
+            migrated += 1
+        if migrated:
+            logger.info(f"[DUMP_ORIGIN] migrated {migrated} legacy document(s) to the new schema")
+
+        # Anything still missing the new fields (corrupt/unmigratable) would
+        # still collide on the unique index -- it's disposable tracking
+        # data, so just drop it instead of blocking startup over it.
+        stale = await dump_origin_map.delete_many({"dest_msg_id": {"$exists": False}})
+        if stale.deleted_count:
+            logger.info(f"[DUMP_ORIGIN] dropped {stale.deleted_count} unmigratable legacy document(s)")
+    except Exception as e:
+        logger.warning(f"[DUMP_ORIGIN] legacy document migration skipped: {e}")
+
+    try:
+        await dump_origin_map.create_index(
+            [("dest_chat_id", 1), ("dest_msg_id", 1)],
+            unique=True,
+            background=True,
+        )
+        # Auto-expire mappings after 60 days so this collection doesn't grow forever.
+        await dump_origin_map.create_index(
+            [("ts", 1)],
+            expireAfterSeconds=60 * 24 * 3600,
+            background=True,
+        )
+    except Exception as e:
+        # Never let index setup crash the whole bot -- worst case /id
+        # lookups just run unindexed (slower, still correct) until this
+        # is fixed manually.
+        logger.error(f"[DUMP_ORIGIN] index creation failed, continuing without it: {e}")
 
 
 # ════════════════════════════════════════════════════════
