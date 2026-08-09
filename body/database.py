@@ -112,89 +112,18 @@ async def ensure_global_ff_indexes():
 
 
 async def ensure_dump_origin_indexes():
-    """
-    Create indexes for the dump-origin tracking collection.
-
-    This used to be keyed by cp_ch_msg_id alone (unique), which was safe
-    only because every dump copy went to the single CP_CH chat and
-    Telegram message ids are unique per-chat. Now that dump copies can be
-    redirected to a different destination channel per source channel
-    (see set_dump_destination), the same message id can legitimately show
-    up in two different destination chats -- so the key must include the
-    destination chat id too.
-
-    Two migration hazards had to be handled explicitly, both of which
-    would otherwise crash the bot on EVERY startup (index build throws ->
-    uncaught -> Bot().run() dies -> supervisord respawns -> same crash
-    forever):
-
-    1. A leftover legacy single-field unique index on cp_ch_msg_id is
-       dropped first.
-    2. Any pre-existing documents from before this feature only have
-       cp_ch_msg_id, not dest_chat_id/dest_msg_id. Building a UNIQUE
-       index on the new fields while 2+ such documents exist fails
-       immediately: Mongo treats a missing field as null, and a unique
-       index only tolerates a single null pair. Those old documents are
-       migrated (or dropped if unmigratable) to the new schema before
-       the new index is built.
-
-    The whole function is defensive on top of that: if anything here
-    still goes wrong, it's logged and swallowed rather than allowed to
-    take the entire bot down. Dump-origin tracking is a "nice to have"
-    for /id lookups, not something worth crash-looping the bot over.
-    """
-    try:
-        existing = await dump_origin_map.index_information()
-        for name, spec in existing.items():
-            if spec.get("key") == [("cp_ch_msg_id", 1)]:
-                await dump_origin_map.drop_index(name)
-                logger.info(f"[DUMP_ORIGIN] dropped legacy index {name}")
-    except Exception as e:
-        logger.warning(f"[DUMP_ORIGIN] legacy index cleanup skipped: {e}")
-
-    try:
-        migrated = 0
-        cursor = dump_origin_map.find(
-            {"cp_ch_msg_id": {"$exists": True}, "dest_msg_id": {"$exists": False}}
-        )
-        async for doc in cursor:
-            await dump_origin_map.update_one(
-                {"_id": doc["_id"]},
-                {
-                    "$set": {"dest_chat_id": CP_CH, "dest_msg_id": doc["cp_ch_msg_id"]},
-                    "$unset": {"cp_ch_msg_id": ""},
-                },
-            )
-            migrated += 1
-        if migrated:
-            logger.info(f"[DUMP_ORIGIN] migrated {migrated} legacy document(s) to the new schema")
-
-        # Anything still missing the new fields (corrupt/unmigratable) would
-        # still collide on the unique index -- it's disposable tracking
-        # data, so just drop it instead of blocking startup over it.
-        stale = await dump_origin_map.delete_many({"dest_msg_id": {"$exists": False}})
-        if stale.deleted_count:
-            logger.info(f"[DUMP_ORIGIN] dropped {stale.deleted_count} unmigratable legacy document(s)")
-    except Exception as e:
-        logger.warning(f"[DUMP_ORIGIN] legacy document migration skipped: {e}")
-
-    try:
-        await dump_origin_map.create_index(
-            [("dest_chat_id", 1), ("dest_msg_id", 1)],
-            unique=True,
-            background=True,
-        )
-        # Auto-expire mappings after 60 days so this collection doesn't grow forever.
-        await dump_origin_map.create_index(
-            [("ts", 1)],
-            expireAfterSeconds=60 * 24 * 3600,
-            background=True,
-        )
-    except Exception as e:
-        # Never let index setup crash the whole bot -- worst case /id
-        # lookups just run unindexed (slower, still correct) until this
-        # is fixed manually.
-        logger.error(f"[DUMP_ORIGIN] index creation failed, continuing without it: {e}")
+    """Create indexes for the CP_CH dump-origin tracking collection."""
+    await dump_origin_map.create_index(
+        [("cp_ch_msg_id", 1)],
+        unique=True,
+        background=True,
+    )
+    # Auto-expire mappings after 60 days so this collection doesn't grow forever.
+    await dump_origin_map.create_index(
+        [("ts", 1)],
+        expireAfterSeconds=60 * 24 * 3600,
+        background=True,
+    )
 
 
 # ════════════════════════════════════════════════════════
@@ -335,17 +264,9 @@ async def reset_global_ff_progress(channel_id: int):
 # ════════════════════════════════════════════════════════
 #  Dump-origin tracking helpers
 # ════════════════════════════════════════════════════════
-async def save_dump_origin(
-    dest_chat_id: int, dest_msg_id: int, origin_channel_id: int, origin_message_id: int
-):
-    """
-    Records that `dest_msg_id` inside `dest_chat_id` (the dump channel a
-    file was actually copied to -- CP_CH by default, or an admin-selected
-    custom destination) originally came from origin_channel_id /
-    origin_message_id, so /id can answer "where did this come from".
-    """
+async def save_dump_origin(cp_ch_msg_id: int, origin_channel_id: int, origin_message_id: int):
     await dump_origin_map.update_one(
-        {"dest_chat_id": dest_chat_id, "dest_msg_id": dest_msg_id},
+        {"cp_ch_msg_id": cp_ch_msg_id},
         {
             "$set": {
                 "origin_channel_id": origin_channel_id,
@@ -357,10 +278,8 @@ async def save_dump_origin(
     )
 
 
-async def get_dump_origin(dest_chat_id: int, dest_msg_id: int) -> dict:
-    return await dump_origin_map.find_one(
-        {"dest_chat_id": dest_chat_id, "dest_msg_id": dest_msg_id}
-    ) or {}
+async def get_dump_origin(cp_ch_msg_id: int) -> dict:
+    return await dump_origin_map.find_one({"cp_ch_msg_id": cp_ch_msg_id}) or {}
 
 
 # ════════════════════════════════════════════════════════
@@ -414,43 +333,6 @@ async def is_dump_skip(channel_id: int) -> bool:
 
 async def get_all_dump_skip_channels():
     cursor = chnl_ids.find({"dump_skip": True})
-    return [doc async for doc in cursor]
-
-
-# ════════════════════════════════════════════════════════
-#  Per-channel dump DESTINATION helpers  ── /dump_change
-#  (which chat an individual source channel's edited-file dump copies
-#  get forwarded to; unset/None = default CP_CH)
-# ════════════════════════════════════════════════════════
-async def set_dump_destination(channel_id: int, dest_channel_id: int):
-    await chnl_ids.update_one(
-        {"chnl_id": channel_id},
-        {"$set": {"dump_dest": dest_channel_id}},
-        upsert=True,
-    )
-    if channel_id in _CHANNEL_CACHE:
-        _CHANNEL_CACHE[channel_id]["data"]["dump_dest"] = dest_channel_id
-
-
-async def clear_dump_destination(channel_id: int):
-    """Resets a channel back to the default CP_CH dump destination."""
-    await chnl_ids.update_one(
-        {"chnl_id": channel_id},
-        {"$unset": {"dump_dest": ""}},
-    )
-    if channel_id in _CHANNEL_CACHE:
-        _CHANNEL_CACHE[channel_id]["data"].pop("dump_dest", None)
-
-
-async def get_dump_destination(channel_id: int) -> Optional[int]:
-    """Returns the custom dump destination chat id for this channel, or
-    None if it's still using the default CP_CH dump channel."""
-    doc = await get_channel_cached(channel_id)
-    return doc.get("dump_dest")
-
-
-async def get_all_dump_destinations():
-    cursor = chnl_ids.find({"dump_dest": {"$exists": True}})
     return [doc async for doc in cursor]
 
 
