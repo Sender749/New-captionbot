@@ -1003,7 +1003,17 @@ async def reCap(client, msg):
     chnl_id = msg.chat.id
     logger.info(f"[RECAP] media received ch={chnl_id} msg={msg.id}")
     try:
-        default_caption = msg.caption or ""
+        # default_caption_plain: entity-stripped plain text — used ONLY for
+        # metadata extraction (title/year/language parsing) so stray HTML
+        # markup never pollutes the smart-filename engine.
+        # default_caption_html: the .html representation — preserves any
+        # hyperlink, bold, italic, etc. the admin applied via Telegram's
+        # native formatting. This is what actually goes into the
+        # {default_caption} placeholder; using the bare (plain) caption
+        # here used to silently strip every link/format the user added.
+        default_caption_plain = str(msg.caption) if msg.caption else ""
+        default_caption_html = msg.caption.html if msg.caption else default_caption_plain
+        default_caption = default_caption_html
         file_name = None
         file_size = None
         for file_type in ("video", "audio", "document", "voice"):
@@ -1049,18 +1059,18 @@ async def reCap(client, msg):
                 break
 
         # Extract info from caption + filename (use original for better metadata extraction)
-        combined_raw = f"{original_file_name} {default_caption}"
+        combined_raw = f"{original_file_name} {default_caption_plain}"
         audio_lang_list = extract_audio_languages(combined_raw)
         language = " + ".join(audio_lang_list) if audio_lang_list else ""
-        year = extract_year(default_caption) or extract_year(original_file_name) or ""
+        year = extract_year(default_caption_plain) or extract_year(original_file_name) or ""
         # Build caption
         try:
             raw_file_name = normalize_series_name(file_name)
             # Parse all metadata once – use original filename to preserve extension dots
-            file_info = parse_file_info(original_file_name or raw_file_name, default_caption)
+            file_info = parse_file_info(original_file_name or raw_file_name, default_caption_plain)
             smart_file_name = ""
             if "{smart_file_name}" in cap_template:
-                smart_file_name = build_smart_filename(original_file_name or raw_file_name, default_caption)
+                smart_file_name = build_smart_filename(original_file_name or raw_file_name, default_caption_plain)
             new_caption = cap_template.format(
                 file_name=raw_file_name,
                 smart_file_name=smart_file_name,
@@ -1429,6 +1439,7 @@ def _build_noise_pattern() -> str:
     tokens += [re.escape(c) for c in VIDEO_CODEC_LIST]
     tokens += [re.escape(c) for c in AUDIO_CODEC_LIST]
     tokens += [re.escape(l.lower()) for l in LANG_LIST]
+    tokens += [re.escape(e) for e in EXT_LIST]
     tokens += [
         r'e\.?subs?', r'h\.?subs?', r'm\.?subs?', r'subs?', r'subtitles?',
         r'dual[\s]?audio', r'multi[\s]?audio', r'multi',
@@ -1437,6 +1448,11 @@ def _build_noise_pattern() -> str:
         r'hdr10\+', r'hdr10', r'hdr', r'dolby[\s]?vision',
         r'\d{2,4}[\s\-]?kbps',
         r'complete(?:d)?', r'full\s*hd', r'\bhd\b', r'\bfhd\b',
+        # generic fallback names used when a file has no real filename
+        # (see reCap) — these must never get glued onto a real caption
+        # title just because they happened to precede it in the
+        # combined filename+caption text.
+        r'voice[\s.\-]?message', r'\bfile\b', r'\bdocument\b', r'\bvideo\b', r'\baudio\b',
     ]
     return '|'.join(tokens)
 
@@ -1501,11 +1517,50 @@ def extract_title_year(raw: str):
     """
     text = _clean_raw(raw)
 
+    # Strip recognized filler/noise tokens from the very START of the
+    # text first (e.g. reCap's fallback "File "/"Document " name when a
+    # file has no real filename, or a bare leading extension). Without
+    # this, a noise match sitting right at position 0 would collapse
+    # the boundary computed below down to zero and produce an empty
+    # title instead of skipping past the filler to reach the real one.
+    text = re.sub(rf'^(?:\s*(?:{_NOISE})\b[\s.\-]*)+', '', text, flags=re.I)
+
     # Step 1: locate year
     year_m = re.search(r'\b((?:19|20)\d{2})\b', text)
     year   = year_m.group(1) if year_m else ""
-    cut    = year_m.start()  if year_m else len(text)
 
+    # Step 1b: the title candidate is bounded at the EARLIEST of several
+    # signals — a year, a season/episode marker, the first recognized
+    # metadata noise token (quality/source/codec/language/subtitle/tag),
+    # or a line break. Whichever comes first wins.
+    #
+    # This matters most when there's NO year at all, which is extremely
+    # common for real channel captions (e.g. TV-episode posts, or a
+    # caption that's just free-form promo/description text). The old
+    # code's fallback for "no year found" was to treat the ENTIRE
+    # remaining text as the title — which, once the smart-filename
+    # engine started reading real captions (not just clean filenames),
+    # meant large chunks of a caption's own prose ended up copied
+    # verbatim into the "title", making the rebuilt caption look like
+    # the original caption with a half-broken smart tag list glued on
+    # after it.
+    boundary = len(text)
+    if year_m:
+        boundary = min(boundary, year_m.start())
+    se_m = re.search(r'\bS(?:eason)?\s*\d{1,3}\b', text, re.I)
+    if se_m:
+        boundary = min(boundary, se_m.start())
+    ep_m = re.search(r'\bEp?(?:isode)?\.?\s*\d{1,3}\b', text, re.I)
+    if ep_m:
+        boundary = min(boundary, ep_m.start())
+    noise_m = re.search(rf'\b(?:{_NOISE})\b', text, re.I)
+    if noise_m:
+        boundary = min(boundary, noise_m.start())
+    nl_m = re.search(r'[\r\n]', text)
+    if nl_m:
+        boundary = min(boundary, nl_m.start())
+
+    cut = boundary
     title_raw = text[:cut]
 
     # Step 2: strip season / episode markers from title zone
@@ -2181,6 +2236,17 @@ def strip_links_and_mentions_keep_text(text: str) -> str:
     return text
 
 def strip_links_only(text: str) -> str:
+    """
+    Remove markdown links, Telegram user-links, HTML anchor tags, raw
+    URLs, and @mentions — WITHOUT touching the caption's line structure.
+
+    Only horizontal whitespace directly left behind by something just
+    removed is cleaned up (e.g. "Check this:   " -> "Check this:").
+    Newlines and blank lines are never collapsed or merged; this used to
+    turn every multi-line caption into a single run-on paragraph
+    whenever Link/Username Remover was enabled, even when the caption
+    had no links in it at all.
+    """
     if not text:
         return text
     text = MD_LINK_RE.sub(r'\1', text)
@@ -2191,7 +2257,9 @@ def strip_links_only(text: str) -> str:
     text = re.sub(r'\(\s*\)', '', text)   # ()
     text = re.sub(r'\[\s*\]', '', text)   # []
     text = re.sub(r'\{\s*\}', '', text)   # {}
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)   # collapse leftover run of spaces/tabs only
+    text = re.sub(r'[ \t]+\n', '\n', text)   # trailing space before a line break
+    text = re.sub(r'\n[ \t]+', '\n', text)   # leading space after a line break
     return text.strip()
 
 DUMP_EMOJI_RE = re.compile(
