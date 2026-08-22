@@ -476,7 +476,8 @@ async def bot_stats(client, message):
 
             "📝 <b>CAPTION QUEUE</b>\n"
             f"  • Pending   : <code>{cap_pending}</code>\n"
-            f"  • Processing: <code>{cap_processing}</code>\n\n"
+            f"  • Processing: <code>{cap_processing}</code>\n"
+            f"  • Total (all-time): <code>{cap_done_today}</code>\n\n"
 
             "📦 <b>FORWARD QUEUE</b>\n"
             f"  • Pending   : <code>{fwd_pending}</code>\n"
@@ -935,7 +936,14 @@ async def caption_worker(client: Client, worker_id: int = 0):
                         )
                         await save_dump_origin(dump_dest, dump_sent.id, ch, job["message_id"])
                     else:
-                        dump_caption = sanitize_dump_caption(job.get("default_caption") or "")
+                        # Prefer the smart-filename-built caption (already
+                        # cleaned of links/@usernames/emojis in reCap) for
+                        # the default CP_CH dump copy; fall back to the old
+                        # sanitized-raw-caption approach only if no usable
+                        # metadata could be extracted for this file.
+                        dump_caption = job.get("smart_file_name") or ""
+                        if not dump_caption:
+                            dump_caption = sanitize_dump_caption(job.get("default_caption") or "")
                         dump_sent = await client.copy_message(
                             chat_id=CP_CH,
                             from_chat_id=ch,
@@ -1064,13 +1072,20 @@ async def reCap(client, msg):
         language = " + ".join(audio_lang_list) if audio_lang_list else ""
         year = extract_year(default_caption_plain) or extract_year(original_file_name) or ""
         # Build caption
+        smart_file_name = ""  # always defined, even if the try body below throws
         try:
             raw_file_name = normalize_series_name(file_name)
             # Parse all metadata once – use original filename to preserve extension dots
             file_info = parse_file_info(original_file_name or raw_file_name, default_caption_plain)
-            smart_file_name = ""
-            if "{smart_file_name}" in cap_template:
-                smart_file_name = build_smart_filename(original_file_name or raw_file_name, default_caption_plain)
+            # Always build smart_file_name (reusing file_info above, so this
+            # is NOT a second parse) — needed even when the channel's own
+            # caption template doesn't reference {smart_file_name}, because
+            # the default CP_CH dump channel now uses it too (see job dict
+            # below / caption_worker).
+            smart_file_name = build_smart_filename(
+                original_file_name or raw_file_name, default_caption_plain,
+                precomputed_info=file_info,
+            )
             new_caption = cap_template.format(
                 file_name=raw_file_name,
                 smart_file_name=smart_file_name,
@@ -1113,11 +1128,28 @@ async def reCap(client, msg):
         if "<" in new_caption and ">" in new_caption:
             new_caption = sanitize_caption_html(new_caption)
 
+        # ── Dump-channel (default CP_CH) caption ───────────────────────
+        # Built from the SAME smart_file_name metadata as the main channel
+        # caption, then run through link/@username removal and emoji
+        # removal unconditionally — the CP_CH copy is an internal/admin
+        # archive copy, so it should always be clean regardless of
+        # whether THIS channel has those removers turned on for its own
+        # public caption. Falls back to the sanitized raw caption if
+        # smart_file_name couldn't be built for some reason (e.g. a file
+        # with literally no usable metadata in its name or caption).
+        if smart_file_name:
+            dump_smart_caption = strip_links_only(smart_file_name)
+            dump_smart_caption = remove_emojis(dump_smart_caption)
+            dump_smart_caption = DUMP_EMOJI_RE.sub("", dump_smart_caption).strip()
+        else:
+            dump_smart_caption = ""
+
         job = {
             "chat_id": msg.chat.id,
             "message_id": msg.id,
             "caption": new_caption,
             "default_caption": default_caption,
+            "smart_file_name": dump_smart_caption,
             "url_buttons": url_buttons or [],
             "user_id": msg.from_user.id if msg.from_user else None
         }
@@ -1964,7 +1996,7 @@ def parse_file_info(filename: str, caption: str) -> dict:
     }
 
 # ── Smart caption builder ─────────────────────────────────────────
-def build_smart_filename(filename: str, caption: str) -> str:
+def build_smart_filename(filename: str, caption: str, precomputed_info: dict = None) -> str:
     """
     Build a professional, fully structured media caption from filename + caption.
 
@@ -1980,6 +2012,12 @@ def build_smart_filename(filename: str, caption: str) -> str:
       resolution = pixel resolution e.g. 480p, 720p, 1080p, 4K
       source     = OTT/streaming platform e.g. Amazon Prime, Netflix, Disney+
 
+    precomputed_info: if the caller already has a parse_file_info(filename,
+    caption) result for this exact (filename, caption) pair, pass it here
+    to skip re-parsing — this is a pure-regex, non-trivial amount of work
+    and callers that need both the individual fields AND the built smart
+    caption (e.g. reCap) should only pay for it once.
+
     Examples:
       Court - State Vs A Nobody (2025) (Hindi DD5.1-224Kbps + Telugu) Dual Audio UnCut South Movie HD WEB-DL 1080p ESub.mkv
       Sapne Vs Everyone S01 (Ep.01-05) (Combined Episodes) (2023) Hindi Web Series HEVC 480p ESub.mkv
@@ -1989,7 +2027,7 @@ def build_smart_filename(filename: str, caption: str) -> str:
       Panchayat S03 (Complete Season) (2024) Hindi Web Series Netflix WEB-DL 1080p ESub.mkv
     """
     raw         = _build_clean_raw(filename, caption)
-    info        = parse_file_info(filename, caption)
+    info        = precomputed_info if precomputed_info is not None else parse_file_info(filename, caption)
     media_type  = detect_media_type(raw)
     audio_langs = info.get("audio_langs") or extract_audio_languages(raw)
     parts: list = []
@@ -2277,18 +2315,17 @@ DUMP_EMOJI_RE = re.compile(
 
 def sanitize_dump_caption(text: str) -> str:
     """
-    Cleans a file's original/default caption before it's sent to the CP_CH
-    dump channel: strips @usernames, links/websites (http, www, t.me),
-    markdown/HTML links, and emojis -- leaving the rest of the original
-    caption text untouched (no smart-filename rebuilding of any kind).
+    Fallback cleaner for the CP_CH dump caption, used only when
+    smart_file_name couldn't be built for a file (no usable metadata in
+    its name or caption). Strips @usernames, links/websites (http, www,
+    t.me), markdown/HTML links, and emojis -- leaving the rest of the
+    original caption's line structure untouched.
     """
     if not text:
         return ""
     text = strip_links_only(text)
     text = remove_emojis(text)
     text = DUMP_EMOJI_RE.sub("", text)
-    # Drop now-empty lines left behind by stripped links/mentions
-    text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
     return text.strip()
 
 def apply_block_words(caption_html: str, raw_blocked: str) -> str:
