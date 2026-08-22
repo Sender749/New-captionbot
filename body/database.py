@@ -21,7 +21,7 @@ FORWARD_WORKERS      = 4     # was 12; 4 avoids flooding Telegram
 
 # Max pending docs scanned per fetch_channel_job() call — keeps polling cheap
 # even when thousands of jobs are queued across busy/cooling-down channels.
-_FETCH_SCAN_LIMIT    = 200
+_FETCH_SCAN_LIMIT    = 1500
 
 # Max parallel edits per channel at once (rate-limit headroom)
 DEFAULT_MAX_WORKERS  = 2     # per channel concurrency cap
