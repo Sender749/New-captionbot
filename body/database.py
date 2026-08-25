@@ -15,7 +15,15 @@ logger = logging.getLogger("captionbot.database")
 # ════════════════════════════════════════════════════════
 
 # Caption workers  ── how many concurrent caption-edit tasks
-CAPTION_WORKERS      = 6     # was 30; 6 is enough with fair scheduling
+# Raised 6 -> 10 now that reCap() only does a cheap DB insert (all the
+# regex/template parsing moved into the worker itself, see
+# render_caption_for_job() in Caption.py) — a worker mostly sits in
+# `await` (Telegram edit/copy round-trip) rather than burning CPU, so
+# more of them means more CHANNELS can be worked on at once without
+# meaningfully raising CPU load on the free tier. Combined with the
+# per-channel cap below, 10 workers can cover up to 5 busy channels at
+# full pace (2 each), or up to 10 different channels at once (1 each).
+CAPTION_WORKERS      = 10
 
 # Forward workers  ── how many concurrent file-forward tasks
 FORWARD_WORKERS      = 4     # was 12; 4 avoids flooding Telegram
@@ -31,8 +39,51 @@ DEFAULT_MAX_WORKERS  = 2     # per channel concurrency cap
 MAX_FORWARD_PER_PAIR = 1     # keep 1 – Telegram throttles hard per chat
 
 # Seconds to sleep between edits (caption) / forwards
-DEFAULT_EDIT_DELAY   = 0.5   # caption edit cooldown per worker
+DEFAULT_EDIT_DELAY   = 0.5   # caption edit cooldown per worker — floor/base value
 FORWARD_DELAY        = 0.8   # forward cooldown per worker (generous)
+
+# ════════════════════════════════════════════════════════
+#  Adaptive per-channel edit delay
+#  Each channel starts at DEFAULT_EDIT_DELAY. Every FloodWait on a
+#  channel backs its delay off (multiplicatively, capped), so a channel
+#  that's clearly too fast for Telegram's per-chat limit settles at a
+#  slower, safer pace WITHOUT slowing down every other channel. A long
+#  clean streak on a channel gradually eases its delay back down toward
+#  the floor, so a channel that's been safe for a while isn't stuck
+#  paying a slow pace forever either.
+# ════════════════════════════════════════════════════════
+MAX_EDIT_DELAY       = 3.0   # ceiling — never wait longer than this between edits
+EASE_DOWN_AFTER      = 20    # consecutive clean edits before easing delay down
+EASE_DOWN_STEP       = 0.1   # how much to ease down each time
+BACKOFF_MULTIPLIER   = 1.6   # how much to back off on a FloodWait
+
+CHANNEL_DELAY  = defaultdict(lambda: DEFAULT_EDIT_DELAY)  # channel_id -> current edit delay
+CHANNEL_STREAK = defaultdict(int)                          # channel_id -> consecutive clean edits
+
+
+def get_channel_delay(chat_id) -> float:
+    return CHANNEL_DELAY[chat_id]
+
+
+def note_edit_success(chat_id):
+    """Call after a successful caption edit. Slowly eases the channel's
+    delay back toward the floor once it's had a long enough clean streak."""
+    CHANNEL_STREAK[chat_id] += 1
+    if CHANNEL_STREAK[chat_id] >= EASE_DOWN_AFTER:
+        CHANNEL_DELAY[chat_id] = max(
+            DEFAULT_EDIT_DELAY, round(CHANNEL_DELAY[chat_id] - EASE_DOWN_STEP, 3)
+        )
+        CHANNEL_STREAK[chat_id] = 0
+
+
+def note_edit_floodwait(chat_id):
+    """Call when a channel hits a FloodWait. Backs its delay off so future
+    edits on this channel are paced more conservatively; other channels
+    are completely unaffected."""
+    CHANNEL_DELAY[chat_id] = min(
+        MAX_EDIT_DELAY, max(CHANNEL_DELAY[chat_id] * BACKOFF_MULTIPLIER, DEFAULT_EDIT_DELAY * 1.2)
+    )
+    CHANNEL_STREAK[chat_id] = 0
 
 # ════════════════════════════════════════════════════════
 #  Per-channel scheduler state  (in-memory, reset on restart)
@@ -54,7 +105,14 @@ _mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
     serverSelectionTimeoutMS=10_000,
     connectTimeoutMS=10_000,
     socketTimeoutMS=30_000,
-    maxPoolSize=10,
+    # Raised 10 -> 20 alongside CAPTION_WORKERS (6 -> 10) + FORWARD_WORKERS
+    # (4) + UI/command traffic all sharing this pool. With the old
+    # maxPoolSize=10, more concurrent workers than connections just means
+    # workers queue up WAITING for a free connection -- adding workers
+    # without this would've made the starvation problem worse, not
+    # better. 20 gives every worker its own connection with headroom left
+    # for commands/buttons.
+    maxPoolSize=20,
     minPoolSize=1,
 )
 db              = _mongo_client.captions_with_chnl
