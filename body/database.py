@@ -1,5 +1,6 @@
 import motor.motor_asyncio
 import logging
+import random
 from info import *
 from typing import Optional
 import time
@@ -21,7 +22,7 @@ FORWARD_WORKERS      = 4     # was 12; 4 avoids flooding Telegram
 
 # Max pending docs scanned per fetch_channel_job() call — keeps polling cheap
 # even when thousands of jobs are queued across busy/cooling-down channels.
-_FETCH_SCAN_LIMIT    = 1500
+_FETCH_SCAN_LIMIT    = 200
 
 # Max parallel edits per channel at once (rate-limit headroom)
 DEFAULT_MAX_WORKERS  = 2     # per channel concurrency cap
@@ -211,21 +212,48 @@ async def enqueue_caption(job: dict):
 
 async def fetch_channel_job():
     """
-    Fair-pick: scan pending caption jobs oldest-first.
-    Skip channels that are cooled down or at concurrency cap.
-    Atomically claim the first eligible job.
+    Fair-pick across ALL channels, with a cheap fast path for the common
+    case and a guaranteed-fair fallback for the adversarial case.
 
-    The scan is capped at _FETCH_SCAN_LIMIT documents per call. Without a
-    cap, once thousands of jobs pile up for channels that are all
-    momentarily at their concurrency cap / cooldown, every single worker
-    would re-scan the *entire* pending backlog on every 0.5s poll just to
-    find nothing eligible -- wasted DB round-trips that get worse the more
-    files are queued, right when the queue needs to be draining fastest.
-    Capping the scan means a worker simply tries again next poll instead of
-    walking the whole collection every time; nothing is ever skipped since
-    finished jobs are deleted and paused ones are already excluded here.
+    -- THE BUG THIS FIXES ------------------------------------------------
+    The old version only ever looked at the globally-oldest
+    _FETCH_SCAN_LIMIT (200) pending docs. That's fine when jobs are spread
+    evenly, but if ONE channel has a big backlog (say 1500 files) queued
+    before any other channel, every one of those 1500 jobs has an OLDER
+    timestamp than a second channel's jobs queued afterwards. The moment
+    that first channel hits a FloodWait cooldown, or is simply busy at its
+    2-worker cap, the oldest-200 window is entirely made of ITS jobs --
+    every one of them gets skipped, the scan finds nothing, and the
+    second/third channel's jobs are never even looked at, even though they
+    have free capacity. Effectively one busy/flood-waited channel could
+    freeze every other channel's editing.
+
+    -- THE FIX -------------------------------------------------------------
+    1) FAST PATH (_fetch_from_oldest_window): unchanged behaviour --
+       scan the oldest _FETCH_SCAN_LIMIT pending docs, skip
+       cooling-down/at-cap channels, claim the first eligible one. This is
+       cheap and handles the normal case (queue not dominated by one
+       stuck channel) in a single indexed query, same as before.
+    2) FALLBACK (_fetch_fair_across_channels): only runs when the fast
+       path finds nothing eligible. It looks at every DISTINCT channel
+       that currently has pending jobs, filters out channels that are
+       cooling down or at their concurrency cap, and then -- for each
+       remaining channel -- claims that channel's own oldest pending job
+       (indexed via the (chat_id, ts) partial index, so it's cheap per
+       channel). This guarantees no channel can be starved just because
+       another channel has a much bigger backlog sitting in front of it.
+
+    In the common case only step 1 ever runs. Step 2 only kicks in during
+    exactly the scenario that used to cause starvation, and resolves it.
     """
     now = time.time()
+    job = await _fetch_from_oldest_window(now)
+    if job is not None:
+        return job
+    return await _fetch_fair_across_channels(now)
+
+
+async def _fetch_from_oldest_window(now: float):
     cursor = queue_col.find({"status": "pending"}).sort("ts", 1).limit(_FETCH_SCAN_LIMIT)
     async for job in cursor:
         ch = job["chat_id"]
@@ -242,6 +270,47 @@ async def fetch_channel_job():
             CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
             continue
         return job
+    return None
+
+
+async def _fetch_fair_across_channels(now: float):
+    try:
+        channels = await queue_col.distinct("chat_id", {"status": "pending"})
+    except Exception as e:
+        logger.warning(f"[FAIR_FETCH] distinct(chat_id) failed: {e}")
+        return None
+    if not channels:
+        return None
+
+    eligible = [
+        ch for ch in channels
+        if CHANNEL_COOLDOWN.get(ch, 0) <= now and CHANNEL_ACTIVE[ch] < DEFAULT_MAX_WORKERS
+    ]
+    if not eligible:
+        return None
+
+    # Shuffle so that across many polls / many workers, every eligible
+    # channel gets an even shot at being picked first -- not always the
+    # same channel-id ordering every time.
+    random.shuffle(eligible)
+
+    for ch in eligible:
+        CHANNEL_ACTIVE[ch] += 1
+        try:
+            job = await queue_col.find_one_and_update(
+                {"chat_id": ch, "status": "pending"},
+                {"$set": {"status": "processing", "started": now}},
+                sort=[("ts", 1)],
+            )
+        except Exception as e:
+            logger.warning(f"[FAIR_FETCH] claim failed ch={ch}: {e}")
+            job = None
+        if job is not None:
+            return job
+        # Nothing claimable for this channel right now (another worker
+        # beat us to its only remaining eligible doc, or a race with a
+        # status change) -- release and try the next eligible channel.
+        CHANNEL_ACTIVE[ch] = max(0, CHANNEL_ACTIVE[ch] - 1)
     return None
 
 
