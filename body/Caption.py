@@ -11,6 +11,7 @@ from body.file_forward import *
 from collections import deque, defaultdict
 from imdb import IMDb
 from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
+from body.database import get_channel_delay, note_edit_success, note_edit_floodwait
 
 logger = logging.getLogger("captionbot.caption")
 
@@ -35,7 +36,13 @@ def _get_ia():
     return _ia
 
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-DEFAULT_EDIT_DELAY = 0.3                 # per channel
+# NOTE: DEFAULT_EDIT_DELAY used to be redefined here as 0.3, silently
+# shadowing database.py's DEFAULT_EDIT_DELAY = 0.5 that `from
+# body.database import *` above already brought in -- two different
+# values existed for the same constant and only the local one (0.3) was
+# actually used, which was confusing and easy to lose track of. Now
+# there's a single source of truth in database.py, used as the floor for
+# the adaptive per-channel delay (see CHANNEL_DELAY / get_channel_delay).
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
@@ -906,10 +913,14 @@ async def caption_worker(client: Client, worker_id: int = 0):
         ch = job["chat_id"]
         released = False
         try:
+            # Heavy parsing/template-building happens HERE, right before
+            # the edit — not back in reCap() when the file first arrived.
+            # See render_caption_for_job() for why.
+            new_caption, dump_smart_caption = render_caption_for_job(job)
             await client.edit_message_caption(
                 chat_id=ch,
                 message_id=job["message_id"],
-                caption=job["caption"],
+                caption=new_caption,
                 parse_mode=ParseMode.HTML,
                 reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row] for row in job.get("url_buttons", [])]) 
                               if job.get("url_buttons") else None
@@ -928,7 +939,7 @@ async def caption_worker(client: Client, worker_id: int = 0):
                             chat_id=dump_dest,
                             from_chat_id=ch,
                             message_id=job["message_id"],
-                            caption=job["caption"],
+                            caption=new_caption,
                             parse_mode=ParseMode.HTML,
                             reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row] for row in job.get("url_buttons", [])])
                                           if job.get("url_buttons") else None
@@ -937,13 +948,13 @@ async def caption_worker(client: Client, worker_id: int = 0):
                         await save_dump_origin(dump_dest, dump_sent.id, ch, job["message_id"])
                     else:
                         # Prefer the smart-filename-built caption (already
-                        # cleaned of links/@usernames/emojis in reCap) for
-                        # the default CP_CH dump copy; fall back to the old
+                        # cleaned of links/@usernames/emojis) for the
+                        # default CP_CH dump copy; fall back to the
                         # sanitized-raw-caption approach only if no usable
                         # metadata could be extracted for this file.
-                        dump_caption = job.get("smart_file_name") or ""
+                        dump_caption = dump_smart_caption or ""
                         if not dump_caption:
-                            dump_caption = sanitize_dump_caption(job.get("default_caption") or "")
+                            dump_caption = sanitize_dump_caption(job.get("default_caption_html") or "")
                         dump_sent = await client.copy_message(
                             chat_id=CP_CH,
                             from_chat_id=ch,
@@ -955,11 +966,18 @@ async def caption_worker(client: Client, worker_id: int = 0):
                     logger.debug(f"[CAP_WORKER_{worker_id}] dump-copy skipped ch={ch} msg={job['message_id']}: {e}")
             await mark_done(job["_id"])
             logger.info(f"[CAP_WORKER_{worker_id}] edited ch={ch} msg={job['message_id']}")
-            await asyncio.sleep(DEFAULT_EDIT_DELAY)
+            # Adaptive per-channel pace: reward a clean edit (nudges this
+            # channel's delay back down over a long streak), then sleep
+            # for THIS channel's current delay rather than one fixed
+            # global value — a channel that's been flood-waited recently
+            # paces itself slower without affecting any other channel.
+            note_edit_success(ch)
+            await asyncio.sleep(get_channel_delay(ch))
         except FloodWait as e:
             wait = e.value + 2
             CHANNEL_COOLDOWN[ch] = time.time() + wait
-            logger.warning(f"[CAP_WORKER_{worker_id}] FloodWait {wait}s ch={ch}")
+            note_edit_floodwait(ch)
+            logger.warning(f"[CAP_WORKER_{worker_id}] FloodWait {wait}s ch={ch}, new pace={get_channel_delay(ch):.2f}s")
             await reschedule(job["_id"], delay=wait)
         except errors.MessageNotModified:
             await mark_done(job["_id"])
@@ -1004,8 +1022,129 @@ def start_caption_workers(client: Client, count: int = None):
         asyncio.create_task(_guarded(i), name=f"cap_worker_{i}")
     logger.info(f"[CAP] {n} caption workers started")
 
+def render_caption_for_job(job: dict):
+    """
+    Does the actual heavy lifting: filename/caption parsing, smart-filename
+    building, template formatting, block/replace words, prefix/suffix,
+    link/emoji removal. Returns (new_caption, dump_smart_caption).
+
+    This used to run inline inside reCap() -- the Telegram update handler
+    itself -- for EVERY incoming file, on the same single asyncio event
+    loop that also handles bot commands and button clicks. During a burst
+    of 100-1500+ files landing in a channel at once, that meant the event
+    loop spent long stretches doing regex-heavy parsing back to back
+    before it could get back around to an admin's button tap, making the
+    bot feel "stuck" under load.
+
+    Now reCap() just saves the raw fields (near-instant DB insert) and
+    THIS function is called from caption_worker(), right before the
+    actual edit -- so the same total CPU work happens, but spread out a
+    few files at a time across the worker pool instead of front-loaded
+    onto the event loop during ingestion, and interleaved with the
+    workers' own `await` points. That's what keeps the UI responsive
+    while a huge batch is being processed.
+
+    Same fallback-to-raw-template behaviour on any parsing error as
+    before. A failure here is now also caught by caption_worker's retry
+    logic (up to 5 attempts) instead of silently dropping the file the
+    way an exception inside old reCap() used to.
+    """
+    original_file_name = job.get("original_file_name") or ""
+    file_name = job.get("file_name") or ""
+    default_caption_plain = job.get("default_caption_plain") or ""
+    default_caption_html = job.get("default_caption_html") or default_caption_plain
+    default_caption = default_caption_html
+    file_size = job.get("file_size")
+    cap_template = job["cap_template"]
+
+    combined_raw = f"{original_file_name} {default_caption_plain}"
+    audio_lang_list = extract_audio_languages(combined_raw)
+    language = " + ".join(audio_lang_list) if audio_lang_list else ""
+    year = extract_year(default_caption_plain) or extract_year(original_file_name) or ""
+
+    smart_file_name = ""  # always defined, even if the try body below throws
+    try:
+        raw_file_name = normalize_series_name(file_name)
+        file_info = parse_file_info(original_file_name or raw_file_name, default_caption_plain)
+        smart_file_name = build_smart_filename(
+            original_file_name or raw_file_name, default_caption_plain,
+            precomputed_info=file_info,
+        )
+        new_caption = cap_template.format(
+            file_name=raw_file_name,
+            smart_file_name=smart_file_name,
+            file_size=file_size,
+            default_caption=default_caption,
+            language=language or file_info.get("audio", ""),
+            year=year or file_info.get("year", ""),
+            title=file_info.get("title", ""),
+            season=file_info.get("season", ""),
+            episode=file_info.get("episode", ""),
+            audio=file_info.get("audio", ""),
+            subtitle=file_info.get("subtitle", ""),
+            quality=file_info.get("quality", ""),
+            resolution=file_info.get("resolution", ""),
+            source=file_info.get("source", ""),
+            vcodec=file_info.get("vcodec", ""),
+            acodec=file_info.get("acodec", ""),
+            extension=file_info.get("extension", ""),
+            duration="",
+            empty="",
+        )
+    except Exception as e:
+        logger.warning(
+            "render_caption_for_job: template formatting failed for chat=%s msg=%s: %s",
+            job.get("chat_id"), job.get("message_id"), e,
+        )
+        new_caption = cap_template
+
+    if job.get("blocked_words_raw"):
+        new_caption = apply_block_words(new_caption, job["blocked_words_raw"])
+    if job.get("replace_raw"):
+        replace_pairs = parse_replace_pairs(job["replace_raw"])
+        if replace_pairs:
+            new_caption = apply_replacements(new_caption, replace_pairs)
+    if job.get("link_remover_on"):
+        new_caption = strip_links_only(new_caption)
+    if job.get("prefix"):
+        new_caption = f"{job['prefix']}\n{new_caption}".strip()
+    if job.get("suffix"):
+        new_caption = f"{new_caption}\n{job['suffix']}".strip()
+    if job.get("emoji_remover_on"):
+        new_caption = remove_emojis(new_caption)
+    new_caption = new_caption.strip()
+    if "<" in new_caption and ">" in new_caption:
+        new_caption = sanitize_caption_html(new_caption)
+
+    # ── Dump-channel (default CP_CH) caption ───────────────────────
+    # Built from the SAME smart_file_name metadata as the main channel
+    # caption, then run through link/@username removal and emoji
+    # removal unconditionally — the CP_CH copy is an internal/admin
+    # archive copy, so it should always be clean regardless of
+    # whether THIS channel has those removers turned on for its own
+    # public caption. Falls back to the sanitized raw caption if
+    # smart_file_name couldn't be built for some reason (e.g. a file
+    # with literally no usable metadata in its name or caption).
+    if smart_file_name:
+        dump_smart_caption = strip_links_only(smart_file_name)
+        dump_smart_caption = remove_emojis(dump_smart_caption)
+        dump_smart_caption = DUMP_EMOJI_RE.sub("", dump_smart_caption).strip()
+    else:
+        dump_smart_caption = ""
+
+    return new_caption, dump_smart_caption
+
+
 @Client.on_message(filters.channel & filters.media)
 async def reCap(client, msg):
+    """
+    Lightweight ingest handler. Deliberately does NOT do any regex
+    parsing or caption building anymore — see render_caption_for_job()
+    for why. It only reads cheap attributes off the message + the
+    (cached) channel settings, and saves them as a "pending" job. This
+    keeps reCap() fast enough to absorb bursts of 100s of files without
+    making the event loop (and therefore the bot's UI) feel slow.
+    """
     if msg.edit_date or not msg.media:
         return
     chnl_id = msg.chat.id
@@ -1021,7 +1160,6 @@ async def reCap(client, msg):
         # here used to silently strip every link/format the user added.
         default_caption_plain = str(msg.caption) if msg.caption else ""
         default_caption_html = msg.caption.html if msg.caption else default_caption_plain
-        default_caption = default_caption_html
         file_name = None
         file_size = None
         for file_type in ("video", "audio", "document", "voice"):
@@ -1066,90 +1204,24 @@ async def reCap(client, msg):
                 original_file_name = getattr(obj, "file_name", None) or ""
                 break
 
-        # Extract info from caption + filename (use original for better metadata extraction)
-        combined_raw = f"{original_file_name} {default_caption_plain}"
-        audio_lang_list = extract_audio_languages(combined_raw)
-        language = " + ".join(audio_lang_list) if audio_lang_list else ""
-        year = extract_year(default_caption_plain) or extract_year(original_file_name) or ""
-        # Build caption
-        smart_file_name = ""  # always defined, even if the try body below throws
-        try:
-            raw_file_name = normalize_series_name(file_name)
-            # Parse all metadata once – use original filename to preserve extension dots
-            file_info = parse_file_info(original_file_name or raw_file_name, default_caption_plain)
-            # Always build smart_file_name (reusing file_info above, so this
-            # is NOT a second parse) — needed even when the channel's own
-            # caption template doesn't reference {smart_file_name}, because
-            # the default CP_CH dump channel now uses it too (see job dict
-            # below / caption_worker).
-            smart_file_name = build_smart_filename(
-                original_file_name or raw_file_name, default_caption_plain,
-                precomputed_info=file_info,
-            )
-            new_caption = cap_template.format(
-                file_name=raw_file_name,
-                smart_file_name=smart_file_name,
-                file_size=file_size,
-                default_caption=default_caption,
-                language=language or file_info.get("audio", ""),
-                year=year or file_info.get("year", ""),
-                title=file_info.get("title", ""),
-                season=file_info.get("season", ""),
-                episode=file_info.get("episode", ""),
-                audio=file_info.get("audio", ""),
-                subtitle=file_info.get("subtitle", ""),
-                quality=file_info.get("quality", ""),
-                resolution=file_info.get("resolution", ""),
-                source=file_info.get("source", ""),
-                vcodec=file_info.get("vcodec", ""),
-                acodec=file_info.get("acodec", ""),
-                extension=file_info.get("extension", ""),
-                duration="",
-                empty="",
-            )
-        except Exception as e:
-            logger.warning("reCap: caption template formatting failed for chat=%s msg=%s: %s", chnl_id, msg.id, e)
-            new_caption = cap_template
-        if blocked_words_raw:
-            new_caption = apply_block_words(new_caption, blocked_words_raw)
-        if replace_raw:
-            replace_pairs = parse_replace_pairs(replace_raw)
-            if replace_pairs:
-                new_caption = apply_replacements(new_caption, replace_pairs)
-        if link_remover_on:
-            new_caption = strip_links_only(new_caption)
-        if prefix:
-            new_caption = f"{prefix}\n{new_caption}".strip()
-        if suffix:
-            new_caption = f"{new_caption}\n{suffix}".strip()
-        if emoji_remover_on:
-            new_caption = remove_emojis(new_caption)
-        new_caption = new_caption.strip()
-        if "<" in new_caption and ">" in new_caption:
-            new_caption = sanitize_caption_html(new_caption)
-
-        # ── Dump-channel (default CP_CH) caption ───────────────────────
-        # Built from the SAME smart_file_name metadata as the main channel
-        # caption, then run through link/@username removal and emoji
-        # removal unconditionally — the CP_CH copy is an internal/admin
-        # archive copy, so it should always be clean regardless of
-        # whether THIS channel has those removers turned on for its own
-        # public caption. Falls back to the sanitized raw caption if
-        # smart_file_name couldn't be built for some reason (e.g. a file
-        # with literally no usable metadata in its name or caption).
-        if smart_file_name:
-            dump_smart_caption = strip_links_only(smart_file_name)
-            dump_smart_caption = remove_emojis(dump_smart_caption)
-            dump_smart_caption = DUMP_EMOJI_RE.sub("", dump_smart_caption).strip()
-        else:
-            dump_smart_caption = ""
-
+        # NOTE: no parsing/template-building happens here anymore — just
+        # the raw fields render_caption_for_job() will need later, saved
+        # as-is. See that function for the actual caption logic.
         job = {
             "chat_id": msg.chat.id,
             "message_id": msg.id,
-            "caption": new_caption,
-            "default_caption": default_caption,
-            "smart_file_name": dump_smart_caption,
+            "file_name": file_name,
+            "original_file_name": original_file_name,
+            "default_caption_plain": default_caption_plain,
+            "default_caption_html": default_caption_html,
+            "file_size": file_size,
+            "cap_template": cap_template,
+            "link_remover_on": link_remover_on,
+            "emoji_remover_on": emoji_remover_on,
+            "blocked_words_raw": blocked_words_raw,
+            "suffix": suffix,
+            "prefix": prefix,
+            "replace_raw": replace_raw,
             "url_buttons": url_buttons or [],
             "user_id": msg.from_user.id if msg.from_user else None
         }
