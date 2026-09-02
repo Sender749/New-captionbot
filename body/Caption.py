@@ -978,7 +978,10 @@ async def caption_worker(client: Client, worker_id: int = 0):
             CHANNEL_COOLDOWN[ch] = time.time() + wait
             note_edit_floodwait(ch)
             logger.warning(f"[CAP_WORKER_{worker_id}] FloodWait {wait}s ch={ch}, new pace={get_channel_delay(ch):.2f}s")
-            await reschedule(job["_id"], delay=wait)
+            # reschedule_floodwait (NOT reschedule) — keeps this job's
+            # original queue position so it doesn't get bumped behind a
+            # later batch. See reschedule_floodwait()'s docstring.
+            await reschedule_floodwait(job["_id"])
         except errors.MessageNotModified:
             await mark_done(job["_id"])
         except Exception as e:
