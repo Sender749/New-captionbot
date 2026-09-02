@@ -386,6 +386,44 @@ async def reschedule(job_id, delay=5):
     )
 
 
+async def reschedule_floodwait(job_id):
+    """
+    Requeue a job that hit a FloodWait -- WITHOUT pushing its `ts` (queue
+    position) forward.
+
+    -- THE BUG THIS FIXES --------------------------------------------------
+    caption_worker used to call reschedule(job_id, delay=wait) on a
+    FloodWait, same as any other retry. That sets ts = now + wait (e.g.
+    now + 30s, now + 120s, whatever Telegram demanded). The channel-wide
+    CHANNEL_COOLDOWN already stops ANY job for that channel from being
+    picked again until the FloodWait passes -- so inflating this specific
+    job's ts on top of that was redundant for gating, but NOT harmless:
+    once the cooldown lifts, ts is compared against every other pending
+    job to decide order, and this job's ts is now artificially set to
+    "cooldown-lift-time" -- which is very likely LATER than the ts of any
+    file the admin queued *after* this one hit its FloodWait (e.g. a
+    second batch sent while the channel was cooling down). That file
+    would then jump the queue ahead of it.
+
+    With 100-200+ files hitting a channel's real per-chat rate limit
+    repeatedly during one batch, MANY of that batch's jobs would each get
+    their ts pushed past whatever was queued next -- so a growing chunk
+    of "batch 1" kept getting shoved behind "batch 2" every time it hit
+    another FloodWait, which is exactly the "bot skipped the first batch
+    and started on the second" symptom being reported.
+
+    Fix: leave ts untouched. The job keeps its original, rightful place
+    in line -- CHANNEL_COOLDOWN alone is what delays it, and the moment
+    the cooldown lifts it's picked up in its correct (oldest-first) order,
+    ahead of anything queued after it, no matter how many times it had to
+    wait.
+    """
+    await queue_col.update_one(
+        {"_id": job_id},
+        {"$set": {"status": "pending"}, "$inc": {"floodwait_retries": 1}},
+    )
+
+
 async def recover_stuck_jobs(timeout=300):
     cutoff = time.time() - timeout
     r1 = await queue_col.update_many(
