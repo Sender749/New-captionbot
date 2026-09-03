@@ -929,39 +929,29 @@ async def caption_worker(client: Client, worker_id: int = 0):
             if not await is_dump_skip(ch):
                 try:
                     dump_dest = await get_dump_destination(ch)
-                    if dump_dest:
-                        # Admin redirected this channel's dump elsewhere via
-                        # /dump_change: mirror the actual smart-built caption
-                        # (with its URL buttons) that was just applied to the
-                        # file, instead of the sanitized default-caption copy
-                        # used for the default CP_CH dump below.
-                        dump_sent = await client.copy_message(
-                            chat_id=dump_dest,
-                            from_chat_id=ch,
-                            message_id=job["message_id"],
-                            caption=new_caption,
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(btn["text"], url=btn["url"]) for btn in row] for row in job.get("url_buttons", [])])
-                                          if job.get("url_buttons") else None
-                                         )
-                        )
-                        await save_dump_origin(dump_dest, dump_sent.id, ch, job["message_id"])
-                    else:
-                        # Prefer the smart-filename-built caption (already
-                        # cleaned of links/@usernames/emojis) for the
-                        # default CP_CH dump copy; fall back to the
-                        # sanitized-raw-caption approach only if no usable
-                        # metadata could be extracted for this file.
-                        dump_caption = dump_smart_caption or ""
-                        if not dump_caption:
-                            dump_caption = sanitize_dump_caption(job.get("default_caption_html") or "")
-                        dump_sent = await client.copy_message(
-                            chat_id=CP_CH,
-                            from_chat_id=ch,
-                            message_id=job["message_id"],
-                            caption=dump_caption,
-                        )
-                        await save_dump_origin(CP_CH, dump_sent.id, ch, job["message_id"])
+                    # Always dump using the smart-filename-built caption
+                    # (already cleaned of links/@usernames/emojis) --
+                    # regardless of whether this channel's dump is going to
+                    # the default CP_CH channel or has been redirected
+                    # elsewhere via /dump_change. Previously a redirected
+                    # channel used `new_caption` (this channel's own
+                    # template output, with its own prefix/suffix/link
+                    # settings and URL buttons) instead, so redirected
+                    # dumps looked different from the default CP_CH ones.
+                    # Fall back to the sanitized-raw-caption approach only
+                    # if no usable metadata could be extracted for this
+                    # file.
+                    dump_caption = dump_smart_caption or ""
+                    if not dump_caption:
+                        dump_caption = sanitize_dump_caption(job.get("default_caption_html") or "")
+                    dest = dump_dest or CP_CH
+                    dump_sent = await client.copy_message(
+                        chat_id=dest,
+                        from_chat_id=ch,
+                        message_id=job["message_id"],
+                        caption=dump_caption,
+                    )
+                    await save_dump_origin(dest, dump_sent.id, ch, job["message_id"])
                 except Exception as e:
                     logger.debug(f"[CAP_WORKER_{worker_id}] dump-copy skipped ch={ch} msg={job['message_id']}: {e}")
             await mark_done(job["_id"])
