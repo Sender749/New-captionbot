@@ -4,6 +4,7 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from body.database import (
     chnl_ids,
+    users,
     get_channel_cached,
     set_channel_title_cache,
     get_channel_title_cached,
@@ -29,25 +30,46 @@ _DEST_LIST_TTL   = 30  # seconds
 
 async def _get_all_registered_channels(force: bool = False) -> list:
     """
-    Every channel the bot is registered as admin in — i.e. every doc in
-    chnl_ids, which when_added_as_admin() (Caption.py) populates the
-    moment the bot is made admin somewhere. This is the bot's own record
-    of "channels I administer", built from its DB — deliberately NOT a
-    live scan of all Telegram chats the bot account can see.
+    Channels available as dump-redirect destinations: only channels that
+    belong to an ADMIN (an id listed in the ADMIN env var), scanned from
+    the `users` collection (the same place admin_channels.py reads
+    "who added which channel" from) and cross-checked against chnl_ids so
+    only channels the bot is actually registered as admin in are offered.
+
+    Previously this scanned chnl_ids directly, which holds EVERY channel
+    the bot is admin in -- including channels regular (non-admin) users
+    added for their own caption editing. That let an admin accidentally
+    redirect a channel's dump copies into some random user's channel.
+    Restricting the picker to admin-owned channels only keeps dump
+    destinations to channels the admins themselves control.
     """
     now = time.time()
     if not force and _DEST_LIST_CACHE["data"] is not None and (now - _DEST_LIST_CACHE["ts"]) < _DEST_LIST_TTL:
         return _DEST_LIST_CACHE["data"]
 
-    result = []
+    admin_ids = set(ADMIN) if isinstance(ADMIN, (list, tuple, set)) else {ADMIN}
+
+    # Bot-is-admin registry, for the title cache and to make sure we only
+    # ever offer channels the bot is actually still registered in.
+    registered = {}
     async for doc in chnl_ids.find({}, {"chnl_id": 1, "_title": 1}):
         cid = doc.get("chnl_id")
         if cid is None:
             continue
-        result.append({
-            "channel_id": cid,
-            "channel_title": doc.get("_title") or str(cid),
-        })
+        registered[cid] = doc.get("_title")
+
+    seen = set()
+    result = []
+    async for doc in users.find({"_id": {"$in": list(admin_ids)}}, {"_id": 1, "channels": 1}):
+        for ch in doc.get("channels", []):
+            cid = ch.get("channel_id")
+            if not cid or cid in seen or cid not in registered:
+                continue
+            seen.add(cid)
+            result.append({
+                "channel_id": cid,
+                "channel_title": registered.get(cid) or ch.get("channel_title") or str(cid),
+            })
     result.sort(key=lambda c: c["channel_title"].casefold())
 
     _DEST_LIST_CACHE["data"] = result
