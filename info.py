@@ -35,4 +35,4 @@ MANUAL_FF = int(os.environ.get("MANUAL_FF", "-1003979911149"))
 # account is a member/admin but the BOT ITSELF was never added — something
 # the Bot API can never do on its own. Leave empty to disable the feature
 # entirely; nothing else in the bot depends on it.
-SESSION_STRING = str(getenv("SESSION_STRING", ""))
+SESSION_STRING = str(getenv("SESSION_STRING", "BQHBa2AAB2Gkf7fVzKe7laAj3-sVJdoVgs7kdqElm_ivE4bUGIML4SNioZOtM_oBIk-Gal_oszjfAT7QIumIVsCMXVuyD0Gh29p1204DwCQ03-H28cieNGmi7-q75p0LETReT3xm54yhXKu1lfcpwu5eNMs9YeI9uPD2yeplb1ma3HyEFnTgJLSGXSR6Ww2EcNvVvum25FElPQlQ___oEdfTMygfTOmILhxkk3ehTTg1a0TrbfdGooam7-1eggRmFHw4kOQbjWRIvvVegOwlt-PZEfHYBviqr0KQftEAjSJ2pS6kvVM5qioOyGbSK8iIKraNBRp6SWv9JZpkDxyRagtMhQbtaAAAAAHGKGRSAA"))
