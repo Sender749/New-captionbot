@@ -8,6 +8,8 @@ from info import *
 from Script import script
 from body.database import *  
 from body.file_forward import *
+from body.member_forward import MF_SESSIONS, handle_member_forward_text
+from body.gen_session import GS_SESSIONS, handle_gen_session_text
 from collections import deque, defaultdict
 from imdb import IMDb
 from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
@@ -18,31 +20,12 @@ logger = logging.getLogger("captionbot.caption")
 _ia = None
 
 def _get_ia():
-    """Lazily create the IMDb() client on first use.
-
-    Creating IMDb() at import time makes cinemagoer build its default
-    S3/SQLite-backed access system, which calls sqlalchemy.create_engine()
-    with a malformed 'sqlite://cinemagoer.db' URL on this
-    environment/version combo and raises immediately -> the whole bot
-    process crashes on import (exit status 1 right after startup, before
-    it even connects to Telegram). Using the "http" backend and building
-    it lazily avoids touching sqlalchemy entirely and keeps the crash
-    contained (best-effort, silent on any error) instead of taking the
-    whole bot down.
-    """
     global _ia
     if _ia is None:
         _ia = IMDb("http")
     return _ia
 
 MESSAGE_LINK_RE = re.compile(r"(?:https?://)?t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)")
-# NOTE: DEFAULT_EDIT_DELAY used to be redefined here as 0.3, silently
-# shadowing database.py's DEFAULT_EDIT_DELAY = 0.5 that `from
-# body.database import *` above already brought in -- two different
-# values existed for the same constant and only the local one (0.3) was
-# actually used, which was confusing and easy to lose track of. Now
-# there's a single source of truth in database.py, used as the floor for
-# the adaptive per-channel delay (see CHANNEL_DELAY / get_channel_delay).
 bot_data = {
     "caption_set": {},
     "block_words_set": {},
@@ -411,9 +394,16 @@ async def admin_help(client, message):
         "📤 <b>FILE FORWARDING</b>\n"
         "├ /file_forward — Start a user file forward session\n"
         "│   <i>→ Pick source → destination → range (or 0 for all)</i>\n"
-        "└ /channels — View all user-added channels &amp; bulk-forward files\n"
-        "    <i>→ Shows channel info, who added it, file count,</i>\n"
-        "    <i>   forwarding progress, start/continue/stop controls</i>\n\n"
+        "├ /channels — View all user-added channels &amp; bulk-forward files\n"
+        "│   <i>→ Shows channel info, who added it, file count,</i>\n"
+        "│   <i>   forwarding progress, start/continue/stop controls</i>\n"
+        "└ /member_forward — Forward from a channel the BOT isn't in\n"
+        "    <i>→ Uses the userbot (SESSION_STRING) to pull files from a</i>\n"
+        "    <i>   channel where only your personal account is a member</i>\n\n"
+        "🔑 <b>USERBOT SETUP</b>\n"
+        "└ /gen_session — Generate a SESSION_STRING for /member_forward\n"
+        "    <i>→ Walks you through phone number → code → (2FA if any)</i>\n"
+        "    <i>   and gives you the string to set as an env var</i>\n\n"
 
         "⚙️ <b>CHANNEL SETTINGS</b>\n"
         "└ /settings — Manage your added channels\n\n"
@@ -2647,6 +2637,8 @@ async def capture_user_input(client, message):
                 "prefix_set", "suffix_set", "url_set", "word_delete_set"):
         active_users.update(bot_data.get(key, {}).keys())
     active_users.update(FF_SESSIONS.keys())
+    active_users.update(MF_SESSIONS.keys())
+    active_users.update(GS_SESSIONS.keys())
     if user_id not in active_users:
         return
 
@@ -2917,6 +2909,18 @@ async def capture_user_input(client, message):
             ),
         )
         return
+
+    # ================= GENERATE SESSION STRING HANDLER =================
+    if user_id in GS_SESSIONS:
+        if await handle_gen_session_text(client, message):
+            return
+
+    # ================= MEMBER-CHANNEL FORWARD HANDLER =================
+    # Delegates entirely to member_forward.py so its session logic stays in
+    # one file; this just routes matching free-text input to it.
+    if user_id in MF_SESSIONS:
+        if await handle_member_forward_text(client, message):
+            return
 
     # ================= FILE FORWARD SKIP HANDLER =================
     if user_id in FF_SESSIONS:
