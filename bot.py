@@ -14,9 +14,11 @@ from body.database import (
     ensure_queue_indexes,
     ensure_forward_indexes,
     ensure_dump_origin_indexes,
+    ensure_member_forward_indexes,
     recover_stuck_jobs,
 )
 from body.Caption import start_caption_workers
+from body.user_session import start_user_session, stop_user_session
 
 PLUGIN_ROOT = "body"
 
@@ -64,7 +66,13 @@ class Bot(Client):
         await ensure_queue_indexes()
         await ensure_forward_indexes()
         await ensure_dump_origin_indexes()
+        await ensure_member_forward_indexes()
         await recover_stuck_jobs()
+
+        # Optional userbot session for /member_forward (pulling files from
+        # channels the bot itself was never added to). No-op if SESSION_STRING
+        # isn't set — logs a warning and everything else starts normally.
+        await start_user_session()
 
         # Safety net for ungraceful shutdowns (Koyeb OOM-kill, crash, etc.)
         # that don't go through /restart's immediate requeue: periodically
@@ -105,6 +113,15 @@ class Bot(Client):
                                     f"**{me.first_name} started ✨**")
         except Exception:
             pass
+
+    async def stop(self, *args, **kwargs):
+        # Best-effort — never let a userbot disconnect hiccup block/crash
+        # normal bot shutdown.
+        try:
+            await stop_user_session()
+        except Exception as e:
+            logger.warning(f"⚠️  stop_user_session() raised during shutdown: {e}")
+        await super().stop(*args, **kwargs)
 
     async def _run_plugin_startup_hooks(self):
         package = importlib.import_module(PLUGIN_ROOT)
