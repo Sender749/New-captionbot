@@ -42,6 +42,14 @@ MAX_FORWARD_PER_PAIR = 1     # keep 1 – Telegram throttles hard per chat
 DEFAULT_EDIT_DELAY   = 0.5   # caption edit cooldown per worker — floor/base value
 FORWARD_DELAY        = 0.8   # forward cooldown per worker (generous)
 
+# ── Member-channel forward (userbot) tuning ──────────────────────────────────
+# Deliberately small/conservative: this path runs through a personal
+# Telegram account (not a bot), which Telegram rate-limits/flags far more
+# aggressively than bot accounts on suspicious bursts.
+MEMBER_FORWARD_WORKERS      = 2      # concurrent userbot forward tasks
+MAX_MEMBER_FORWARD_PER_PAIR = 1      # 1 at a time per src→dst pair
+MEMBER_FORWARD_DELAY        = 1.5    # cooldown per worker between sends
+
 # ════════════════════════════════════════════════════════
 #  Adaptive per-channel edit delay
 #  Each channel starts at DEFAULT_EDIT_DELAY. Every FloodWait on a
@@ -122,6 +130,14 @@ user_channels   = db.user_channels
 queue_col       = db.caption_queue
 forward_queue   = db.forward_queue
 
+# ── Member-channel forward queue (userbot-sourced jobs) ──────────────────────
+# Kept as its own collection (not reusing forward_queue) so this feature's
+# failure modes — missing/expired SESSION_STRING, userbot FloodWaits,
+# download+re-upload fallback — stay fully isolated from the well-tested
+# bot-to-bot forward queue. A problem here can never stall or corrupt a
+# normal /file_forward or /channels job.
+member_forward_queue = db.member_forward_queue
+
 # ── NEW: global admin forwarding progress ────────────────────────────────────
 # Stores per-channel forwarding resume state:
 #   { channel_id: int, last_msg_id: int, total_forwarded: int, updated_at: float }
@@ -155,6 +171,19 @@ async def ensure_forward_indexes():
     await forward_queue.create_index([("session_id", 1)])
     await forward_queue.create_index([("user_id", 1)])
     await forward_queue.create_index(
+        [("src", 1), ("dst", 1), ("ts", 1)],
+        partialFilterExpression={"status": "pending"},
+        background=True,
+    )
+
+
+async def ensure_member_forward_indexes():
+    await member_forward_queue.create_index([("status", 1), ("ts", 1)])
+    await member_forward_queue.create_index([("src", 1)])
+    await member_forward_queue.create_index([("dst", 1)])
+    await member_forward_queue.create_index([("session_id", 1)])
+    await member_forward_queue.create_index([("user_id", 1)])
+    await member_forward_queue.create_index(
         [("src", 1), ("dst", 1), ("ts", 1)],
         partialFilterExpression={"status": "pending"},
         background=True,
@@ -438,6 +467,12 @@ async def recover_stuck_jobs(timeout=300):
     )
     if r2.modified_count:
         logger.info(f"[RECOVER] Reset {r2.modified_count} stuck forward job(s)")
+    r3 = await member_forward_queue.update_many(
+        {"status": "processing", "started": {"$lt": cutoff}},
+        {"$set": {"status": "pending"}},
+    )
+    if r3.modified_count:
+        logger.info(f"[RECOVER] Reset {r3.modified_count} stuck member-forward job(s)")
 
 
 # ════════════════════════════════════════════════════════
@@ -458,6 +493,32 @@ async def forward_done(job_id):
 
 async def forward_retry(job_id, delay: float):
     await forward_queue.update_one(
+        {"_id": job_id},
+        {
+            "$set": {"status": "pending", "ts": time.time() + delay},
+            "$inc": {"retries": 1},
+        },
+    )
+
+
+# ════════════════════════════════════════════════════════
+#  Member-channel forward queue helpers  (userbot-sourced jobs)
+# ════════════════════════════════════════════════════════
+async def enqueue_member_forward(job: dict):
+    await member_forward_queue.insert_one({
+        **job,
+        "status":  "pending",
+        "retries": 0,
+        "ts":      time.time(),
+    })
+
+
+async def member_forward_done(job_id):
+    await member_forward_queue.delete_one({"_id": job_id})
+
+
+async def member_forward_retry(job_id, delay: float):
+    await member_forward_queue.update_one(
         {"_id": job_id},
         {
             "$set": {"status": "pending", "ts": time.time() + delay},
