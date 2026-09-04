@@ -28,3 +28,11 @@ FF_CH = int(os.environ.get("FF_CH", "-1003073036876"))
 # ── Admin global-forward destination ─────────────────────────────────────────
 # Files forwarded via /channels → "File Forwarding" are sent here.
 MANUAL_FF = int(os.environ.get("MANUAL_FF", "-1003979911149"))
+
+# ── Member-channel forward (userbot) ─────────────────────────────────────────
+# Pyrogram session string for a personal Telegram account (NOT the bot).
+# Powers /member_forward, which pulls files out of channels where this
+# account is a member/admin but the BOT ITSELF was never added — something
+# the Bot API can never do on its own. Leave empty to disable the feature
+# entirely; nothing else in the bot depends on it.
+SESSION_STRING = str(getenv("SESSION_STRING", ""))
