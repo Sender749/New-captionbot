@@ -651,6 +651,12 @@ async def set_dump_skip(channel_id: int, status: bool):
         {"$set": {"dump_skip": bool(status)}},
         upsert=True,
     )
+    # Write-through the cache (same pattern as set_dump_destination below) --
+    # without this, is_dump_skip() keeps serving the stale cached value for
+    # up to CACHE_TTL seconds after this call, so the caption workers kept
+    # dumping files even though the DB already said "skip".
+    if channel_id in _CHANNEL_CACHE:
+        _CHANNEL_CACHE[channel_id]["data"]["dump_skip"] = bool(status)
 
 
 async def remove_dump_skip(channel_id: int):
@@ -658,6 +664,8 @@ async def remove_dump_skip(channel_id: int):
         {"chnl_id": channel_id},
         {"$unset": {"dump_skip": ""}},
     )
+    if channel_id in _CHANNEL_CACHE:
+        _CHANNEL_CACHE[channel_id]["data"].pop("dump_skip", None)
 
 
 async def is_dump_skip(channel_id: int) -> bool:
@@ -799,6 +807,17 @@ async def add_user_channel(user_id: int, channel_id: int, channel_title: str):
 async def get_user_channels(user_id):
     data = await users.find_one({"_id": user_id})
     return data.get("channels", []) if data else []
+
+
+async def get_channel_owner(channel_id: int) -> Optional[int]:
+    """
+    Reverse lookup: which user_id added this channel, per the `users`
+    collection's embedded channels list (the same list add_user_channel()
+    writes to and admin_channels.py reads from). Returns None if no user
+    doc references this channel (e.g. the owner's user doc was deleted).
+    """
+    doc = await users.find_one({"channels.channel_id": channel_id}, {"_id": 1})
+    return doc["_id"] if doc else None
 
 
 # ════════════════════════════════════════════════════════

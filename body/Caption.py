@@ -10,6 +10,7 @@ from body.database import *
 from body.file_forward import *
 from body.member_forward import MF_SESSIONS, handle_member_forward_text
 from body.gen_session import GS_SESSIONS, handle_gen_session_text
+from body.dump_direction import render_dump_skip_list
 from collections import deque, defaultdict
 from imdb import IMDb
 from body.database import _CHANNEL_CACHE as CHANNEL_CACHE, CHANNEL_ACTIVE, CHANNEL_COOLDOWN, DEFAULT_MAX_WORKERS
@@ -269,9 +270,8 @@ async def dump_skip_cmd(client, message):
     except ValueError:
         return await message.reply_text("❌ Invalid channel ID")
     await set_dump_skip(channel_id, True)
-    text = "✅ <b>Dump skip enabled</b>\n\n"
-    text += await format_dump_skip_list(client)
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
+    await message.reply_text("✅ <b>Dump skip enabled</b>", parse_mode=ParseMode.HTML)
+    await render_dump_skip_list(client, message, page=0)
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("remove_dump"))
 async def remove_dump_cmd(client, message):
@@ -285,9 +285,8 @@ async def remove_dump_cmd(client, message):
     except ValueError:
         return await message.reply_text("❌ Invalid channel ID")
     await remove_dump_skip(channel_id)
-    text = "🗑 <b>Dump skip removed</b>\n\n"
-    text += await format_dump_skip_list(client)
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
+    await message.reply_text("🗑 <b>Dump skip removed</b>", parse_mode=ParseMode.HTML)
+    await render_dump_skip_list(client, message, page=0)
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("id"))
 async def dump_origin_id_cmd(client, message):
@@ -2306,21 +2305,6 @@ def remove_emojis(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
-
-async def format_dump_skip_list(client: Client) -> str:
-    items = await get_all_dump_skip_channels()
-    if not items:
-        return "📭 <b>No dump-skip channels</b>"
-    lines = ["📌 <b>Dump-skip channels:</b>\n"]
-    for doc in items:
-        cid = doc["chnl_id"]
-        try:
-            chat = await client.get_chat(cid)
-            title = chat.title
-        except:
-            title = "Unknown / Bot not in channel"
-        lines.append(f"• <b>{title}</b>\n  <code>{cid}</code>")
-    return "\n".join(lines)
 
 def normalize_series_name(name: str) -> str:
     if not name:

@@ -12,6 +12,8 @@ from body.database import (
     get_dump_destination,
     set_dump_destination,
     clear_dump_destination,
+    get_all_dump_skip_channels,
+    get_channel_owner,
 )
 from info import ADMIN, CP_CH
 
@@ -234,3 +236,120 @@ async def dchg_default(client: Client, query):
     except Exception as e:
         logger.exception(f"[DUMP_CHANGE] reset failed source={source_id}: {e}")
         await query.answer(f"❌ Failed to reset: {e}", show_alert=True)
+
+
+# ── /dump_skip list ───────────────────────────────────────────────────────────
+# Paginated viewer for every channel currently in dump-skip mode. Used both
+# as its own command (/dump_skip_list) and right after /dump_skip or
+# /remove_dump toggles a channel (Caption.py calls render_dump_skip_list()).
+#
+# Replaces the old format_dump_skip_list() (previously in Caption.py), which
+# called client.get_chat() one at a time, sequentially, for EVERY dump-skip
+# channel with no pagination -- the more skip-channels existed, the slower
+# every single reply got. This version only resolves the 10 channels on the
+# current page, and prefers the already-cached title (chnl_ids._title) over
+# a live API call.
+
+def _private_channel_link(channel_id: int) -> str:
+    """
+    A t.me/c/<internal_id> deep link. Works for ANY channel -- public or
+    private -- as long as the viewer (the admin tapping it) is already a
+    member, which they are by definition since they're managing it here.
+    Needs no stored/looked-up @username at all, so it's free to build.
+    """
+    cid_str = str(channel_id)
+    internal_id = cid_str[4:] if cid_str.startswith("-100") else cid_str.lstrip("-")
+    return f"https://t.me/c/{internal_id}/1"
+
+
+async def _render_dump_skip_list(client: Client, target, page: int = 0):
+    is_query = hasattr(target, "data")   # True → CallbackQuery
+
+    try:
+        items = await get_all_dump_skip_channels()
+    except Exception as e:
+        logger.exception(f"[DUMP_SKIP_LIST] failed to fetch list: {e}")
+        text = f"❌ <b>Failed to load dump-skip list.</b>\n<code>{e}</code>"
+        if is_query:
+            await target.message.edit_text(text)
+        else:
+            await target.reply_text(text)
+        return
+
+    if not items:
+        text = "📭 <b>No dump-skip channels.</b>"
+        kb = [[InlineKeyboardButton("❌", callback_data="close_msg")]]
+        if is_query:
+            await target.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await target.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    items.sort(key=lambda d: (d.get("_title") or str(d.get("chnl_id"))).casefold())
+
+    total_pages = max(1, (len(items) + CHANNELS_PER_PAGE - 1) // CHANNELS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * CHANNELS_PER_PAGE
+    page_items = items[start:start + CHANNELS_PER_PAGE]
+
+    lines = [f"📌 <b>Dump-skip channels</b> — {len(items)} total\n"]
+    for doc in page_items:
+        cid = doc.get("chnl_id")
+        if cid is None:
+            continue
+        title = doc.get("_title") or await _resolve_title(client, cid)
+        owner_id = await get_channel_owner(cid)
+        owner_text = (
+            f'<a href="tg://user?id={owner_id}">{owner_id}</a>' if owner_id else "Unknown"
+        )
+        lines.append(
+            f'📢 <a href="{_private_channel_link(cid)}">{title}</a>\n'
+            f'🆔 <code>{cid}</code>  •  👤 Added by: {owner_text}'
+        )
+    text = "\n\n".join(lines)
+
+    kb = []
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"dskip_pg_{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"dskip_pg_{page + 1}"))
+        kb.append(nav_row)
+    kb.append([InlineKeyboardButton("❌", callback_data="close_msg")])
+
+    if is_query:
+        await target.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
+    else:
+        await target.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
+
+
+async def render_dump_skip_list(client: Client, target, page: int = 0):
+    """Public entry point -- Caption.py calls this after /dump_skip and
+    /remove_dump toggle a channel, so the confirmation is followed by the
+    live, paginated list instead of the old plain-text dump."""
+    await _render_dump_skip_list(client, target, page=page)
+
+
+@Client.on_message(filters.private & _ADMIN_FILTER & filters.command("dump_skip_list"))
+async def dump_skip_list_cmd(client: Client, message):
+    try:
+        await _render_dump_skip_list(client, message, page=0)
+    except Exception as e:
+        logger.exception(f"[DUMP_SKIP_LIST] render failed: {e}")
+        try:
+            await message.reply_text(f"❌ Failed to load dump-skip list:\n<code>{e}</code>")
+        except Exception:
+            pass
+
+
+@Client.on_callback_query(filters.regex(r"^dskip_pg_(\d+)$") & _ADMIN_FILTER)
+async def dskip_page_nav(client: Client, query):
+    await query.answer()
+    page = int(query.matches[0].group(1))
+    try:
+        await _render_dump_skip_list(client, query, page=page)
+    except Exception as e:
+        logger.exception(f"[DUMP_SKIP_LIST] pagination failed page={page}: {e}")
+        await query.answer(f"❌ Failed to load page: {e}", show_alert=True)
