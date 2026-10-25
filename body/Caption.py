@@ -8,6 +8,8 @@ from info import *
 from Script import script
 from body.database import *  
 from body.file_forward import *
+from body.smart_text import analyze, normalize_text, ENGINE_VERSION, FALLBACK_NAMES
+from body.caption_history import record_history
 from body.member_forward import MF_SESSIONS, handle_member_forward_text
 from body.gen_session import GS_SESSIONS, handle_gen_session_text
 from body.dump_direction import render_dump_skip_list
@@ -905,7 +907,8 @@ async def caption_worker(client: Client, worker_id: int = 0):
             # Heavy parsing/template-building happens HERE, right before
             # the edit — not back in reCap() when the file first arrived.
             # See render_caption_for_job() for why.
-            new_caption, dump_smart_caption = render_caption_for_job(job)
+            hist_meta = {}
+            new_caption, dump_smart_caption = render_caption_for_job(job, meta_out=hist_meta)
             await client.edit_message_caption(
                 chat_id=ch,
                 message_id=job["message_id"],
@@ -945,6 +948,9 @@ async def caption_worker(client: Client, worker_id: int = 0):
                     logger.debug(f"[CAP_WORKER_{worker_id}] dump-copy skipped ch={ch} msg={job['message_id']}: {e}")
             await mark_done(job["_id"])
             logger.info(f"[CAP_WORKER_{worker_id}] edited ch={ch} msg={job['message_id']}")
+            # Caption history: non-blocking (asyncio queue + bulk writer) and
+            # can never raise, so it cannot slow down or break this worker.
+            record_history(job, hist_meta, new_caption, dump_smart_caption)
             # Adaptive per-channel pace: reward a clean edit (nudges this
             # channel's delay back down over a long streak), then sleep
             # for THIS channel's current delay rather than one fixed
@@ -1016,11 +1022,15 @@ def start_caption_workers(client: Client, count: int = None):
         asyncio.create_task(_guarded(i), name=f"cap_worker_{i}")
     logger.info(f"[CAP] {n} caption workers started")
 
-def render_caption_for_job(job: dict):
+def render_caption_for_job(job: dict, meta_out: dict = None):
     """
     Does the actual heavy lifting: filename/caption parsing, smart-filename
     building, template formatting, block/replace words, prefix/suffix,
     link/emoji removal. Returns (new_caption, dump_smart_caption).
+
+    meta_out: optional dict that is filled with the analysis metadata
+    (confidence/source per field, flags, engine_version) so the caller can
+    save it to the caption history without parsing the file a second time.
 
     This used to run inline inside reCap() -- the Telegram update handler
     itself -- for EVERY incoming file, on the same single asyncio event
@@ -1051,19 +1061,23 @@ def render_caption_for_job(job: dict):
     file_size = job.get("file_size")
     cap_template = job["cap_template"]
 
-    combined_raw = f"{original_file_name} {default_caption_plain}"
-    audio_lang_list = extract_audio_languages(combined_raw)
-    language = " + ".join(audio_lang_list) if audio_lang_list else ""
-    year = extract_year(default_caption_plain) or extract_year(original_file_name) or ""
-
+    language = ""
+    year = ""
     smart_file_name = ""  # always defined, even if the try body below throws
     try:
         raw_file_name = normalize_series_name(file_name)
         file_info = parse_file_info(original_file_name or raw_file_name, default_caption_plain)
+        # one analysis feeds {language}, {year}, {audio} ... and the smart name
+        language = " + ".join(file_info.get("audio_langs") or [])
+        year = file_info.get("year") or extract_year(default_caption_plain) or extract_year(original_file_name) or ""
+        if meta_out is not None:
+            meta_out.update(file_info.get("_meta") or {})
         smart_file_name = build_smart_filename(
             original_file_name or raw_file_name, default_caption_plain,
             precomputed_info=file_info,
         )
+        if meta_out is not None:
+            meta_out["smart_file_name"] = smart_file_name
         new_caption = cap_template.format(
             file_name=raw_file_name,
             smart_file_name=smart_file_name,
@@ -1156,9 +1170,11 @@ async def reCap(client, msg):
         default_caption_html = msg.caption.html if msg.caption else default_caption_plain
         file_name = None
         file_size = None
+        file_unique_id = None
         for file_type in ("video", "audio", "document", "voice"):
             obj = getattr(msg, file_type, None)
             if obj:
+                file_unique_id = getattr(obj, "file_unique_id", None)
                 file_name = getattr(obj, "file_name", None)
                 if not file_name and file_type == "voice":
                     file_name = "Voice Message"
@@ -1206,6 +1222,7 @@ async def reCap(client, msg):
             "message_id": msg.id,
             "file_name": file_name,
             "original_file_name": original_file_name,
+            "file_unique_id": file_unique_id,
             "default_caption_plain": default_caption_plain,
             "default_caption_html": default_caption_html,
             "file_size": file_size,
@@ -1323,6 +1340,7 @@ QUALITY_LIST = [
     "WEB-DL", "WEBRip", "WEB",
     "BluRay", "Blu-Ray", "BRRip", "BDRip",
     "HDRip", "DVDRip", "DVDScr", "DVD",
+    "HDCAMRip", "CAMRip", "TSRip", "HDScr",
     "HDTS", "HDTC", "HDCAM", "HDTV",
     "Theater Print", "Theatrical Print", "TC Print",
     "PreDVD", "Pre-DVD", "PDVD",
@@ -1479,7 +1497,9 @@ _SOUTH_RE     = re.compile(r'\bSouth\b', re.I)
 _BOLLYWOOD_RE = re.compile(r'\bBollywood\b', re.I)
 _HOLLYWOOD_RE = re.compile(r'\bHollywood\b', re.I)
 _DUAL_RE      = re.compile(r'\bDual[\s.]*Audio\b', re.I)
-_MULTI_RE     = re.compile(r'\bMulti[\s.]*(?:Audio|Lang(?:uage)?)?\b', re.I)
+# bare "Multi" counts (it runs on the TAG text, so the title "Multi Bhai" never
+# reaches it) -- but "Multi Sub(s)" is a subtitle tag, not extra audio.
+_MULTI_RE     = re.compile(r'\bMulti(?![\s.\-]*(?:sub|subs|subtitle|subtitles)\b)', re.I)
 _COMPLETED_RE = re.compile(r'\bCompleted\b', re.I)
 _HD_RE        = re.compile(r'\b(?:HD|FHD|Full[\s.]*HD)\b', re.I)
 _HDR_RE       = re.compile(r'\b(?:HDR10\+|HDR10|HDR|Dolby[\s.]*Vision|DV)\b', re.I)
@@ -1494,7 +1514,8 @@ _URL_RE       = re.compile(r'(?:https?://|www\.)\S+', re.I)
 _TME_RE       = re.compile(r't\.me/\S+', re.I)
 _MENTION_RE   = re.compile(r'@[A-Za-z0-9_]{3,}')
 _DOMAIN_RE    = re.compile(
-    r'\b[A-Za-z0-9-]{2,30}\.(?:com|net|in|co|org|me|xyz|info|live|cc|to|link|pw|icu|site)\b',
+    r'\b[A-Za-z0-9-]{2,30}(?:\.(?:com|net|org|info|xyz|live|link|pw|icu|site)\b'
+    r'|\.(?:in|co|me|to|cc)(?![.\w]))',
     re.I
 )
 _AD_PHRASE_RE = re.compile(
@@ -1597,90 +1618,13 @@ def imdb_enrich_title(title: str, year: str):
 # ── Title + Year extractor ────────────────────────────────────────
 def extract_title_year(raw: str):
     """
-    Robustly extracts the show/movie title and release year.
-
-    Strategy:
-      1. Normalise separators (dots, underscores → spaces).
-      2. Find the first 4-digit year (1900–2099) — everything before it
-         is a candidate title.
-      3. Strip season/episode markers, codec/quality/source/language
-         noise and bracketed alt-title junk from the candidate.
-      4. Title-case the result.
-
-    Handles all common naming conventions:
-      • Movie.Name.2024.1080p.BluRay.mkv
-      • Show Name S03 E07 (2023) Hindi WEB-DL
-      • Title (2020) (Hindi + Tamil) Dual Audio UnCut 720p
-      • Anime.Name.S01.EP05.720p.HEVC
+    Thin wrapper kept for API compatibility. The real work is done by
+    body.smart_text.analyze(): the title is the part of the line before the
+    year / season / resolution / quality anchor, minus trailing tag words,
+    and the FIRST word of a title is never cut ("Hindi Medium", "Sub Zero").
     """
-    text = _clean_raw(raw)
-
-    # Strip recognized filler/noise tokens from the very START of the
-    # text first (e.g. reCap's fallback "File "/"Document " name when a
-    # file has no real filename, or a bare leading extension). Without
-    # this, a noise match sitting right at position 0 would collapse
-    # the boundary computed below down to zero and produce an empty
-    # title instead of skipping past the filler to reach the real one.
-    text = re.sub(rf'^(?:\s*(?:{_NOISE})\b[\s.\-]*)+', '', text, flags=re.I)
-
-    # Step 1: locate year
-    year_m = re.search(r'\b((?:19|20)\d{2})\b', text)
-    year   = year_m.group(1) if year_m else ""
-
-    # Step 1b: the title candidate is bounded at the EARLIEST of several
-    # signals — a year, a season/episode marker, the first recognized
-    # metadata noise token (quality/source/codec/language/subtitle/tag),
-    # or a line break. Whichever comes first wins.
-    #
-    # This matters most when there's NO year at all, which is extremely
-    # common for real channel captions (e.g. TV-episode posts, or a
-    # caption that's just free-form promo/description text). The old
-    # code's fallback for "no year found" was to treat the ENTIRE
-    # remaining text as the title — which, once the smart-filename
-    # engine started reading real captions (not just clean filenames),
-    # meant large chunks of a caption's own prose ended up copied
-    # verbatim into the "title", making the rebuilt caption look like
-    # the original caption with a half-broken smart tag list glued on
-    # after it.
-    boundary = len(text)
-    if year_m:
-        boundary = min(boundary, year_m.start())
-    se_m = re.search(r'\bS(?:eason)?\s*\d{1,3}\b', text, re.I)
-    if se_m:
-        boundary = min(boundary, se_m.start())
-    ep_m = re.search(r'\bEp?(?:isode)?\.?\s*\d{1,3}\b', text, re.I)
-    if ep_m:
-        boundary = min(boundary, ep_m.start())
-    noise_m = re.search(rf'\b(?:{_NOISE})\b', text, re.I)
-    if noise_m:
-        boundary = min(boundary, noise_m.start())
-    nl_m = re.search(r'[\r\n]', text)
-    if nl_m:
-        boundary = min(boundary, nl_m.start())
-
-    cut = boundary
-    title_raw = text[:cut]
-
-    # Step 2: strip season / episode markers from title zone
-    title_raw = re.sub(r'\s*\bS(?:eason)?\s*\d{1,3}(?:E\d{1,3})+\b.*$', '', title_raw, flags=re.I)  # S01E07 / S01E07E08
-    title_raw = re.sub(r'\s*\bS(?:eason)?\s*\d{1,3}\b.*$', '', title_raw, flags=re.I)
-    title_raw = re.sub(r'\s*\bEp?(?:isode)?\.?\s*\d{1,3}\b.*$', '', title_raw, flags=re.I)
-
-    # Step 3: strip known noise tokens (dynamically built from all tables)
-    title_raw = re.sub(rf'\b(?:{_NOISE})\b', '', title_raw, flags=re.I)
-
-    # Step 4: remove bracketed junk – "(Poojai)", "[Clear]", "{hin}"
-    title_raw = re.sub(r'\([^)]{0,50}\)', '', title_raw)
-    title_raw = re.sub(r'\[[^\]]{0,50}\]', '', title_raw)
-    title_raw = re.sub(r'\{[^}]{0,50}\}', '', title_raw)
-
-    # Step 5: strip leading/trailing punctuation
-    title_raw = re.sub(r'[\[\]()\-–—:,|{}\s]+$', '', title_raw.strip())
-    title_raw = re.sub(r'^[\[\]()\-–—:,|{}\s]+', '', title_raw.strip())
-
-    title = re.sub(r'\s{2,}', ' ', title_raw).strip()
-    title = title.title() if title else ""
-    return title, year
+    a = analyze("", raw)
+    return a["title"]["value"], a["year"]["value"]
 
 # ── Season / Episode extractor ───────────────────────────────────
 def extract_season_episode(text: str):
@@ -1716,12 +1660,19 @@ def extract_season_episode(text: str):
     m = re.search(
         r'\bS(?:eason)?\s*0*(\d{1,3})\s*'
         r'E(?:p(?:isode)?)?\.?\s*0*(\d{1,3})\s*[-–to]+\s*'
-        r'(?:E(?:p(?:isode)?)?\.?\s*)?0*(\d{1,3})\b',
+        r'(E(?:p(?:isode)?)?\.?\s*)?0*(\d{1,3})\b',
         t, re.I
     )
     if m:
         season  = f"S{int(m.group(1)):02d}"
-        episode = f"Ep.{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        # "S01 E01-E05" keeps the E-form, "S15 E06-15" the Ep.-form, so
+        # feeding the engine its own output is stable (idempotent).
+        if int(m.group(2)) == int(m.group(4)):          # "S01E03 - Episode 3" is ONE episode
+            return season, f"E{int(m.group(2)):02d}", ""
+        if m.group(3):
+            episode = f"E{int(m.group(2)):02d}-E{int(m.group(4)):02d}"
+        else:
+            episode = f"Ep.{int(m.group(2)):02d}-{int(m.group(4)):02d}"
         return season, episode, "Combined Episodes"
 
     # ── 2. Season + double-episode contiguous: S01E07E08 ─────────
@@ -1768,111 +1719,18 @@ def extract_season_episode(text: str):
 
     return season, episode, ""
 
-# ── Subtitle-language context ─────────────────────────────────────
-def _subtitle_context_spans(text: str):
-    """
-    Return character spans (start, end) of the LANGUAGE portion of any
-    subtitle-language relationship found by `_scan_subtitle_context`.
-    Any language match whose position falls inside one of these spans
-    is treated as a subtitle language, not an audio language.
-
-    NOTE: spans are relative to the dot/underscore-normalized text
-    (see `_clean_raw`) — the caller must run language matching against
-    that SAME normalized string for the offsets to line up correctly.
-    """
-    spans, _ = _scan_subtitle_context(text)
-    return spans
-
-def _get_subtitle_languages(text: str) -> set:
-    """
-    Returns the set of language names explicitly paired with a subtitle
-    reference (e.g. "English Subtitle", "Subtitle: Hindi, Punjabi").
-    Used by extract_subtitle_tag to pick ESub/HSub/MSub, and by
-    extract_audio_languages to make sure those mentions are NOT counted
-    as audio languages.
-    """
-    _, langs = _scan_subtitle_context(text)
-    return langs
-
-# ── Language extractor ────────────────────────────────────────────
+# ── Language / subtitle extractors ────────────────────────────────
+# Audio vs subtitle language detection now lives in body/smart_text.py
+# (normalisation -> labeled lines -> filename tag zone -> confidence).
 def extract_audio_languages(text: str) -> list:
-    """
-    Extract the AUDIO languages present in the filename + caption.
+    """Audio languages found in `text` (HIGH/MEDIUM confidence only)."""
+    return analyze("", text)["audio"]["langs"]
 
-    • Context-aware: a language mention that only ever appears as part
-      of a "<lang> Subtitle" / "Subtitle: <lang>" phrase (spelled out
-      in full, not just ESub/HSub) is treated as a SUBTITLE language
-      and excluded here — even while other real audio languages
-      (Hindi, Punjabi, etc.) in the same text are still picked up.
-    • If the same language ALSO appears elsewhere outside a subtitle
-      context, it's still counted as audio (that occurrence wins).
-    • Languages are returned IN THE ORDER THEY APPEAR in the text,
-      so "Hindi + Telugu" always stays "Hindi + Telugu".
-    • Full names are tried first; 3-letter ISO codes only as fallback.
-    """
-    text = _clean_raw(text)  # keep positions consistent with sub-span offsets
-    sub_spans = _subtitle_context_spans(text)
 
-    def _in_sub_span(pos: int) -> bool:
-        return any(s <= pos < e for s, e in sub_spans)
-
-    found_with_pos: list = []
-
-    for lang in LANG_LIST:
-        for m in re.finditer(rf'\b{re.escape(lang)}\b', text, re.I):
-            if _in_sub_span(m.start()):
-                continue
-            found_with_pos.append((m.start(), lang))
-            break  # first non-subtitle occurrence is enough for this language
-
-    # Fallback: 3-letter codes (only if zero full names found)
-    if not found_with_pos:
-        for code, lang in LANG_CODE_MAP.items():
-            m = re.search(rf'\b{re.escape(code)}\b', text, re.I)
-            if m and not _in_sub_span(m.start()) and lang not in [l for _, l in found_with_pos]:
-                found_with_pos.append((m.start(), lang))
-
-    # Sort by position of first appearance → preserves source order
-    found_with_pos.sort(key=lambda x: x[0])
-
-    # Deduplicate while keeping order (same lang matched at two positions)
-    seen: set = set()
-    result: list = []
-    for _, lang in found_with_pos:
-        if lang not in seen:
-            seen.add(lang)
-            result.append(lang)
-    return result
-
-# ── Subtitle tag extractor ────────────────────────────────────────
 def extract_subtitle_tag(text: str) -> str:
-    """
-    Returns the subtitle presence tag.
-    Priority: ESub > HSub > MSub > Sub
+    """ESub / HSub / MSub / "" for `text`."""
+    return analyze("", text)["subtitle"]["tag"]
 
-    Also promotes a spelled-out "<lang> Subtitle" mention:
-      English  → ESub
-      Hindi    → HSub
-      2+ langs → MSub
-    """
-    if ESUB_RE.search(text):
-        return "ESub"
-    if HSUB_RE.search(text):
-        return "HSub"
-    if MSUB_RE.search(text):
-        return "MSub"
-    sub_langs = _get_subtitle_languages(text)
-    if sub_langs:
-        if len(sub_langs) > 1:
-            return "MSub"
-        if "English" in sub_langs:
-            return "ESub"
-        if "Hindi" in sub_langs:
-            return "HSub"
-        return "MSub"
-    if SUB_RE.search(text):
-        return "MSub"
-    return ""
 
 # ── Individual placeholder extractors ────────────────────────────
 def extract_resolution(text: str) -> str:
@@ -1882,14 +1740,20 @@ def extract_resolution(text: str) -> str:
             return r
     return ""
 
+_WEB_SERIES_RE = re.compile(r'\bweb[\s.\-]*series\b', re.I)
+_WEB_RIP_RE = re.compile(r'\bweb[\s.\-]rip\b', re.I)
+
+
 def extract_quality(text: str) -> str:
     """
     Returns the print/rip-quality tag — e.g. WEB-DL, BluRay, HDRip,
     Theater Print, HDCAM … (NOT the pixel resolution — see
     extract_resolution for that).
     """
+    text = _WEB_SERIES_RE.sub(" ", text)     # "Web Series" is a label, not a WEB print
+    text = _WEB_RIP_RE.sub("WEBRip", text)   # "Web-Rip" / "Web Rip" -> WEBRip
     for q in QUALITY_LIST:
-        pattern = re.escape(q).replace(r'\ ', r'[\s.\-]*')
+        pattern = re.escape(q).replace(r'\ ', r'[\s.\-]*').replace(r'\-', r'[\s.\-_]?')
         if re.search(rf'\b{pattern}\b', text, re.I):
             return q
     return ""
@@ -1947,6 +1811,12 @@ def extract_extension(text: str) -> str:
     return ""
 
 # ── Audio label formatter ─────────────────────────────────────────
+_CODEC_CASE = {
+    "truehd atmos": "TrueHD Atmos", "dolby atmos": "Dolby Atmos",
+    "atmos": "Atmos", "truehd": "TrueHD",
+}
+
+
 def _format_audio_label(langs: list, text: str) -> str:
     """
     Formats the audio language block, preserving codec+bitrate annotation
@@ -1972,8 +1842,9 @@ def _format_audio_label(langs: list, text: str) -> str:
     )
     acodec_str = ""
     if m:
-        codec_part   = m.group(1)
-        bitrate_part = m.group(2)
+        # the tag text is lower-cased by the normaliser -> restore canonical casing
+        codec_part   = _CODEC_CASE.get(m.group(1).lower().replace("  ", " "), m.group(1).upper())
+        bitrate_part = re.sub(r"(?i)kbps$", "Kbps", m.group(2)) if m.group(2) else None
         acodec_str   = f" {codec_part}-{bitrate_part}" if bitrate_part else f" {codec_part}"
     else:
         br_m = _BITRATE_RE.search(text)
@@ -2023,25 +1894,33 @@ def detect_media_type(text: str) -> str:
 # ── Master metadata parser ────────────────────────────────────────
 def parse_file_info(filename: str, caption: str) -> dict:
     """
-    Parse all metadata from filename + caption combined (with promo/ad
-    noise stripped first). Returns a flat dict used directly by the
-    {placeholder} template engine.
-    """
-    raw = _build_clean_raw(filename, caption)
+    Parse all metadata from filename + caption (promo/ad noise stripped
+    first). Returns a flat dict used directly by the {placeholder} engine.
 
-    title, year          = extract_title_year(raw)
-    title, year          = imdb_enrich_title(title, year)  # no-op unless explicitly enabled
+    Title / year / audio / subtitle come from smart_text.analyze() and carry
+    a confidence + source (see the "_meta" key). Quality / source / codec /
+    flag extractors run on the TAG text only (everything except the title
+    words), so a title like "Cam Girl" or "TS Madras" is never read as a
+    CAM / TS print.
+    """
+    fn_n = strip_promo_noise(normalize_text(filename or ""))
+    cap_n = strip_promo_noise(normalize_text(caption or ""))
+    a = analyze(fn_n, cap_n, normalized=True)
+    raw = f"{fn_n} {cap_n}".replace("\n", " ")
+    tag = a["tag_text"] or raw
+
+    title, year = a["title"]["value"], a["year"]["value"]
+    title, year = imdb_enrich_title(title, year)  # no-op unless explicitly enabled
     season, episode, stag = extract_season_episode(raw)
-    audio_langs          = extract_audio_languages(raw)
-    subtitle             = extract_subtitle_tag(raw)
-    resolution            = extract_resolution(raw)
-    quality               = extract_quality(raw)
-    source                = extract_source(raw)
-    vcodec                = extract_video_codec(raw)
-    acodec                = extract_audio_codec(raw)
-    bitrate               = extract_bitrate(raw)
-    ext                   = extract_extension(raw)
-    audio_str             = _format_audio_label(audio_langs, raw) if audio_langs else ""
+    audio_langs = a["audio"]["langs"]
+    resolution = extract_resolution(tag)
+    quality = extract_quality(tag)
+    source = extract_source(tag)
+    vcodec = extract_video_codec(tag)
+    acodec = extract_audio_codec(tag)
+    bitrate = extract_bitrate(tag)
+    ext = extract_extension(raw)
+    audio_str = _format_audio_label(audio_langs, tag) if audio_langs else ""
 
     return {
         "title":       title,
@@ -2051,7 +1930,7 @@ def parse_file_info(filename: str, caption: str) -> dict:
         "season_tag":  stag,          # "Combined Episodes" | "Complete Season" | ""
         "audio":       audio_str,
         "audio_langs": audio_langs,
-        "subtitle":    subtitle,
+        "subtitle":    a["subtitle"]["tag"],
         "quality":     quality,        # print/rip type   e.g. WEB-DL, BluRay, HDCAM
         "resolution":  resolution,     # pixel resolution e.g. 720p, 1080p, 4K
         "source":      source,         # OTT platform     e.g. Amazon Prime, Netflix
@@ -2059,9 +1938,28 @@ def parse_file_info(filename: str, caption: str) -> dict:
         "acodec":      acodec,
         "bitrate":     bitrate,
         "extension":   ext,
+        # internal -- used by build_smart_filename and the caption history
+        "_raw":        raw,
+        "_tag_text":   tag,
+        "_meta": {
+            "engine_version": ENGINE_VERSION,
+            "title":    a["title"],
+            "year":     a["year"],
+            "audio":    {k: a["audio"][k] for k in ("langs", "conf", "source")},
+            "subtitle": {k: a["subtitle"][k] for k in ("langs", "tag", "conf", "source")},
+            "flags":    a["flags"],
+            "dual_kw":  a["audio"]["dual"],
+        },
     }
 
+
 # ── Smart caption builder ─────────────────────────────────────────
+_FLAG_CASE = {
+    "hd": "HD", "fhd": "FHD", "full hd": "Full HD", "hdr": "HDR", "hdr10": "HDR10",
+    "hdr10+": "HDR10+", "dolby vision": "Dolby Vision", "dv": "DV",
+}
+
+
 def build_smart_filename(filename: str, caption: str, precomputed_info: dict = None) -> str:
     """
     Build a professional, fully structured media caption from filename + caption.
@@ -2092,10 +1990,14 @@ def build_smart_filename(filename: str, caption: str, precomputed_info: dict = N
       My Hero Academia S06 E07 (2023) Japanese + English Anime HEVC 1080p ESub.mkv
       Panchayat S03 (Complete Season) (2024) Hindi Web Series Netflix WEB-DL 1080p ESub.mkv
     """
-    raw         = _build_clean_raw(filename, caption)
     info        = precomputed_info if precomputed_info is not None else parse_file_info(filename, caption)
-    media_type  = detect_media_type(raw)
-    audio_langs = info.get("audio_langs") or extract_audio_languages(raw)
+    raw_full    = info.get("_raw") or _build_clean_raw(filename, caption)
+    # Flags / quality / codec regexes look at the TAG text only (the title
+    # words are removed), so "Cam Girl", "Multi Bhai", "Dual Survival" never
+    # turn into CAM / Multi Audio / Dual Audio tags.
+    raw         = info.get("_tag_text") or raw_full
+    media_type  = detect_media_type(raw_full)
+    audio_langs = info.get("audio_langs") or []
     parts: list = []
 
     # ── 1. Title ─────────────────────────────────────────────────
@@ -2118,11 +2020,9 @@ def build_smart_filename(filename: str, caption: str, precomputed_info: dict = N
     # ── 5. Audio / Language block ────────────────────────────────
     if audio_langs:
         audio_label = _format_audio_label(audio_langs, raw)
-        # Wrap multi-language in parentheses (matches real-world conventions)
-        if len(audio_langs) > 1:
-            parts.append(f"({audio_label})")
-        else:
-            parts.append(audio_label)
+        # Every audio block is bracketed -- one language or several -- and a
+        # detected audio codec stays inside the bracket: (Hindi AAC)
+        parts.append(f"({audio_label})")
 
     # ── 6. Dual / Multi Audio label ──────────────────────────────
     # Automatic — based on how many languages were actually detected —
@@ -2130,6 +2030,10 @@ def build_smart_filename(filename: str, caption: str, precomputed_info: dict = N
     # as an additional (not required) signal.
     explicit_dual  = bool(_DUAL_RE.search(raw))
     explicit_multi = bool(_MULTI_RE.search(raw))
+    # A labeled "Audio:" list is authoritative: a stray "Dual Audio" word in
+    # the filename must not contradict it.
+    if ((info.get("_meta") or {}).get("audio") or {}).get("source") == "label":
+        explicit_dual = explicit_multi = False
     if len(audio_langs) >= 3 or explicit_multi:
         parts.append("Multi Audio")
     elif len(audio_langs) == 2 or explicit_dual:
@@ -2146,7 +2050,7 @@ def build_smart_filename(filename: str, caption: str, precomputed_info: dict = N
     # ── 8b. Extended Cut/Edition ───────────────────────────────────
     ext_m = _EXTENDED_RE.search(raw)
     if ext_m:
-        parts.append(re.sub(r'[\s.\-]+', ' ', ext_m.group(0).strip()))
+        parts.append(re.sub(r'[\s.\-]+', ' ', ext_m.group(0).strip()).title())
 
     # ── 9. Regional / industry label ─────────────────────────────
     if media_type == "movie":
@@ -2191,7 +2095,7 @@ def build_smart_filename(filename: str, caption: str, precomputed_info: dict = N
     # ── 12. HD / FHD flag ────────────────────────────────────────
     hd_m = _HD_RE.search(raw)
     if hd_m:
-        parts.append(re.sub(r'[\s.]+', ' ', hd_m.group(0).strip()))
+        parts.append(_FLAG_CASE.get(re.sub(r'[\s.]+', ' ', hd_m.group(0).strip()).lower(), hd_m.group(0).strip()))
 
     # ── 13. HDR flag(s) ───────────────────────────────────────────
     # A file can legitimately mention more than one HDR-type format
@@ -2199,7 +2103,7 @@ def build_smart_filename(filename: str, caption: str, precomputed_info: dict = N
     # mentions instead of keeping only the first.
     hdr_labels: list = []
     for hdr_m in _HDR_RE.finditer(raw):
-        label = re.sub(r'[\s.]+', ' ', hdr_m.group(0).strip())
+        label = _FLAG_CASE.get(re.sub(r'[\s.]+', ' ', hdr_m.group(0).strip()).lower(), hdr_m.group(0).strip())
         if label.upper() not in [l.upper() for l in hdr_labels]:
             hdr_labels.append(label)
     if hdr_labels:
