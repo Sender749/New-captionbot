@@ -105,6 +105,52 @@ class WriterTests(unittest.IsolatedAsyncioTestCase):
         H.record_history(JOB, {}, "n")                           # must not raise
 
 
+class OriginalCmdTests(unittest.IsolatedAsyncioTestCase):
+    def test_html_kept_only_when_different(self):
+        same = H.build_history_doc({**JOB, "default_caption": JOB["default_caption_plain"]}, {}, "n")
+        self.assertNotIn("original_caption_html", same)
+        rich = H.build_history_doc({**JOB, "default_caption": '<a href="https://x.y">Audio</a>: Hindi'}, {}, "n")
+        self.assertIn("original_caption_html", rich)
+
+    def test_pick_text_prefers_html(self):
+        self.assertEqual(H.pick_original_text({"original_caption": "p", "original_caption_html": "<b>p</b>"}), ("<b>p</b>", True))
+        self.assertEqual(H.pick_original_text({"original_caption": "p"}), ("p", False))
+        self.assertEqual(H.pick_original_text(None), ("", False))
+
+    async def test_lookup_by_origin_then_by_file(self):
+        class Col:
+            def __init__(self):
+                self.docs = [{"channel_id": -1001, "message_id": 7, "file_unique_id": "U1", "original_caption": "A"}]
+
+            async def find_one(self, q, sort=None):
+                for d in self.docs:
+                    if all(d.get(k) == v for k, v in q.items()):
+                        return d
+
+        old, H.history_col = H.history_col, Col()
+        old_loc = H._locate_origin
+        try:
+            async def no_origin(r):
+                return None, None
+            H._locate_origin = no_origin
+
+            class Media:
+                file_unique_id = "U1"
+
+            class Reply:
+                video = Media()
+            doc = await H.find_history_for_reply(Reply())            # any copy of the file
+            self.assertEqual(doc["original_caption"], "A")
+
+            async def origin(r):
+                return -1001, 7
+            H._locate_origin = origin
+            doc = await H.find_history_for_reply(object())            # forwarded channel post
+            self.assertEqual(doc["original_caption"], "A")
+        finally:
+            H.history_col, H._locate_origin = old, old_loc
+
+
 class ExportTests(unittest.TestCase):
     def test_args(self):
         self.assertEqual(H.parse_export_args([]), (7, "all"))
