@@ -16,6 +16,7 @@ Admin-only commands (private chat):
   /history_export [days] [all|unsure|changed]
   /history_clear
   /wrong <correct output>      (reply to a processed / forwarded message)
+  /original                    (reply to any file -> its caption BEFORE the bot edited it)
 """
 import asyncio
 import io
@@ -27,6 +28,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from info import ADMIN, CP_CH
@@ -68,7 +70,12 @@ def build_history_doc(job, meta, new_caption, smart_file_name=""):
         f = meta.get(name) or {}
         return {k: (_cap(v) if isinstance(v, str) else v) for k, v in f.items()}
 
+    plain = _cap(job.get("default_caption_plain"))
+    html = _cap(job.get("default_caption"))
+    doc_html = {"original_caption_html": html} if html and html != plain else {}
+
     return {
+        **doc_html,
         "channel_id": job.get("chat_id"),
         "message_id": msg_id,
         "file_unique_id": uid,
@@ -390,3 +397,60 @@ async def wrong_cmd(client, message):
                   "reported_at": datetime.now(timezone.utc)}},
     )
     await message.reply_text("✅ Saved. It will be listed first in <code>/history_export</code>.")
+
+
+# ───────────────────────────── /original ────────────────────────────────────
+
+def pick_original_text(doc):
+    """-> (text, is_html).  Prefers the HTML form so links/bold survive."""
+    html = (doc or {}).get("original_caption_html")
+    if html:
+        return html, True
+    return (doc or {}).get("original_caption") or "", False
+
+
+async def find_history_for_reply(replied):
+    """Newest history record for the file/post a message points at, or None."""
+    cid, mid = await _locate_origin(replied)        # exact channel post / dump copy first
+    if cid and mid:
+        doc = await history_col.find_one({"channel_id": cid, "message_id": mid}, sort=[("ts", -1)])
+        if doc:
+            return doc
+    for attr in ("video", "document", "audio", "voice", "animation", "video_note"):
+        media = getattr(replied, attr, None)
+        uid = getattr(media, "file_unique_id", None) if media else None
+        if uid:                                      # same file, whichever chat holds a copy
+            doc = await history_col.find_one({"file_unique_id": uid}, sort=[("ts", -1)])
+            if doc:
+                return doc
+    return None
+
+
+@Client.on_message(filters.command("original") & _ADMIN_PM)
+async def original_cmd(client, message):
+    replied = message.reply_to_message
+    if not replied:
+        await message.reply_text("ℹ️ Reply to a file with <code>/original</code> to get its caption from before the bot edited it.")
+        return
+    try:
+        doc = await find_history_for_reply(replied)
+    except Exception as e:
+        await message.reply_text("❌ Lookup failed: <code>%s</code>" % e)
+        return
+    if not doc:
+        await message.reply_text(
+            "❌ No record of that file. History only covers files edited after caption history "
+            "was enabled, and is kept for %d days." % HISTORY_TTL_DAYS)
+        return
+    text, is_html = pick_original_text(doc)
+    if not text.strip():
+        await message.reply_text("ℹ️ That file had no caption before the edit.")
+        return
+    try:
+        if is_html:
+            await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            await message.reply_text(text, parse_mode=ParseMode.DISABLED, disable_web_page_preview=True)
+    except Exception:                                # e.g. HTML cut mid-tag -> plain text
+        await message.reply_text(doc.get("original_caption") or text, parse_mode=ParseMode.DISABLED,
+                                 disable_web_page_preview=True)
