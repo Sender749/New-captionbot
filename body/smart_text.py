@@ -19,11 +19,12 @@ Pipeline (see analyze()):
 
 Every field comes back as value + confidence + source.
 """
+import difflib
 import html as _html
 import re
 import unicodedata
 
-ENGINE_VERSION = "2.0"
+ENGINE_VERSION = "2.1"
 
 HIGH, MEDIUM, LOW = "high", "medium", "low"
 
@@ -40,6 +41,17 @@ _TRANS.update({ord(c): "|" for c in "‣▪▫◦‧∙"})
 # invisible "blank" letters used as spacers in channel captions
 _TRANS.update({ord(c): " " for c in "\u3164\u115f\u1160\uffa0\u2800\u200b\u200c\u200d\u2060\ufeff"})
 
+_NATIVE = {
+    "हिन्दी": "Hindi", "हिंदी": "Hindi", "தமிழ்": "Tamil", "తెలుగు": "Telugu",
+    "മലയാളം": "Malayalam", "ಕನ್ನಡ": "Kannada", "বাংলা": "Bengali", "ਪੰਜਾਬੀ": "Punjabi",
+    "मराठी": "Marathi", "ગુજરાતી": "Gujarati", "اردو": "Urdu", "ภาษาไทย": "Thai",
+    "한국어": "Korean", "日本語": "Japanese", "中文": "Chinese",
+}
+_ICON_AUDIO = re.compile(r"(?m)^[ \t]*(?:[➥➢➤➪▶►•|]\s*)*(?:🔊|🔈|🔉|🎧)\s*[:\-]*\s*")
+_ICON_SUB = re.compile(r"(?m)^[ \t]*(?:[➥➢➤➪▶►•|]\s*)*(?:💬|🗨️?|🗨)\s*[:\-]*\s*")
+_PLURAL_S = re.compile(r"(?i)\b(audio|subtitle|language|lang)\(s\)")
+_PROMO_ANCHOR = re.compile(
+    r"(?is)<a\b[^>]*>(?:\s|<[^>]+>)*[^<]{0,12}?\b(?:join|subscribe|follow|visit|click)\b[^<]{0,25}?(?:<[^>]+>|\s)*</a>")
 _HTML_BR = re.compile(r"<\s*br\s*/?\s*>", re.I)
 _HTML_TAG = re.compile(
     r"</?(?:b|i|u|s|em|strong|code|pre|a|span|blockquote|tg-spoiler)\b[^>]*>", re.I
@@ -75,6 +87,11 @@ def normalize_text(s):
     if "&" in s and ";" in s:
         s = _html.unescape(s)
     if not s.isascii():
+        for k, v in _NATIVE.items():
+            if k in s:
+                s = s.replace(k, " %s " % v)
+        s = _ICON_AUDIO.sub("Audio: ", s)
+        s = _ICON_SUB.sub("Subtitle: ", s)
         s = s.replace("™", "").replace("®", "").replace("©", "")
         # NFKC per character, but leave "other numbers" (1/2, 2) alone
         s = "".join(
@@ -85,11 +102,14 @@ def normalize_text(s):
     if not s.isascii():
         s = _strip_symbols(s)
     if "<" in s:
+        s = _PROMO_ANCHOR.sub(" ", s)
         s = _HTML_BR.sub("\n", s)
         s = _HTML_TAG.sub("", s)
     if "\\u" in s:
         s = _ESC_U.sub("", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n")
+    if "(s)" in s.lower():
+        s = _PLURAL_S.sub(r"\1s", s)               # "Audio(s) : Hindi"
     if "#" in s:
         s = _HASHTAG.sub("", s)                 # "#Hindi #English" -> "Hindi English"
     s = _COLON_DASH.sub(": ", s)
@@ -146,10 +166,12 @@ def _lang_of(tok, level):
 
 # ───────────────────────────── token classes ────────────────────────────────
 
+_RES_NUMBERS = {"144", "240", "360", "480", "540", "576", "720", "900", "1080", "1440", "2160"}
 _YEAR_RE = re.compile(r"^(?:19|20)\d\d$")
-_RES_RE = re.compile(r"^(?:\d{3,4}p|[248]k|uhd)$")
+_RES_RE = re.compile(r"^(?:\d{3,4}p|[248]k|uhd|\d{3,4}x\d{3,4})$")
 _SE_RE = re.compile(
-    r"^(?:s\d{1,3}(?:e\d{1,3})*(?:-?e?\d{1,3})?|e\d{1,3}(?:-e?\d{1,3})?|ep\.?\d{1,3}(?:-\d{1,3})?)$"
+    r"^(?:s\d{1,3}(?:e\d{1,3})*(?:-?e?\d{1,3})?|e\d{1,4}(?:-e?\d{1,3})?|ep\.?\d{1,4}(?:-\d{1,3})?"
+    r"|\d{1,2}x\d{2,3})$"
 )
 _EXTS = {"mkv", "mp4", "avi", "webm", "mov", "m4v", "wmv", "flv"}
 # unambiguous quality / codec / platform tokens that start the "tag zone"
@@ -195,8 +217,8 @@ _MSUB_VALUES = {"multi", "multiple", "various", "all", "many"}
 _PROT_CH = re.compile(r"(?<![0-9])([1-9])\.([0-2])(?![0-9])")
 _PROT_H = re.compile(r"\b([hHxX])\.(26[45])\b")   # H.264 keeps its dot
 _DOTS = re.compile(r"[._]+")
-_EP_DOT = re.compile(r"\b([Ee][Pp]?)\.(?=\d)")
-_EP_SPACE = re.compile(r"\b([Ee][Pp]?)[ ]+(?=\d{1,3}\b)")
+_EP_DOT = re.compile(r"(?<![\w-])([Ee][Pp]?)\.(?=\d{1,3}(?!\d))")
+_EP_SPACE = re.compile(r"(?<![\w-])([Ee][Pp]?)[ ]+(?=\d{1,3}\b)")
 _TOKEN_RE = re.compile(r"[\[\](){}]|[,+&/|:]|[^\s\[\](){},+&/|:]+")
 _BRACKET_RE = re.compile(r"[\[\(\{]([^\[\]\(\)\{\}]{1,80})[\]\)\}]")
 _BR_TOK = "\x02"        # placeholder token for a language bracket group
@@ -238,6 +260,9 @@ def _tokenize_pairs(text):
             hits = sum(1 for x in parts if _YEAR_RE.match(x) or _RES_RE.match(x)
                        or _SE_RE.match(x) or x in _STRONG)
             langs_in = sum(1 for x in parts if _lang_of(x, 1))
+            if len(parts) == 2 and all(_YEAR_RE.match(x) for x in parts):
+                out.append((parts[0], t.split("-")[0]))                 # "2025-2026" -> 2025
+                continue
             if hits >= 2 or (hits >= 1 and hits + langs_in >= 2):   # hyphen is the separator here
                 for lo, o in zip(parts, t.split("-")):
                     if lo:
@@ -326,6 +351,8 @@ class _Seg:
 
 def _prep_brackets(text, groups, texts):
     """Replace language brackets with placeholder tokens; junk brackets too."""
+    lead = len(text) - len(text.lstrip())
+
     def repl(m):
         content = m.group(1)
         langs = _lang_group(content)
@@ -334,6 +361,10 @@ def _prep_brackets(text, groups, texts):
             texts.append(content)
             return " %s%d%s " % (_BR_TOK, len(groups) - 1, _BR_TOK)
         toks = _tokenize(content)
+        if m.start() <= lead and not any(
+                _YEAR_RE.match(x) or _RES_RE.match(x) or _SE_RE.match(x)
+                for t in toks for x in ([t] + t.split("-"))):
+            return " %s " % _JUNK_TOK
         keep = any(
             _YEAR_RE.match(x) or _RES_RE.match(x) or _SE_RE.match(x)
             or x in _STRONG or x in _SUB_KW or x in _AUDIO_KW or x in _SUB_LIT
@@ -342,6 +373,20 @@ def _prep_brackets(text, groups, texts):
         )
         return " %s " % content if keep else " %s " % _JUNK_TOK
     return _BRACKET_RE.sub(repl, text)
+
+
+_NOT_PLAIN = {"web", "dl", "rip", "org", "line", "clean", "hq", "season", "seasons", "series",
+              "complete", "episode", "episodes", "movie", "movies", "full", "in", "ripx"}
+
+
+def _is_plain(tok):
+    """An ordinary word (not a tag, language, codec, anchor or separator)."""
+    return (tok.isalpha() and len(tok) > 1 and not _is_soft(tok) and tok not in _NOT_PLAIN
+            and tok not in _STRONG and tok not in _CODEC_FILLER and tok not in _EXTS)
+
+
+def _has_episode_before(toks, i):
+    return any(re.match(r"^s\d{1,3}e\d|^e\d|^ep\.?\d|^\d{1,2}x\d", t) for t in toks[:i])
 
 
 def _is_br(tok):
@@ -391,7 +436,8 @@ def _anchor_kind(toks, i, n):
     t = toks[i]
     return bool(
         _RES_RE.match(t) or _SE_RE.match(t) or t in _STRONG or t in _EXTS
-        or (t in ("season", "episode") and i + 1 < n and toks[i + 1].isdigit() and len(toks[i + 1]) <= 3)
+        or (t in ("season", "seasons", "episode") and i + 1 < n
+            and re.match(r"^\d{1,4}(?:-\d{1,3})?$", toks[i + 1]))
     )
 
 
@@ -427,6 +473,13 @@ def _segment(text):
     anchor = None
     for i in range(t0 + 1, n):
         t = toks[i]
+        if _YEAR_RE.match(t) and i + 1 < n and _YEAR_RE.match(toks[i + 1]):
+            continue                                  # "2049 2017": 2049 is part of the title
+        if t == "-" and i + 1 < n and toks[i + 1].isdigit() and 2 <= len(toks[i + 1]) <= 4 \
+                and not _YEAR_RE.match(toks[i + 1]) and toks[i + 1] not in _RES_NUMBERS \
+                and (i + 2 >= n or _anchor_kind(toks, i + 2, n) or toks[i + 2] in _SEP_TOKS):
+            anchor = i                                  # anime absolute episode number
+            break
         if _YEAR_RE.match(t) or _anchor_kind(toks, i, n):
             anchor = i
             break
@@ -456,7 +509,8 @@ def _segment(text):
     tag_pairs = _expand_hyphen_langs(pairs[:t0] + pairs[s:])
     seg.tag_toks = [p[0] for p in tag_pairs]
     for i in range(n):                          # year (a title-initial token is never the year)
-        if i != t0 and _YEAR_RE.match(toks[i]):
+        if (i != t0 and _YEAR_RE.match(toks[i]) and not (i + 1 < n and _YEAR_RE.match(toks[i + 1]))
+                and not (i and toks[i - 1] in ("episode", "ep", "e"))):
             seg.has_year = True
             seg.year = toks[i]
             break
@@ -514,9 +568,10 @@ def _langs_at(toks, idxs, groups):
 
 
 class _Roles:
-    __slots__ = ("audio_role", "audio_free", "sub_role", "msub", "dual", "multi_kw")
+    __slots__ = ("audio_role", "audio_free", "audio_all", "sub_role", "msub", "dual", "multi_kw")
 
     def __init__(self):
+        self.audio_all = []    # role + free languages in text order
         self.audio_role = []   # explicit "Hindi Audio" / "[Hindi + English]"
         self.audio_free = []   # un-claimed language words in the tag zone
         self.sub_role = []
@@ -569,6 +624,7 @@ def _parse_tag_tokens(toks, start, groups):
             r.sub_role.append(_SUB_LIT[t])
         elif t in _MSUB_LIT:
             r.msub = True
+    ordered = [(i, _langs_at(toks, [i], groups)) for i in audio_idx]
     r.audio_role = _dedup(_langs_at(toks, audio_idx, groups))
     r.sub_role += _langs_at(toks, sub_idx, groups)
     r.sub_role = _dedup(r.sub_role)
@@ -578,11 +634,17 @@ def _parse_tag_tokens(toks, start, groups):
         t = toks[i]
         if _is_br(t):
             r.audio_free += groups[int(t.strip(_BR_TOK))]
+            ordered.append((i, groups[int(t.strip(_BR_TOK))]))
         else:
             l = _lang_of(t, 1)
             if l:
+                if (i > start and i + 1 < n and _is_plain(toks[i - 1]) and _is_plain(toks[i + 1])
+                        and _has_episode_before(toks, i)):
+                    continue                         # inside an EPISODE TITLE ("Beware the Hindi Ocean")
                 r.audio_free.append(l)
+                ordered.append((i, [l]))
     r.audio_free = _dedup(r.audio_free)
+    r.audio_all = _dedup([l for _, ls in sorted(ordered, key=lambda x: x[0]) for l in ls])
     if "dual" in toks[start:] and "audio" in toks[start:]:
         r.dual = True
     return r
@@ -591,7 +653,7 @@ def _parse_tag_tokens(toks, start, groups):
 # ───────────────────────────── labeled lines ────────────────────────────────
 
 _LABEL_RE = re.compile(
-    r"(?<![a-z0-9])(?:"
+    r"(?<![a-z0-9-])(?:"
     r"(?P<a>audio\s*/\s*lang(?:uage)?s?|audio\s*lang(?:uage)?s?|audio\s*tracks?|audios?"
     r"|original\s*lang(?:uage)?s?|languages?|lang|dubbed|dubbing|dub|voice"
     r"|dual\s*audio|multi\s*audio)"
@@ -718,6 +780,64 @@ def _title_from(seg):
     return _title_case(title) if title else ""
 
 
+# ─────────────────── junk / truncated filename handling ─────────────────────
+
+_JUNK_FN = re.compile(
+    r"^(?:video|vid|img|image|file|document|doc|audio|aud|voice|clip|screen[\s_-]*recording|"
+    r"telegram|tg|download|untitled|new[\s_-]*file)?[\s_-]*"
+    r"(?:\d{6,}|(?:19|20)\d{2}[-_.]?(?:0[1-9]|1[0-2])[-_.]?(?:0[1-9]|[12]\d|3[01]))"
+    r"(?:[\s_-][A-Za-z0-9]{1,8})*$", re.I)
+_HASH_FN = re.compile(r"^[0-9a-f]{16,}$", re.I)
+_EXT_TAIL = re.compile(r"\.\w{2,4}$")
+
+
+def looks_junk_filename(filename):
+    """Camera / app / timestamp / hash names that say nothing about the content."""
+    stem = _EXT_TAIL.sub("", (filename or "").strip())
+    if not stem:
+        return True
+    if _JUNK_FN.match(stem) or _HASH_FN.match(stem):
+        return True
+    letters = re.sub(r"[^A-Za-z\u0080-\uffff]", "", stem)
+    if len(letters) <= 2:                               # "a.mkv" -- but "It 2017" keeps its year
+        toks = _tokenize(stem)
+        return not any(_YEAR_RE.match(t) or _RES_RE.match(t) or _SE_RE.match(t) for t in toks)
+    return False
+
+
+def _alnum(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def repair_truncated(filename, lines):
+    """
+    Telegram cuts long file names (~60 chars) -- "…[Hindi D.mkv" -- while the
+    caption often holds the COMPLETE release name.  When a caption line is a
+    longer copy of the filename, use that line instead, so languages,
+    subtitles and codecs that were cut off are not lost.
+    """
+    stem = _EXT_TAIL.sub("", filename)
+    key = _alnum(stem)
+    if len(key) < 30:
+        return filename
+    prefix = key[: max(25, len(key) - 12)]            # the last chars may be a cut-off word
+    best, best_len = None, len(key) - 1                 # same length or longer (typo-fixed copies too)
+    for ln in lines:
+        lk = _alnum(ln)
+        if len(lk) <= best_len:
+            continue
+        if lk.startswith(prefix):
+            best, best_len = ln, len(lk)
+        elif lk[:12] == prefix[:12]:                      # same start -> allow inserted/changed text
+            sm = difflib.SequenceMatcher(None, prefix, lk[: len(prefix) + 40], autojunk=False)
+            if sum(b.size for b in sm.get_matching_blocks()) >= 0.88 * len(prefix):
+                best, best_len = ln, len(lk)
+    if best is None:
+        return filename
+    m = _EXT_TAIL.search(filename)
+    return best if _EXT_TAIL.search(best) or not m else best + m.group(0)
+
+
 # ───────────────────────────── main entry point ─────────────────────────────
 
 def _field(value="", conf="", source=""):
@@ -738,8 +858,14 @@ def analyze(filename, caption, normalized=False):
         caption = normalize_text(caption or "")
     flags = set()
     filename = filename.replace("\n", " ").strip()
+    cap_lines = [ln for ln in caption.split("\n") if ln.strip()]
     if filename.lower() in FALLBACK_NAMES:
         filename = ""
+    elif filename and cap_lines:
+        if looks_junk_filename(filename):
+            filename = ""                         # junk name: the caption is the source
+        else:
+            filename = repair_truncated(filename, cap_lines)
 
     audio_label, sub_label = [], []
     sub_none = msub_label = False
@@ -789,8 +915,8 @@ def analyze(filename, caption, normalized=False):
     omitted = False
     for kind, text, seg in segs:
         roles = _parse_tag_tokens(seg.tag_toks, 0, seg.groups)
-        found = roles.audio_role + [l for l in roles.audio_free if l not in roles.audio_role]
-        if seg.anchored or roles.audio_role:
+        found = list(roles.audio_all)
+        if seg.anchored or roles.audio_role or found:
             aud = found
             if kind == "file":
                 file_audio += aud
@@ -799,7 +925,7 @@ def analyze(filename, caption, normalized=False):
                 if roles.audio_role and not cap_audio_src:
                     cap_audio_src = "role-keyword"
         elif found:
-            omitted = True                         # LOW: free text, never guessed
+            omitted = True
         if seg.title_toks:
             tr = _parse_tag_tokens(seg.title_toks, 0, seg.groups)
             if tr.audio_role:
@@ -886,5 +1012,5 @@ def analyze(filename, caption, normalized=False):
 
     return {
         "title": title, "year": year, "audio": audio, "subtitle": sub,
-        "flags": sorted(flags), "tag_text": tag_text,
+        "flags": sorted(flags), "tag_text": tag_text, "filename": filename,
     }

@@ -1519,8 +1519,8 @@ _DOMAIN_RE    = re.compile(
     re.I
 )
 _AD_PHRASE_RE = re.compile(
-    r'\b(?:join[\s.]+(?:us|our|now)?|subscribe(?:[\s.]+now)?|follow[\s.]+us|'
-    r'click[\s.]+here|visit[\s.]+(?:us|now)?|for[\s.]+more[\s.]+(?:movies|videos|updates)?|'
+    r'\b(?:join[\s.]+(?:us|our|now|my)\b|subscribe[\s.]+(?:now|to|our|us)\b|follow[\s.]+us|'
+    r'click[\s.]+here|visit[\s.]+(?:us|now|our)\b|for[\s.]+more[\s.]+(?:movies|videos|updates)\b|'
     r'download[\s.]+from|powered[\s.]+by|uploaded[\s.]+by|encoded[\s.]+by|'
     r'telegram[\s.]+channel|our[\s.]+channel|official[\s.]+channel)\b',
     re.I
@@ -1627,97 +1627,108 @@ def extract_title_year(raw: str):
     return a["title"]["value"], a["year"]["value"]
 
 # ── Season / Episode extractor ───────────────────────────────────
+_SE_BRACKETS = re.compile(r"[\[\]\(\)\{\}]")
+_EPW = r"E(?:p(?:isode)?)?[\s.\-]*"            # E / Ep / Ep. / Episode / EP-
+
+
+def _ep_range(a: int, b: int):
+    """Same format for every range form, so the engine is idempotent."""
+    if a == b or b < a or b == 0:          # "Ep.03-00" / "E10-E05" is not a range
+        return f"E{a:02d}", ""
+    return f"Ep.{a:02d}-{b:02d}", "Combined Episodes"
+
+
 def extract_season_episode(text: str):
     """
-    Returns (season_str, episode_str, season_tag) as clean display strings.
+    Returns (season_str, episode_str, season_tag).
 
-    Patterns handled (all case-insensitive):
-      S01E07          →  S01, E07,        ""
-      S01 E07         →  S01, E07,        ""
-      S01E07E08       →  S01, E07-E08,    ""
-      Season 2 Ep 5   →  S02, E05,        ""
-      S01 (Ep.01-09)  →  S01, Ep.01-09,   "Combined Episodes"
-      Ep.01-05        →  "",  Ep.01-05,   "Combined Episodes"
-      EP05 / Ep 5     →  "",  E05,        ""
-      S01 (no E##)    →  S01, "",         "Complete Season"
+    Understood (all case-insensitive, dots/underscores/brackets ignored):
+      S01E07 / S01 E07 / S01-E07 / Season 2 Episode 5   -> S01, E07
+      S01 [E07-E12] / S01E01-05 / S01 EP 07 to 12        -> S01, Ep.07-12  + "Combined Episodes"
+      S01E01E02 / S01E05 S01E06 (separate tags)           -> S01, Ep.01-02  + "Combined Episodes"
+      2x05 / 1x12                                         -> S02, E05
+      Ep.01-05 / EP-12 / E12 / Episode 12 / E1234         -> "", E12
+      "Anime Name - 05 [720p]"                            -> "", E05   (absolute numbering)
+      S01-S03 / Season 1-3 / Seasons 1 to 4 (no episode)  -> S01-S03 + "Complete Season"
+      S03 only, no episode anywhere                       -> S03 + "Complete Season"
 
-    season_tag:
-      "Combined Episodes" — the file bundles a range of episodes
-                             (e.g. S01 E01-05, S15 E06-15).
-      "Complete Season"   — only a season number is present with no
-                             episode marker at all → whole season.
-      ""                  — a normal single-episode file (or a movie).
+    "Complete Season" is only ever returned when NO episode form matched in
+    the filename or the caption.
     """
-    t = re.sub(r'[._]', ' ', text)
-    season  = ""
-    episode = ""
+    orig = re.sub(r"[._]", " ", text)
+    t = re.sub(r"\s+", " ", _SE_BRACKETS.sub(" ", orig))
+    SEP = r"[\s.\-]*"
 
-    # ── 1. Season + Episode RANGE together ────────────────────────
-    # Matches: S01E01-E05 / S01 E01-05 / S15E06-15 / Season 1 Ep 1-9
-    # (season and episode are captured from the SAME match, so this
-    #  works even when there's no space/dot between "S01" and "E01" —
-    #  a plain \bS..\b season regex can't see across that boundary).
+    RNG = rf"(?:\s*(?:-+|–|to)\s*{_EPW}|-+|–|\s+to\s+)"          # end has "E", or is glued "01-05", or "to"
+
+    # 0. range inside brackets:  S01 EP (01-08) / S03 {E01 10} / S01 [Ep06 10]
     m = re.search(
-        r'\bS(?:eason)?\s*0*(\d{1,3})\s*'
-        r'E(?:p(?:isode)?)?\.?\s*0*(\d{1,3})\s*[-–to]+\s*'
-        r'(E(?:p(?:isode)?)?\.?\s*)?0*(\d{1,3})\b',
-        t, re.I
-    )
-    if m:
-        season  = f"S{int(m.group(1)):02d}"
-        # "S01 E01-E05" keeps the E-form, "S15 E06-15" the Ep.-form, so
-        # feeding the engine its own output is stable (idempotent).
-        if int(m.group(2)) == int(m.group(4)):          # "S01E03 - Episode 3" is ONE episode
-            return season, f"E{int(m.group(2)):02d}", ""
-        if m.group(3):
-            episode = f"E{int(m.group(2)):02d}-E{int(m.group(4)):02d}"
-        else:
-            episode = f"Ep.{int(m.group(2)):02d}-{int(m.group(4)):02d}"
-        return season, episode, "Combined Episodes"
+        r"\bS(?:eason)?\s*0*(\d{1,3})\s*(?:E(?:p(?:isode)?)?[\s.\-]*)?[\(\[\{]\s*(?:E(?:p(?:isode)?)?[\s.\-]*)?0*(\d{1,3})"
+        r"\s*(?:-+|–|to|\s)\s*(?:E(?:p(?:isode)?)?[\s.\-]*)?0*(\d{1,3})\s*[\)\]\}]", orig, re.I)
+    if m and int(m.group(3)) > int(m.group(2)):
+        ep, tag = _ep_range(int(m.group(2)), int(m.group(3)))
+        return f"S{int(m.group(1)):02d}", ep, tag
 
-    # ── 2. Season + double-episode contiguous: S01E07E08 ─────────
-    m = re.search(r'\bS(?:eason)?\s*0*(\d{1,3})\s*E(\d{1,3})E(\d{1,3})\b', t, re.I)
-    if m:
-        season  = f"S{int(m.group(1)):02d}"
-        episode = f"E{int(m.group(2)):02d}-E{int(m.group(3)):02d}"
-        return season, episode, "Combined Episodes"
-
-    # ── 3. Season + single Episode together ───────────────────────
-    # Handles contiguous "S01E02", spaced "S01 E02" and keyword form
-    # "Season 2 Episode 5" in one shot.
+    # 1. season + episode RANGE:  S01 E07-E12 / S01E01-05 / S01 EP 07 to 12
     m = re.search(
-        r'\bS(?:eason)?\s*0*(\d{1,3})\s*E(?:p(?:isode)?)?\.?\s*0*(\d{1,3})\b',
-        t, re.I
-    )
-    if m:
-        season  = f"S{int(m.group(1)):02d}"
-        episode = f"E{int(m.group(2)):02d}"
-        return season, episode, ""
+        rf"\bS(?:eason)?\s*0*(\d{{1,3}}){SEP}{_EPW}0*(\d{{1,4}}){RNG}0*(\d{{1,4}})\b",
+        t, re.I)
+    if m and not re.match(r"\s+\d{1,2}\s+\d{2}\b", t[m.end(3):]):          # "21 04 23" is a date
+        ep, tag = _ep_range(int(m.group(2)), int(m.group(3)))
+        return f"S{int(m.group(1)):02d}", ep, tag
 
-    # ── 4. Episode-only RANGE (no season number at all) ───────────
-    # Matches: Ep.01-09 / (Ep 1-9) / E01-09 / E01-E09
-    m = re.search(
-        r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\s*[-–to]+\s*(?:Ep?(?:isode)?\.?\s*)?0*(\d{1,3})\b',
-        t, re.I
-    )
+    # 2a. contiguous double episode: S01E07E08
+    m = re.search(rf"\bS(?:eason)?\s*0*(\d{{1,3}}){SEP}E(\d{{1,4}})E(\d{{1,4}})\b", t, re.I)
     if m:
-        episode = f"Ep.{int(m.group(1)):02d}-{int(m.group(2)):02d}"
-        return season, episode, "Combined Episodes"
+        ep, tag = _ep_range(int(m.group(2)), int(m.group(3)))
+        return f"S{int(m.group(1)):02d}", ep, tag
 
-    # ── 5. Episode-only single (no season number at all) ──────────
-    m = re.search(r'\bEp?(?:isode)?\.?\s*0*(\d{1,3})\b', t, re.I)
+    # 2b. several separate tags of one season: S01E05 S01E06 ...
+    tags = re.findall(rf"\bS(?:eason)?\s*0*(\d{{1,3}}){SEP}{_EPW}0*(\d{{1,4}})\b", t, re.I)
+    if len({e for _, e in tags}) >= 2 and len({s for s, _ in tags}) == 1:
+        eps = sorted({int(e) for _, e in tags})
+        ep, tag = _ep_range(eps[0], eps[-1])
+        return f"S{int(tags[0][0]):02d}", ep, tag
+
+    # 3. season + single episode
+    m = re.search(rf"\bS(?:eason)?\s*0*(\d{{1,3}}){SEP}{_EPW}0*(\d{{1,4}})\b", t, re.I)
     if m:
-        episode = f"E{int(m.group(1)):02d}"
-        return season, episode, ""
+        return f"S{int(m.group(1)):02d}", f"E{int(m.group(2)):02d}", ""
 
-    # ── 6. Season present alone, no episode marker anywhere ───────
-    # e.g. "Show.Name.S03.Complete.1080p" → whole season file.
-    m = re.search(r'\bS(?:eason)?\s*0*(\d{1,3})\b', t, re.I)
+    # 4. 2x05 / 1x12  (never 1920x1080: the season is at most two digits at a word start)
+    m = re.search(r"(?<![\w])(\d{1,2})x(?!26[45]\b)(\d{2,3})\b", t, re.I)
+    if m and int(m.group(1)) > 0:
+        return f"S{int(m.group(1)):02d}", f"E{int(m.group(2)):02d}", ""
+
+    # 5. episode-only range:  Ep.01-05 / E01-E05
+    m = re.search(rf"(?<![\w-]){_EPW}0*(\d{{1,4}}){RNG}0*(\d{{1,4}})\b", t, re.I)
+    if m and not re.match(r"\s+\d{1,2}\s+\d{2}\b", t[m.end(2):]):
+        ep, tag = _ep_range(int(m.group(1)), int(m.group(2)))
+        return "", ep, tag
+
+    # 6. episode-only single:  Ep 5 / EP-12 / E12 (1-3 digits) or E1234 (contiguous)
+    m = re.search(rf"(?<![\w-]){_EPW}0*(\d{{1,3}})\b", t, re.I) or re.search(r"(?<![\w-])E(\d{4})\b", t, re.I)
     if m:
-        season = f"S{int(m.group(1)):02d}"
-        return season, "", "Complete Season"
+        return "", f"E{int(m.group(1)):02d}", ""
 
-    return season, episode, ""
+    # 7. anime absolute numbering: "Name - 05 [720p]" / "Name - 12v2 (1080p)"
+    m = re.search(r"\s-\s0*(\d{2,4})(?:v\d)?(?=\s*(?:[\[\(]|\d{3,4}p|\.\w{2,4}$|$))", text)
+    if m and not re.match(r"(?:19|20)\d\d$", m.group(1)) \
+            and m.group(1).lstrip("0") not in ("144", "240", "360", "480", "540", "576", "720", "900", "1080", "1440", "2160"):
+        return "", f"E{int(m.group(1)):02d}", ""
+
+    # 8. season range, no episode:  S01-S03 / Season 1-3 / Seasons 1 to 4 / Seasons 1 & 2
+    m = re.search(r"\bS(?:eason)?s?\s*0*(\d{1,2})\s*(?:-+|–|to|&|and)\s*S?(?:eason)?s?\s*0*(\d{1,2})\b", t, re.I)
+    if m and int(m.group(1)) < int(m.group(2)):
+        return f"S{int(m.group(1)):02d}-S{int(m.group(2)):02d}", "", "Complete Season"
+
+    # 9. season only -> whole season (no episode anywhere in filename or caption)
+    m = re.search(r"\bS(?:eason)?\s*0*(\d{1,3})\b", t, re.I)
+    if m:
+        return f"S{int(m.group(1)):02d}", "", "Complete Season"
+
+    return "", "", ""
+
 
 # ── Language / subtitle extractors ────────────────────────────────
 # Audio vs subtitle language detection now lives in body/smart_text.py
@@ -1892,6 +1903,11 @@ def detect_media_type(text: str) -> str:
     return "movie"
 
 # ── Master metadata parser ────────────────────────────────────────
+# "@MovieChannel_Dune_Part_Two_2024_720p.mkv": a leading @handle glued to the title by
+# underscores must not swallow the whole name -- drop only the first chunk.
+_LEAD_HANDLE = re.compile(r"(?m)^[\s\[\(]*@[A-Za-z0-9]+_(?=[A-Za-z0-9]+_)")
+
+
 def parse_file_info(filename: str, caption: str) -> dict:
     """
     Parse all metadata from filename + caption (promo/ad noise stripped
@@ -1903,10 +1919,14 @@ def parse_file_info(filename: str, caption: str) -> dict:
     words), so a title like "Cam Girl" or "TS Madras" is never read as a
     CAM / TS print.
     """
-    fn_n = strip_promo_noise(normalize_text(filename or ""))
-    cap_n = strip_promo_noise(normalize_text(caption or ""))
+    fn_n = strip_promo_noise(_LEAD_HANDLE.sub("", normalize_text(filename or "")))
+    cap_n = strip_promo_noise(_LEAD_HANDLE.sub("", normalize_text(caption or "")))
     a = analyze(fn_n, cap_n, normalized=True)
-    raw = f"{fn_n} {cap_n}".replace("\n", " ")
+    # the filename analyze() actually used: "" for a junk name, the full caption
+    # line when Telegram cut the filename short -- so S/E parsing sees the same text
+    eff_fn = a.get("filename", fn_n)
+    ext_src = fn_n if fn_n else eff_fn
+    raw = f"{eff_fn} {cap_n}".replace("\n", " ")
     tag = a["tag_text"] or raw
 
     title, year = a["title"]["value"], a["year"]["value"]
@@ -1919,7 +1939,7 @@ def parse_file_info(filename: str, caption: str) -> dict:
     vcodec = extract_video_codec(tag)
     acodec = extract_audio_codec(tag)
     bitrate = extract_bitrate(tag)
-    ext = extract_extension(raw)
+    ext = extract_extension(f"{ext_src} {raw}")
     audio_str = _format_audio_label(audio_langs, tag) if audio_langs else ""
 
     return {
