@@ -881,7 +881,7 @@ async def caption_worker(client: Client, worker_id: int = 0):
                     )
                     await save_dump_origin(dest, dump_sent.id, ch, job["message_id"])
                 except Exception as e:
-                    logger.debug(f"[CAP_WORKER_{worker_id}] dump-copy skipped ch={ch} msg={job['message_id']}: {e}")
+                    logger.warning(f"[CAP_WORKER_{worker_id}] dump-copy failed ch={ch} msg={job['message_id']}: {type(e).__name__}: {e}")
             await mark_done(job["_id"])
             logger.info(f"[CAP_WORKER_{worker_id}] edited ch={ch} msg={job['message_id']}")
             record_history(job, hist_meta, new_caption, dump_smart_caption)
@@ -998,23 +998,42 @@ def render_caption_for_job(job: dict, meta_out: dict = None):
         )
         new_caption = cap_template
 
-    if job.get("blocked_words_raw"):
-        new_caption = apply_block_words(new_caption, job["blocked_words_raw"])
-    if job.get("replace_raw"):
-        replace_pairs = parse_replace_pairs(job["replace_raw"])
-        if replace_pairs:
-            new_caption = apply_replacements(new_caption, replace_pairs)
-    if job.get("link_remover_on"):
-        new_caption = strip_links_only(new_caption)
-    if job.get("prefix"):
-        new_caption = f"{job['prefix']}\n{new_caption}".strip()
-    if job.get("suffix"):
-        new_caption = f"{new_caption}\n{job['suffix']}".strip()
-    if job.get("emoji_remover_on"):
-        new_caption = remove_emojis(new_caption)
-    new_caption = new_caption.strip()
-    if "<" in new_caption and ">" in new_caption:
-        new_caption = sanitize_caption_html(new_caption)
+    if cap_template.strip() == "{default_caption}":
+        new_caption = default_caption
+        if job.get("blocked_words_raw"):
+            new_caption = remove_blocked_words_keep_layout(new_caption, job["blocked_words_raw"])
+        if job.get("replace_raw"):
+            replace_pairs = parse_replace_pairs(job["replace_raw"])
+            if replace_pairs:
+                new_caption = apply_replacements(new_caption, replace_pairs)
+        if job.get("link_remover_on"):
+            new_caption = strip_links_keep_layout(new_caption)
+        if job.get("prefix"):
+            new_caption = f"{job['prefix']}\n{new_caption}" if new_caption else job["prefix"]
+        if job.get("suffix"):
+            new_caption = f"{new_caption}\n{job['suffix']}" if new_caption else job["suffix"]
+        if job.get("emoji_remover_on"):
+            new_caption = remove_emojis_keep_layout(new_caption)
+        if "<" in new_caption and ">" in new_caption:
+            new_caption = sanitize_caption_html(new_caption)
+    else:
+        if job.get("blocked_words_raw"):
+            new_caption = apply_block_words(new_caption, job["blocked_words_raw"])
+        if job.get("replace_raw"):
+            replace_pairs = parse_replace_pairs(job["replace_raw"])
+            if replace_pairs:
+                new_caption = apply_replacements(new_caption, replace_pairs)
+        if job.get("link_remover_on"):
+            new_caption = strip_links_only(new_caption)
+        if job.get("prefix"):
+            new_caption = f"{job['prefix']}\n{new_caption}".strip()
+        if job.get("suffix"):
+            new_caption = f"{new_caption}\n{job['suffix']}".strip()
+        if job.get("emoji_remover_on"):
+            new_caption = remove_emojis(new_caption)
+        new_caption = new_caption.strip()
+        if "<" in new_caption and ">" in new_caption:
+            new_caption = sanitize_caption_html(new_caption)
 
     if smart_file_name:
         dump_smart_caption = strip_links_only(smart_file_name)
@@ -1819,6 +1838,35 @@ DUMP_EMOJI_RE = re.compile(
     "]+",
     flags=re.UNICODE,
 )
+
+def strip_links_keep_layout(text: str) -> str:
+    if not text:
+        return text
+    text = MD_LINK_RE.sub(r'\1', text)
+    text = TG_USER_LINK_RE.sub(r'\1', text)
+    text = HTML_A_RE.sub(r'\1', text)
+    text = URL_RE.sub("", text)
+    text = MENTION_RE.sub("", text)
+    return text
+
+def remove_emojis_keep_layout(text: str) -> str:
+    if not text:
+        return text
+    for emo in EMOJI_LIST:
+        text = text.replace(emo, "")
+    return text
+
+def remove_blocked_words_keep_layout(text: str, raw_blocked: str) -> str:
+    if not text or not raw_blocked:
+        return text
+    items = sorted(
+        {i.strip() for i in re.split(r"[,\n]+", raw_blocked) if i.strip()},
+        key=len,
+        reverse=True,
+    )
+    for item in items:
+        text = re.sub(re.escape(item), "", text, flags=re.IGNORECASE)
+    return text
 
 def sanitize_dump_caption(text: str) -> str:
     if not text:
