@@ -10,6 +10,7 @@ from body.database import *
 from body.file_forward import *
 from body.smart_text import analyze, normalize_text, ENGINE_VERSION, FALLBACK_NAMES
 from body.caption_history import record_history
+from body.stats_tracker import record_edit, record_dump, record_failure, record_floodwait
 from body.member_forward import MF_SESSIONS, handle_member_forward_text
 from body.gen_session import GS_SESSIONS, handle_gen_session_text
 from body.dump_direction import render_dump_skip_list
@@ -355,7 +356,7 @@ async def admin_help(client, message):
 
         "📊 <b>INFO &amp; MONITORING</b>\n"
         "┌ /admin — Show this admin command list\n"
-        "├ /stats — Full bot statistics &amp; DB info\n"
+        "├ /stats — Stats panel: edits, dump, channels, owners, daily reports\n"
         "└ /queue — Live caption &amp; forward queue status\n\n"
 
         "📢 <b>BROADCAST</b>\n"
@@ -395,88 +396,6 @@ async def admin_help(client, message):
         "📋 /queue is available to all users (shows their own tasks)."
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-@Client.on_message(filters.private & filters.user(ADMIN) & filters.command("stats"))
-async def bot_stats(client, message):
-    loading = await message.reply_text("📊 Fetching stats…")
-    try:
-        cap_pending    = await queue_col.count_documents({"status": "pending"})
-        cap_processing = await queue_col.count_documents({"status": "processing"})
-        cap_done_today = await queue_col.count_documents({})
-        fwd_pending    = await forward_queue.count_documents({"status": "pending"})
-        fwd_processing = await forward_queue.count_documents({"status": "processing"})
-
-        users_count    = await total_user()
-        channels_count = await chnl_ids.count_documents({})
-        dump_skip_count = await chnl_ids.count_documents({"dump_skip": True})
-
-        all_channel_docs = await users.aggregate([
-            {"$unwind": "$channels"},
-            {"$group": {"_id": "$channels.channel_id",
-                        "title": {"$first": "$channels.channel_title"}}}
-        ]).to_list(length=None)
-
-        admin_channels = []
-        for doc in all_channel_docs[:30]:
-            ch_id = doc["_id"]
-            title = doc.get("title", str(ch_id))
-            try:
-                m = await client.get_chat_member(ch_id, "me")
-                if _is_admin_member(m):
-                    try:
-                        chat = await client.get_chat(ch_id)
-                        title = chat.title or title
-                        link  = f"https://t.me/{chat.username}" if getattr(chat, "username", None) else None
-                        admin_channels.append((title, ch_id, link))
-                    except Exception:
-                        admin_channels.append((title, ch_id, None))
-            except Exception:
-                pass
-
-        bot     = await client.get_me()
-        bot_name = bot.first_name
-        bot_user = bot.username
-
-        text = (
-            f"📊 <b>BOT STATISTICS</b>\n"
-            f"🤖 <b>{bot_name}</b>  (@{bot_user})\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-            "👥 <b>USERS &amp; CHANNELS</b>\n"
-            f"  • Total users     : <code>{users_count}</code>\n"
-            f"  • DB channel docs : <code>{channels_count}</code>\n"
-            f"  • Dump-skip chans : <code>{dump_skip_count}</code>\n"
-            f"  • Bot is admin in : <code>{len(admin_channels)}</code> channel(s)\n\n"
-
-            "📝 <b>CAPTION QUEUE</b>\n"
-            f"  • Pending   : <code>{cap_pending}</code>\n"
-            f"  • Processing: <code>{cap_processing}</code>\n"
-            f"  • Total (all-time): <code>{cap_done_today}</code>\n\n"
-
-            "📦 <b>FORWARD QUEUE</b>\n"
-            f"  • Pending   : <code>{fwd_pending}</code>\n"
-            f"  • Processing: <code>{fwd_processing}</code>\n\n"
-        )
-
-        if admin_channels:
-            text += "📡 <b>CHANNELS WHERE BOT IS ADMIN</b>\n"
-            for i, (title, ch_id, link) in enumerate(admin_channels[:20], 1):
-                if link:
-                    text += f"  {i}. <a href='{link}'>{title}</a> <code>({ch_id})</code>\n"
-                else:
-                    text += f"  {i}. {title} <code>({ch_id})</code>\n"
-            if len(admin_channels) > 20:
-                text += f"  … and {len(admin_channels) - 20} more\n"
-        else:
-            text += "📡 <b>CHANNELS WHERE BOT IS ADMIN:</b> None found\n"
-
-        text += "\n━━━━━━━━━━━━━━━━━━━━━━━━"
-
-        await loading.edit_text(text, parse_mode=ParseMode.HTML,
-                                 disable_web_page_preview=True)
-    except Exception as e:
-        await loading.edit_text(f"❌ Error fetching stats:\n<code>{e}</code>",
-                                 parse_mode=ParseMode.HTML)
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command(["broadcast"]))
 async def broadcast(client, message):
@@ -880,17 +799,20 @@ async def caption_worker(client: Client, worker_id: int = 0):
                         caption=dump_caption,
                     )
                     await save_dump_origin(dest, dump_sent.id, ch, job["message_id"])
+                    record_dump(ch)
                 except Exception as e:
                     logger.warning(f"[CAP_WORKER_{worker_id}] dump-copy failed ch={ch} msg={job['message_id']}: {type(e).__name__}: {e}")
             await mark_done(job["_id"])
             logger.info(f"[CAP_WORKER_{worker_id}] edited ch={ch} msg={job['message_id']}")
             record_history(job, hist_meta, new_caption, dump_smart_caption)
+            record_edit(ch)
             note_edit_success(ch)
             await asyncio.sleep(get_channel_delay(ch))
         except FloodWait as e:
             wait = e.value + 2
             CHANNEL_COOLDOWN[ch] = time.time() + wait
             note_edit_floodwait(ch)
+            record_floodwait(ch)
             try:
                 still_pending = await queue_col.count_documents({"chat_id": ch, "status": "pending"})
             except Exception:
@@ -905,6 +827,7 @@ async def caption_worker(client: Client, worker_id: int = 0):
             retries = job.get("retries", 0)
             if isinstance(e, PERMANENT_EDIT_ERRORS) or retries >= MAX_JOB_RETRIES:
                 await mark_done(job["_id"])
+                record_failure(ch)
                 logger.error(
                     f"[CAP_WORKER_{worker_id}] dropped ch={ch} msg={job.get('message_id')} "
                     f"after {retries} retries: {type(e).__name__}: {e}"
