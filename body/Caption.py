@@ -12,6 +12,7 @@ from body.smart_text import analyze, normalize_text, ENGINE_VERSION, FALLBACK_NA
 from body.caption_history import record_history
 from body.corrections_store import make_sig, get_correction, apply_fields
 from body.review_flow import enqueue_review
+from body.name_fixups import strip_lead_noise, site_marked, prefer_caption_title, add_dub_tags, part_label
 from body.stats_tracker import record_edit, record_dump, record_failure, record_floodwait
 from body.member_forward import MF_SESSIONS, handle_member_forward_text
 from body.gen_session import GS_SESSIONS, handle_gen_session_text
@@ -1489,9 +1490,14 @@ _LEAD_HANDLE = re.compile(r"(?m)^[\s\[\(]*@[A-Za-z0-9]+_(?=[A-Za-z0-9]+_)")
 
 
 def parse_file_info(filename: str, caption: str) -> dict:
-    fn_n = strip_promo_noise(_LEAD_HANDLE.sub("", normalize_text(filename or "")))
+    fn_in = strip_lead_noise(normalize_text(filename or ""), TITLE_STRIP_PREFIXES)
+    fn_n = strip_promo_noise(strip_lead_noise(_LEAD_HANDLE.sub("", fn_in), TITLE_STRIP_PREFIXES))
     cap_n = strip_promo_noise(_LEAD_HANDLE.sub("", normalize_text(caption or "")))
     a = analyze(fn_n, cap_n, normalized=True)
+    if fn_n and cap_n and site_marked(fn_n):
+        alt = analyze("", cap_n, normalized=True)
+        if prefer_caption_title(a, alt):
+            a = alt
     eff_fn = a.get("filename", fn_n)
     ext_src = fn_n if fn_n else eff_fn
     raw = f"{eff_fn} {cap_n}".replace("\n", " ")
@@ -1568,7 +1574,7 @@ def build_smart_filename(filename: str, caption: str, precomputed_info: dict = N
         parts.append(f"({info['year']})")
 
     if audio_langs:
-        audio_label = _format_audio_label(audio_langs, raw)
+        audio_label = add_dub_tags(_format_audio_label(audio_langs, raw), audio_langs, raw_full)
         parts.append(f"({audio_label})")
 
     explicit_dual  = bool(_DUAL_RE.search(raw))
@@ -1648,6 +1654,10 @@ def build_smart_filename(filename: str, caption: str, precomputed_info: dict = N
 
     if info["subtitle"]:
         parts.append(info["subtitle"])
+
+    part = part_label(raw_full)
+    if part:
+        parts.append(part)
 
     if info["extension"]:
         parts.append(f".{info['extension']}")
