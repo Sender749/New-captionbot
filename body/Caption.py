@@ -335,7 +335,7 @@ async def dump_origin_id_cmd(client, message):
     )
 
 
-@Client.on_message(filters.private & filters.command("file_forward"))
+@Client.on_message(filters.private & filters.command("f"))
 async def ff_start(client, message):
     uid = message.from_user.id
     channels = await get_user_channels(uid)
