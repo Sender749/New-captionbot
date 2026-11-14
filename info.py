@@ -29,6 +29,7 @@ REVIEW_CH = int(os.environ.get("REVIEW_CH", "0") or 0)
 REVIEW_PER_MIN = int(os.environ.get("REVIEW_PER_MIN", "20") or 20)
 REVIEW_DEDUP_S = int(os.environ.get("REVIEW_DEDUP_S", "600") or 600)
 REVIEW_DIGEST_AT = str(os.environ.get("REVIEW_DIGEST_AT", "03:30"))
+TITLE_STRIP_PREFIXES = [x.strip() for x in os.environ.get("TITLE_STRIP_PREFIXES", "KC").split(",") if x.strip()]
 
 # ── Admin global-forward destination ─────────────────────────────────────────
 # Files forwarded via /channels → "File Forwarding" are sent here.
