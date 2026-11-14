@@ -130,7 +130,9 @@ class Bot(Client):
             hook = getattr(module, "on_bot_start", None)
             if callable(hook):
                 logger.info(f"🔌 Running startup hook: {module_name}.on_bot_start()")
-                hook(self)
+                result = hook(self)
+                if asyncio.iscoroutine(result):
+                    await result
 
     async def _periodic_recovery(self):
         """Runs recover_stuck_jobs() every 90s so the bot self-heals from
