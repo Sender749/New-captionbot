@@ -15,7 +15,7 @@ Admin-only commands (private chat):
   /history_stats
   /history_export [days] [all|unsure|changed]
   /history_clear
-  /wrong <correct output>      (reply to a processed / forwarded message)
+  /wrong <correct smart file name | field=value; ...>  (reply to a processed / forwarded message)
   /original                    (reply to any file -> its caption BEFORE the bot edited it)
 """
 import asyncio
@@ -34,6 +34,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from info import ADMIN, CP_CH
 from body.database import db, get_dump_origin
 from body.smart_text import ENGINE_VERSION
+from body.corrections_store import parse_correction, save_correction
 
 logger = logging.getLogger("captionbot.history")
 
@@ -90,6 +91,7 @@ def build_history_doc(job, meta, new_caption, smart_file_name=""):
             "subtitle": fld("subtitle"),
         },
         "flags": flags,
+        "sig": meta.get("sig") or "",
         "engine_version": meta.get("engine_version") or ENGINE_VERSION,
         "ts": datetime.now(timezone.utc),
     }
@@ -375,13 +377,18 @@ async def _locate_origin(replied):
 
 @Client.on_message(filters.command("wrong") & _ADMIN_PM)
 async def wrong_cmd(client, message):
-    expected = (message.text or "").split(None, 1)
-    expected = expected[1].strip() if len(expected) > 1 else ""
-    if not message.reply_to_message or not expected:
+    raw = (message.text or "").split(None, 1)
+    raw = raw[1].strip() if len(raw) > 1 else ""
+    if not message.reply_to_message or not raw:
         await message.reply_text(
             "ℹ️ Reply to a <b>forwarded channel post</b> (or a message containing its t.me/c link) with\n"
-            "<code>/wrong &lt;the correct output&gt;</code>"
+            "<code>/wrong &lt;the correct smart file name&gt;</code>\n"
+            "or fields: <code>/wrong audio=Hindi + English; sub=ESub</code> (title, year, audio, sub)"
         )
+        return
+    kind, value = parse_correction(raw)
+    if kind is None:
+        await message.reply_text("❌ %s" % value)
         return
     cid, mid = await _locate_origin(message.reply_to_message)
     if not cid:
@@ -391,12 +398,25 @@ async def wrong_cmd(client, message):
     if not doc:
         await message.reply_text("❌ No history record for <code>%s</code> / <code>%s</code> (history keeps %d days)." % (cid, mid, HISTORY_TTL_DAYS))
         return
-    await history_col.update_one(
-        {"_id": doc["_id"]},
-        {"$set": {"reported": True, "expected_output": expected[:MAX_TEXT],
-                  "reported_at": datetime.now(timezone.utc)}},
+    if not doc.get("sig"):
+        await message.reply_text("❌ That record was made before corrections were supported, so it can't be matched again. Only newly edited posts can be corrected.")
+        return
+    shown = value if kind == "name" else "; ".join("%s=%s" % (k, v) for k, v in value.items())
+    saved = await save_correction(
+        doc["sig"], kind, value,
+        channel_id=cid, message_id=mid,
+        filename=doc.get("original_filename", ""), caption=doc.get("original_caption", ""),
+        bot_output=doc.get("smart_file_name", ""), engine_version=doc.get("engine_version", ""),
+        via="wrong_cmd",
     )
-    await message.reply_text("✅ Saved. It will be listed first in <code>/history_export</code>.")
+    update = {"reported": True, "expected_output": shown[:MAX_TEXT], "reported_at": datetime.now(timezone.utc)}
+    if kind == "fields":
+        update["field_fixes"] = value
+    await history_col.update_one({"_id": doc["_id"]}, {"$set": update})
+    if saved:
+        await message.reply_text("✅ Saved permanently. The next time this exact file name and caption arrive, the bot will use it. It is also listed first in <code>/history_export</code>.")
+    else:
+        await message.reply_text("⚠️ Saved to history, but the permanent correction could not be stored. Send it again.")
 
 
 # ───────────────────────────── /original ────────────────────────────────────

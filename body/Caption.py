@@ -10,6 +10,8 @@ from body.database import *
 from body.file_forward import *
 from body.smart_text import analyze, normalize_text, ENGINE_VERSION, FALLBACK_NAMES
 from body.caption_history import record_history
+from body.corrections_store import make_sig, get_correction, apply_fields
+from body.review_flow import enqueue_review
 from body.stats_tracker import record_edit, record_dump, record_failure, record_floodwait
 from body.member_forward import MF_SESSIONS, handle_member_forward_text
 from body.gen_session import GS_SESSIONS, handle_gen_session_text
@@ -805,6 +807,7 @@ async def caption_worker(client: Client, worker_id: int = 0):
             await mark_done(job["_id"])
             logger.info(f"[CAP_WORKER_{worker_id}] edited ch={ch} msg={job['message_id']}")
             record_history(job, hist_meta, new_caption, dump_smart_caption)
+            enqueue_review(job, hist_meta)
             record_edit(ch)
             note_edit_success(ch)
             await asyncio.sleep(get_channel_delay(ch))
@@ -882,17 +885,26 @@ def render_caption_for_job(job: dict, meta_out: dict = None):
     smart_file_name = ""
     try:
         raw_file_name = normalize_series_name(file_name)
-        file_info = parse_file_info(original_file_name or raw_file_name, default_caption_plain)
+        sig_name = original_file_name or raw_file_name
+        sig = make_sig(sig_name, default_caption_plain)
+        fix = get_correction(sig)
+        file_info = parse_file_info(sig_name, default_caption_plain)
+        if fix and fix.get("fields"):
+            apply_fields(file_info, fix["fields"])
         language = " + ".join(file_info.get("audio_langs") or [])
         year = file_info.get("year") or extract_year(default_caption_plain) or extract_year(original_file_name) or ""
         if meta_out is not None:
             meta_out.update(file_info.get("_meta") or {})
+            meta_out["sig"] = sig
         smart_file_name = build_smart_filename(
-            original_file_name or raw_file_name, default_caption_plain,
+            sig_name, default_caption_plain,
             precomputed_info=file_info,
         )
+        if fix and fix.get("smart_name"):
+            smart_file_name = fix["smart_name"]
         if meta_out is not None:
             meta_out["smart_file_name"] = smart_file_name
+            meta_out["corrected"] = bool(fix)
         new_caption = cap_template.format(
             file_name=raw_file_name,
             smart_file_name=smart_file_name,
