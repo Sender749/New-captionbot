@@ -25,11 +25,12 @@ LOG_CH = os.environ.get("LOG_CH", "-1002904285991")
 CP_CH = int(os.environ.get("CP_CH", "-1002920306518"))
 FF_CH = int(os.environ.get("FF_CH", "-1003073036876"))
 
-REVIEW_CH = int(os.environ.get("REVIEW_CH", "-1003073036876") or 0)
+REVIEW_CH = int(os.environ.get("REVIEW_CH", "0") or 0)
 REVIEW_PER_MIN = int(os.environ.get("REVIEW_PER_MIN", "20") or 20)
 REVIEW_DEDUP_S = int(os.environ.get("REVIEW_DEDUP_S", "600") or 600)
 REVIEW_DIGEST_AT = str(os.environ.get("REVIEW_DIGEST_AT", "03:30"))
 TITLE_STRIP_PREFIXES = [x.strip() for x in os.environ.get("TITLE_STRIP_PREFIXES", "KC").split(",") if x.strip()]
+AUTO_SET_COMMANDS = str(os.environ.get("AUTO_SET_COMMANDS", "1")).strip().lower() not in ("0", "false", "no", "off")
 
 # ── Admin global-forward destination ─────────────────────────────────────────
 # Files forwarded via /channels → "File Forwarding" are sent here.
