@@ -20,13 +20,13 @@ reviews_col = db.caption_reviews
 
 QUEUE_MAX = 2000
 REVIEW_TTL_DAYS = 30
-PENDING_TTL_S = 900
+PROMPT_TTL_S = 3600
 SEND_RETRIES = 3
 RECENT_MAX = 5000
 CARD_LIMIT = 3900
 
 _queue = None
-_pending = {}
+_prompts = {}
 _recent = {}
 _stats = {"queued": 0, "deduped": 0, "dropped": 0, "sent": 0, "errors": 0}
 
@@ -88,13 +88,15 @@ def _post_link(cid, mid):
     return ""
 
 
-def build_card_text(item):
+def build_card_text(item, with_file=True):
     lines = [
         "🔎 <b>Review needed</b> · <code>%s</code>" % html.escape(", ".join(item["flags"])),
         "<b>File:</b> <code>%s</code>" % html.escape(item["filename"] or "-"),
-        "<b>Caption:</b> %s" % html.escape(_clip(item["caption"], 400) or "-"),
-        "<b>Bot output:</b> <code>%s</code>" % html.escape(item["bot_output"] or "-"),
+        "<b>Original caption:</b> %s" % html.escape(_clip(item["caption"], 300) or "-"),
+        "<b>Bot caption:</b> <code>%s</code>" % html.escape(item["bot_output"] or "-"),
     ]
+    if not with_file:
+        lines.append("⚠️ The file could not be copied here.")
     link = _post_link(item["cid"], item["mid"])
     if link:
         lines.append('<a href="%s">Open post</a>' % link)
@@ -127,34 +129,48 @@ async def _claim(item):
     return res.upserted_id is not None
 
 
+async def _with_retry(factory):
+    for _ in range(SEND_RETRIES):
+        try:
+            return await factory()
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+    raise RuntimeError("flood wait retries exhausted")
+
+
 async def _post_card(client, item):
     if not await _claim(item):
         return
+    copied = None
     try:
-        for attempt in range(SEND_RETRIES):
-            try:
-                sent = await client.send_message(
-                    REVIEW_CH,
-                    build_card_text(item),
-                    reply_markup=build_card_buttons(item["cid"], item["mid"]),
-                    disable_web_page_preview=True,
-                )
-                break
-            except FloodWait as e:
-                await asyncio.sleep(e.value + 1)
-        else:
-            raise RuntimeError("flood wait retries exhausted")
+        try:
+            copied = await _with_retry(lambda: client.copy_message(REVIEW_CH, item["cid"], item["mid"]))
+        except Exception as e:
+            logger.warning("review file copy failed ch=%s msg=%s: %s", item["cid"], item["mid"], e)
+        kwargs = {"reply_to_message_id": copied.id} if copied else {}
+        sent = await _with_retry(lambda: client.send_message(
+            REVIEW_CH,
+            build_card_text(item, with_file=copied is not None),
+            reply_markup=build_card_buttons(item["cid"], item["mid"]),
+            disable_web_page_preview=True,
+            **kwargs,
+        ))
     except Exception:
         try:
             await reviews_col.delete_one({"cid": item["cid"], "mid": item["mid"]})
         except Exception:
             pass
+        if copied:
+            try:
+                await client.delete_messages(REVIEW_CH, copied.id)
+            except Exception:
+                pass
         raise
     _stats["sent"] += 1
     try:
         await reviews_col.update_one(
             {"cid": item["cid"], "mid": item["mid"]},
-            {"$set": {"card_chat": sent.chat.id, "card_id": sent.id}},
+            {"$set": {"card_chat": sent.chat.id, "card_id": sent.id, "file_id": copied.id if copied else None}},
         )
     except Exception:
         pass
@@ -231,44 +247,66 @@ async def review_button_cb(client, query):
         await query.answer("Marked OK")
         await _finish_card(client, query.message.chat.id, query.message.id, "✅ Marked OK by %s" % who)
         return
-    uid = query.from_user.id
-    _pending[uid] = {
+    await _drop_prompts(client, cid, mid)
+    prompt_text = (
+        "✏️ <b>Reply to this message</b> with the correct caption.\n\n"
+        "Bot caption: <code>%s</code>\n\n"
+        "Send the full caption line, or fields like\n"
+        "<code>audio=Hindi + English; sub=ESub</code>\n"
+        "(fields: title, year, audio, sub). Reply <code>cancel</code> to stop."
+    ) % html.escape(rv.get("bot_output") or "-")
+    try:
+        prompt = await client.send_message(
+            query.message.chat.id, _clip(prompt_text, CARD_LIMIT), reply_to_message_id=query.message.id
+        )
+    except Exception as e:
+        logger.warning("review prompt failed: %s", e)
+        await query.answer("Could not post the prompt here.", show_alert=True)
+        return
+    _prompts[prompt.id] = {
         "cid": cid, "mid": mid, "sig": rv.get("sig"),
         "filename": rv.get("filename", ""), "caption": rv.get("caption", ""),
         "bot_output": rv.get("bot_output", ""), "engine_version": rv.get("engine_version", ""),
         "card_chat": query.message.chat.id, "card_id": query.message.id,
+        "prompt_chat": prompt.chat.id, "prompt_id": prompt.id,
         "who": who, "ts": time.monotonic(),
     }
-    prompt = (
-        "✏️ <b>Send the correct output</b> for:\n<code>%s</code>\n\n"
-        "Bot made: <code>%s</code>\n\n"
-        "Send the full smart file name, or fields like\n"
-        "<code>audio=Hindi + English; sub=ESub</code>\n"
-        "(fields: title, year, audio, sub). Send <code>cancel</code> to stop."
-    ) % (html.escape(rv.get("filename") or "-"), html.escape(rv.get("bot_output") or "-"))
-    try:
-        await client.send_message(uid, _clip(prompt, CARD_LIMIT))
-    except Exception:
-        _pending.pop(uid, None)
-        await query.answer("Open a private chat with the bot, press Start, then tap again.", show_alert=True)
-        return
-    await query.answer("Check your private chat with the bot.")
+    await query.answer("Reply to the new message below the card.")
 
 
-def _has_pending(_, __, message):
+async def _drop_prompts(client, cid, mid):
+    now = time.monotonic()
+    for pid, p in list(_prompts.items()):
+        if (p["cid"] == cid and p["mid"] == mid) or now - p["ts"] > PROMPT_TTL_S:
+            _prompts.pop(pid, None)
+            try:
+                await client.delete_messages(p["prompt_chat"], p["prompt_id"])
+            except Exception:
+                pass
+
+
+def _has_prompt(_, __, message):
+    rid = getattr(message, "reply_to_message_id", None)
+    p = _prompts.get(rid) if rid else None
+    if not p or message.chat.id != p["prompt_chat"]:
+        return False
+    if time.monotonic() - p["ts"] > PROMPT_TTL_S:
+        _prompts.pop(rid, None)
+        return False
     user = getattr(message, "from_user", None)
-    if not user:
-        return False
-    p = _pending.get(user.id)
-    if not p:
-        return False
-    if time.monotonic() - p["ts"] > PENDING_TTL_S:
-        _pending.pop(user.id, None)
+    if user is not None and user.id not in ADMIN:
         return False
     return True
 
 
-_pending_filter = filters.create(_has_pending)
+_prompt_filter = filters.create(_has_prompt)
+
+
+async def _edit_prompt(client, p, text):
+    try:
+        await client.edit_message_text(p["prompt_chat"], p["prompt_id"], text)
+    except Exception as e:
+        logger.debug("edit prompt failed: %s", e)
 
 
 async def _store_correction(client, message, p, kind, value):
@@ -279,9 +317,9 @@ async def _store_correction(client, message, p, kind, value):
         engine_version=p["engine_version"], via="review_button",
     )
     if not ok:
-        await message.reply_text("❌ Could not save that right now. Send it again or send <code>cancel</code>.")
+        await message.reply_text("❌ Could not save that right now. Reply again or reply <code>cancel</code>.")
         return
-    _pending.pop(message.from_user.id, None)
+    _prompts.pop(p["prompt_id"], None)
     shown = value if kind == "name" else "; ".join("%s=%s" % (k, v) for k, v in value.items())
     try:
         await reviews_col.update_one({"cid": p["cid"], "mid": p["mid"]}, {"$set": {"status": "corrected"}})
@@ -293,30 +331,24 @@ async def _store_correction(client, message, p, kind, value):
         logger.warning("review correction bookkeeping failed: %s", e)
     await _finish_card(client, p["card_chat"], p["card_id"],
                        "❌ Corrected by %s: <code>%s</code>" % (p["who"], html.escape(_clip(shown, 400))))
-    await message.reply_text(
-        "✅ Saved. The next time this exact file name and caption arrive, the bot will use it. "
-        "The post that is already edited is not changed."
-    )
+    await _edit_prompt(client, p, "✅ Saved. The next time this exact file name and caption arrive, the bot will use it. "
+                                  "The post that is already edited is not changed.")
 
 
-@Client.on_message(
-    filters.private & filters.user(ADMIN) & filters.text & ~filters.regex(r"^/") & _pending_filter,
-    group=-5,
-)
+@Client.on_message(filters.chat(REVIEW_CH) & filters.text & filters.reply & _prompt_filter, group=-5)
 async def review_correction_text(client, message):
-    uid = message.from_user.id
-    p = _pending.get(uid)
+    p = _prompts.get(message.reply_to_message_id)
     text = (message.text or "").strip()
     try:
         if p is None:
             pass
         elif text.lower() == "cancel":
-            _pending.pop(uid, None)
-            await message.reply_text("Cancelled.")
+            _prompts.pop(p["prompt_id"], None)
+            await _edit_prompt(client, p, "Cancelled.")
         else:
             kind, value = parse_correction(text)
             if kind is None:
-                await message.reply_text("❌ %s\nTry again, or send <code>cancel</code>." % html.escape(value))
+                await message.reply_text("❌ %s\nReply again, or reply <code>cancel</code>." % html.escape(value))
             else:
                 await _store_correction(client, message, p, kind, value)
     except Exception as e:

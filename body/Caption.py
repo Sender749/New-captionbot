@@ -12,6 +12,7 @@ from body.smart_text import analyze, normalize_text, ENGINE_VERSION, FALLBACK_NA
 from body.caption_history import record_history
 from body.corrections_store import make_sig, get_correction, apply_fields
 from body.review_flow import enqueue_review
+from body.command_registry import build_admin_panel
 from body.name_fixups import strip_lead_noise, site_marked, prefer_caption_title, add_dub_tags, part_label
 from body.stats_tracker import record_edit, record_dump, record_failure, record_floodwait
 from body.member_forward import MF_SESSIONS, handle_member_forward_text
@@ -335,7 +336,7 @@ async def dump_origin_id_cmd(client, message):
     )
 
 
-@Client.on_message(filters.private & filters.command("f"))
+@Client.on_message(filters.private & filters.command("file_forward"))
 async def ff_start(client, message):
     uid = message.from_user.id
     channels = await get_user_channels(uid)
@@ -353,52 +354,8 @@ async def ff_start(client, message):
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command("admin"))
 async def admin_help(client, message):
     bot = await client.get_me()
-    text = (
-        f"👑 <b>Admin Panel — @{bot.username}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        "📊 <b>INFO &amp; MONITORING</b>\n"
-        "┌ /admin — Show this admin command list\n"
-        "├ /stats — Stats panel: edits, dump, channels, owners, daily reports\n"
-        "└ /queue — Live caption &amp; forward queue status\n\n"
-
-        "📢 <b>BROADCAST</b>\n"
-        "┌ /broadcast — Broadcast a message to all users\n"
-        "└   <i>(reply to any message to broadcast it)</i>\n\n"
-
-        "🗃 <b>DUMP CHANNEL CONTROL</b>\n"
-        "┌ /dump_skip <code>-100xxx</code> — Skip dump for a channel\n"
-        "├ /remove_dump <code>-100xxx</code> — Remove dump skip for a channel\n"
-        "└ /dump_change <code>-100xxx</code> — Redirect a channel's dump to another channel\n\n"
-
-        "🗄 <b>DATABASE</b>\n"
-        "└ /reset — ⚠️ Wipe ALL users, channels &amp; settings from DB\n\n"
-
-        "🔄 <b>BOT CONTROL</b>\n"
-        "└ /restart — Restart the bot process\n\n"
-
-        "📤 <b>FILE FORWARDING</b>\n"
-        "├ /file_forward — Start a user file forward session\n"
-        "│   <i>→ Pick source → destination → range (or 0 for all)</i>\n"
-        "├ /channels — View all user-added channels &amp; bulk-forward files\n"
-        "│   <i>→ Shows channel info, who added it, file count,</i>\n"
-        "│   <i>   forwarding progress, start/continue/stop controls</i>\n"
-        "└ /member_forward — Forward from a channel the BOT isn't in\n"
-        "    <i>→ Uses the userbot (SESSION_STRING) to pull files from a</i>\n"
-        "    <i>   channel where only your personal account is a member</i>\n\n"
-        "🔑 <b>USERBOT SETUP</b>\n"
-        "└ /gen_session — Generate a SESSION_STRING for /member_forward\n"
-        "    <i>→ Walks you through phone number → code → (2FA if any)</i>\n"
-        "    <i>   and gives you the string to set as an env var</i>\n\n"
-
-        "⚙️ <b>CHANNEL SETTINGS</b>\n"
-        "└ /settings — Manage your added channels\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔐 All commands above are admin-only.\n"
-        "📋 /queue is available to all users (shows their own tasks)."
-    )
-    await message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    for chunk in build_admin_panel(bot.username):
+        await message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 @Client.on_message(filters.private & filters.user(ADMIN) & filters.command(["broadcast"]))
 async def broadcast(client, message):
