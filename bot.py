@@ -63,11 +63,17 @@ class Bot(Client):
             await super().start()
 
         # One-time DB setup
-        await ensure_queue_indexes()
-        await ensure_forward_indexes()
-        await ensure_dump_origin_indexes()
-        await ensure_member_forward_indexes()
-        await recover_stuck_jobs()
+        for _setup in (
+            ensure_queue_indexes,
+            ensure_forward_indexes,
+            ensure_dump_origin_indexes,
+            ensure_member_forward_indexes,
+            recover_stuck_jobs,
+        ):
+            try:
+                await _setup()
+            except Exception as e:
+                logger.error(f"[STARTUP] {_setup.__name__} failed: {e!r}")
 
         # Optional userbot session for /member_forward (pulling files from
         # channels the bot itself was never added to). No-op if SESSION_STRING
